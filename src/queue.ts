@@ -28,7 +28,7 @@ export interface QueueItem {
 const MAX_RETRIES = 10;
 const WORKER_INTERVAL = 2000; // 2s
 const QUERY_BATCH_SIZE = 100;  // multicall queries — can be large
-const TX_BATCH_SIZE = 5;       // tx sends per cycle — small batches to avoid pushing gas price up
+const TX_BATCH_SIZE = 50;      // items per batch tx (batchCommit/batchCreateRecord handles all in 1 tx)
 
 // --- Rate Limiting ---
 
@@ -414,32 +414,44 @@ async function processCommitted() {
   }
 
   if (ready.length === 0) return;
-  console.log(`[queue] Sending ${ready.length} createRecord txs...`);
 
-  // Sequential send — each tx must succeed before next to prevent nonce gaps
-  const { wallet } = getCreateWallet();
-  let sent = 0;
-  for (const item of ready) {
-    const handle = await acquireNonce("create");
+  // Build params for batchCreateRecord
+  const params = ready.map((item) => {
     const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
-    try {
-      const hash = await wallet.writeContract({
-        address: CONTRACT_ADDRESS,
-        abi: writeAbi,
-        functionName: "createRecord",
-        args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
-        nonce: handle.nonce,
-      });
+    return {
+      rpId: item.rpId,
+      credentialId: item.credentialId,
+      walletRef: walletRefHex,
+      publicKey: publicKeyHex,
+      name: item.name,
+      initialCredentialId: item.initialCredentialId,
+      metadata: metadataHex,
+    };
+  });
+
+  // Single batchCreateRecord tx for all items — 1 nonce, no gaps
+  const { wallet } = getCreateWallet();
+  const handle = await acquireNonce("create");
+  try {
+    const hash = await wallet.writeContract({
+      address: BATCH_HELPER_ADDRESS,
+      abi: batchAbi,
+      functionName: "batchCreateRecord",
+      args: [CONTRACT_ADDRESS, params],
+      nonce: handle.nonce,
+    });
+    // Mark all as creating
+    const now = Date.now();
+    for (const item of ready) {
       db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
-        .run(hash, Date.now(), item.id);
-      sent++;
-    } catch (err) {
-      handle.release();
-      console.warn(`[queue] CreateRecord failed at item ${sent + 1}/${ready.length}, stopping batch: ${err instanceof Error ? err.message : err}`);
-      break;
+        .run(hash, now, item.id);
     }
+    console.log(`[queue] batchCreateRecord: ${ready.length} items in 1 tx`);
+  } catch (err) {
+    handle.release();
+    console.warn(`[queue] batchCreateRecord failed: ${err instanceof Error ? err.message : err}`);
+    // Items stay committed, will retry next cycle
   }
-  if (sent > 0) console.log(`[queue] ${sent}/${ready.length} createRecord txs sent`);
 }
 
 // Phase 3: Send commit txs for pending items (no waiting for receipt)
@@ -449,32 +461,32 @@ async function processPending() {
   ).all(Date.now(), TX_BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
-  console.log(`[queue] Sending ${items.length} commit txs...`);
 
-  // Sequential send — each tx must succeed before next to prevent nonce gaps
+  // Build all commitments
+  const commitments = items.map((item) => buildCommitment(item).commitment);
+
+  // Single batchCommit tx for all items — 1 nonce, no gaps
   const { wallet } = getCommitWallet();
-  let sent = 0;
-  for (const item of items) {
-    const handle = await acquireNonce("commit");
-    const { commitment } = buildCommitment(item);
-    try {
-      await wallet.writeContract({
-        address: CONTRACT_ADDRESS,
-        abi: writeAbi,
-        functionName: "commit",
-        args: [commitment],
-        nonce: handle.nonce,
-      });
-      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-      sent++;
-    } catch (err) {
-      // Release nonce and stop batch — don't create gaps
-      handle.release();
-      console.warn(`[queue] Commit failed at item ${sent + 1}/${items.length}, stopping batch: ${err instanceof Error ? err.message : err}`);
-      break;
+  const handle = await acquireNonce("commit");
+  try {
+    await wallet.writeContract({
+      address: BATCH_HELPER_ADDRESS,
+      abi: batchAbi,
+      functionName: "batchCommit",
+      args: [CONTRACT_ADDRESS, commitments],
+      nonce: handle.nonce,
+    });
+    // Mark all as committed
+    const now = Date.now();
+    for (const item of items) {
+      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(now, item.id);
     }
+    console.log(`[queue] batchCommit: ${items.length} items in 1 tx`);
+  } catch (err) {
+    handle.release();
+    console.warn(`[queue] batchCommit failed: ${err instanceof Error ? err.message : err}`);
+    // Individual items will retry next cycle (still pending)
   }
-  if (sent > 0) console.log(`[queue] ${sent}/${items.length} commit txs sent`);
 }
 
 const FAILURE_ALERT_BATCH = 10;
@@ -513,25 +525,37 @@ import { getConfig } from "./config.ts";
 import { CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
 import { acquireNonce } from "./nonce.ts";
 
-const writeAbi = [
+const BATCH_HELPER_ADDRESS = "0xc7b0db5d4974aba3ea25780f40bf369cc013a16e" as const;
+
+const batchAbi = [
   {
     type: "function",
-    name: "commit",
-    inputs: [{ name: "commitment", type: "bytes32" }],
+    name: "batchCommit",
+    inputs: [
+      { name: "index", type: "address" },
+      { name: "commitments", type: "bytes32[]" },
+    ],
     outputs: [],
     stateMutability: "nonpayable",
   },
   {
     type: "function",
-    name: "createRecord",
+    name: "batchCreateRecord",
     inputs: [
-      { name: "rpId", type: "string" },
-      { name: "credentialId", type: "string" },
-      { name: "walletRef", type: "bytes32" },
-      { name: "publicKey", type: "bytes" },
-      { name: "name", type: "string" },
-      { name: "initialCredentialId", type: "string" },
-      { name: "metadata", type: "bytes" },
+      { name: "index", type: "address" },
+      {
+        name: "params",
+        type: "tuple[]",
+        components: [
+          { name: "rpId", type: "string" },
+          { name: "credentialId", type: "string" },
+          { name: "walletRef", type: "bytes32" },
+          { name: "publicKey", type: "bytes" },
+          { name: "name", type: "string" },
+          { name: "initialCredentialId", type: "string" },
+          { name: "metadata", type: "bytes" },
+        ],
+      },
     ],
     outputs: [],
     stateMutability: "nonpayable",
