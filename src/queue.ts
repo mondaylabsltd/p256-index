@@ -187,16 +187,39 @@ async function checkAlerts(): Promise<void> {
 
   // 3. Gas balance + gas price check (use write RPC for reliability)
   try {
-    const { wallet, client } = getWalletAndClient();
-    const balance = await client.getBalance({ address: wallet.account.address });
+    const { wallet: createWallet, client } = getCreateWallet();
+    const balance = await client.getBalance({ address: createWallet.account.address });
     const balanceXdai = Number(balance) / 1e18;
     if (balanceXdai < GAS_BALANCE_THRESHOLD) {
-      alerts.push(`🪫 Gas balance low: ${balanceXdai.toFixed(6)} xDAI (wallet: ${wallet.account.address})`);
+      alerts.push(`🪫 Create wallet balance low: ${balanceXdai.toFixed(6)} xDAI (${createWallet.account.address})`);
     }
     const gasPrice = await client.getGasPrice();
     const gasPriceGwei = Number(gasPrice) / 1e9;
     if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
       alerts.push(`⛽ Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), queue paused`);
+    }
+
+    // Auto-fund commit wallet if balance is low (transfer from create wallet)
+    const { wallet: commitWallet } = getCommitWallet();
+    if (commitWallet.account.address !== createWallet.account.address) {
+      const commitBalance = await client.getBalance({ address: commitWallet.account.address });
+      const commitBalanceXdai = Number(commitBalance) / 1e18;
+      const FUND_THRESHOLD = 0.005; // xDAI
+      const FUND_AMOUNT = 0.02;     // xDAI
+      if (commitBalanceXdai < FUND_THRESHOLD && balanceXdai > FUND_AMOUNT + GAS_BALANCE_THRESHOLD) {
+        console.log(`[queue] Auto-funding commit wallet: ${commitBalanceXdai.toFixed(6)} xDAI < ${FUND_THRESHOLD}, sending ${FUND_AMOUNT} xDAI`);
+        try {
+          const hash = await createWallet.sendTransaction({
+            to: commitWallet.account.address,
+            value: BigInt(Math.floor(FUND_AMOUNT * 1e18)),
+          });
+          console.log(`[queue] Funded commit wallet: ${hash}`);
+        } catch (err) {
+          console.warn(`[queue] Auto-fund failed:`, err instanceof Error ? err.message : err);
+        }
+      } else if (commitBalanceXdai < FUND_THRESHOLD) {
+        alerts.push(`🪫 Commit wallet balance low: ${commitBalanceXdai.toFixed(6)} xDAI (${commitWallet.account.address}), main wallet too low to auto-fund`);
+      }
     }
   } catch { /* ignore check failures */ }
 
@@ -235,67 +258,28 @@ async function processQueue() {
       return;
     }
 
-    await processPending();
+    // Priority order: verify creating → advance committed → send pending commits
+    // Items closest to done get processed first; nonces prioritize createRecord over commit.
+    await processCreating();
     await processCommitted();
+    await processPending();
     await checkAlerts();
   } finally {
     workerRunning = false;
   }
 }
 
-async function processPending() {
+// Phase 1: Verify items in 'creating' status — check hasRecord on-chain
+async function processCreating() {
   const items = db.prepare(
-    "SELECT * FROM create_queue WHERE status = 'pending' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
-  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
-
-  if (items.length === 0) return;
-  console.log(`[queue] Processing ${items.length} pending items...`);
-
-  // Mark as committing
-  const ids = items.map((i) => i.id);
-  for (const id of ids) {
-    db.prepare("UPDATE create_queue SET status = 'committing', updatedAt = ? WHERE id = ?").run(Date.now(), id);
-  }
-
-  // Batch commit - fire all in parallel
-  const results = await Promise.allSettled(
-    items.map((item) => commitItem(item))
-  );
-
-  for (let i = 0; i < items.length; i++) {
-    const result = results[i];
-    if (result.status === "fulfilled") {
-      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
-    } else {
-      handleFailure(items[i], result.reason?.message ?? "commit failed");
-    }
-  }
-}
-
-async function processCommitted() {
-  const items = db.prepare(
-    "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
-  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
+    "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
+  ).all(BATCH_SIZE) as unknown as QueueItem[];
 
   if (items.length === 0) return;
 
-  // Use write RPC for chain reads — public RPC list has too many dead nodes
   const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
-  const currentBlock = await client.getBlockNumber();
-  const ready: QueueItem[] = [];
   for (const item of items) {
-    const { commitment } = buildCommitment(item);
-    const commitBlock = await client.readContract({
-      address: CONTRACT_ADDRESS,
-      abi: CONTRACT_ABI,
-      functionName: "getCommitBlock",
-      args: [commitment],
-    });
-    if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
-      ready.push(item);
-    } else if (commitBlock === 0n) {
-      // Commitment doesn't exist — maybe already consumed or never committed
-      // Check if record already exists on-chain
+    try {
       const exists = await client.readContract({
         address: CONTRACT_ADDRESS,
         abi: CONTRACT_ABI,
@@ -304,44 +288,109 @@ async function processCommitted() {
       });
       if (exists) {
         db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-        console.log(`[queue] Item ${item.id} already on-chain, marking done`);
+        console.log(`[queue] Item ${item.id} confirmed on-chain, done`);
       } else {
-        // Only reset to pending if item has been in 'committed' state long enough (2 minutes).
-        // This prevents premature resets when the commit tx just landed but RPC hasn't synced yet.
-        const COMMIT_COOLDOWN = 2 * 60_000; // 2 minutes
-        if (Date.now() - item.updatedAt < COMMIT_COOLDOWN) {
-          console.log(`[queue] Item ${item.id} commitment not found yet, waiting (updated ${Math.round((Date.now() - item.updatedAt) / 1000)}s ago)`);
-        } else {
-          db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-          console.warn(`[queue] Item ${item.id} commitment missing after ${COMMIT_COOLDOWN / 1000}s, resetting to pending`);
+        // Tx may still be pending; if stuck too long, retry
+        const CREATING_TIMEOUT = 2 * 60_000; // 2 minutes
+        if (Date.now() - item.updatedAt > CREATING_TIMEOUT) {
+          // Reset to committed to re-send createRecord
+          handleFailure(item, "createRecord tx not confirmed after 2min", "committed");
         }
       }
-    } else {
-      console.log(`[queue] Item ${item.id} waiting for reveal delay (commit block: ${commitBlock}, current: ${currentBlock})`);
+    } catch {
+      // RPC error, skip — will retry next cycle
+    }
+  }
+}
+
+// Phase 2: Advance committed items — check reveal delay, fire createRecord (no wait)
+async function processCommitted() {
+  const items = db.prepare(
+    "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
+  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
+
+  if (items.length === 0) return;
+
+  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+  const currentBlock = await client.getBlockNumber();
+  const ready: QueueItem[] = [];
+  for (const item of items) {
+    const { commitment } = buildCommitment(item);
+    try {
+      const commitBlock = await client.readContract({
+        address: CONTRACT_ADDRESS,
+        abi: CONTRACT_ABI,
+        functionName: "getCommitBlock",
+        args: [commitment],
+      });
+      if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
+        ready.push(item);
+      } else if (commitBlock === 0n) {
+        // Check if record already exists on-chain
+        const exists = await client.readContract({
+          address: CONTRACT_ADDRESS,
+          abi: CONTRACT_ABI,
+          functionName: "hasRecord",
+          args: [item.rpId, item.credentialId],
+        });
+        if (exists) {
+          db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
+          console.log(`[queue] Item ${item.id} already on-chain, marking done`);
+        } else {
+          const COMMIT_COOLDOWN = 2 * 60_000;
+          if (Date.now() - item.updatedAt < COMMIT_COOLDOWN) {
+            // Commit tx may still be pending, wait
+          } else {
+            db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
+            console.warn(`[queue] Item ${item.id} commitment missing after ${COMMIT_COOLDOWN / 1000}s, resetting to pending`);
+          }
+        }
+      }
+    } catch {
+      // RPC error, skip — will retry next cycle
     }
   }
 
   if (ready.length === 0) return;
-  console.log(`[queue] Creating ${ready.length} committed items on-chain...`);
+  console.log(`[queue] Sending ${ready.length} createRecord txs...`);
 
-  // Mark as creating
-  for (const item of ready) {
-    db.prepare("UPDATE create_queue SET status = 'creating', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-  }
-
-  // Batch createRecord - fire all in parallel
+  // Fire all createRecord txs — no waiting for receipt (verified in processCreating)
   const results = await Promise.allSettled(
-    ready.map((item) => createItem(item))
+    ready.map((item) => fireCreateRecord(item))
   );
 
   for (let i = 0; i < ready.length; i++) {
     const result = results[i];
     if (result.status === "fulfilled") {
-      db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
+      db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
         .run(result.value, Date.now(), ready[i].id);
     } else {
-      // Reset to 'committed' (not 'pending') to avoid re-committing and wasting gas
-      handleFailure(ready[i], result.reason?.message ?? "create failed", "committed");
+      handleFailure(ready[i], result.reason?.message ?? "createRecord send failed", "committed");
+    }
+  }
+}
+
+// Phase 3: Send commit txs for pending items (no waiting for receipt)
+async function processPending() {
+  const items = db.prepare(
+    "SELECT * FROM create_queue WHERE status = 'pending' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
+  ).all(Date.now(), BATCH_SIZE) as unknown as QueueItem[];
+
+  if (items.length === 0) return;
+  console.log(`[queue] Sending ${items.length} commit txs...`);
+
+  // Fire all commit txs — no waiting for receipt (verified by getCommitBlock in processCommitted)
+  const results = await Promise.allSettled(
+    items.map((item) => fireCommit(item))
+  );
+
+  for (let i = 0; i < items.length; i++) {
+    const result = results[i];
+    if (result.status === "fulfilled") {
+      // fulfilled = tx sent (or already committed). Mark 'committed', processCommitted will verify.
+      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
+    } else {
+      handleFailure(items[i], result.reason?.message ?? "commit send failed");
     }
   }
 }
@@ -397,18 +446,32 @@ const writeAbi = [
   },
 ] as const;
 
-function getWalletAndClient() {
+function getCreateWallet() {
   const pk = getConfig().privateKey;
   if (!pk) throw new Error("Missing env: PRIVATE_KEY");
   const rpcUrl = getWriteRpc();
-  const wallet = createWalletClient({
-    account: privateKeyToAccount(pk as `0x${string}`),
-    chain: gnosis,
-    transport: http(rpcUrl),
-  });
-  // Use the SAME RPC for receipt polling to avoid sync delays between nodes
-  const client = createPublicClient({ chain: gnosis, transport: http(rpcUrl) });
-  return { wallet, client };
+  return {
+    wallet: createWalletClient({
+      account: privateKeyToAccount(pk as `0x${string}`),
+      chain: gnosis,
+      transport: http(rpcUrl),
+    }),
+    client: createPublicClient({ chain: gnosis, transport: http(rpcUrl) }),
+  };
+}
+
+function getCommitWallet() {
+  const pk = getConfig().commitPrivateKey;
+  if (!pk) throw new Error("Missing env: COMMIT_PRIVATE_KEY or PRIVATE_KEY");
+  const rpcUrl = getWriteRpc();
+  return {
+    wallet: createWalletClient({
+      account: privateKeyToAccount(pk as `0x${string}`),
+      chain: gnosis,
+      transport: http(rpcUrl),
+    }),
+    client: createPublicClient({ chain: gnosis, transport: http(rpcUrl) }),
+  };
 }
 
 function buildCommitment(item: QueueItem) {
@@ -429,11 +492,12 @@ function buildCommitment(item: QueueItem) {
   };
 }
 
-async function commitItem(item: QueueItem): Promise<void> {
-  const { wallet, client } = getWalletAndClient();
+/** Send commit tx (commit wallet), return immediately (no receipt wait). */
+async function fireCommit(item: QueueItem): Promise<void> {
+  const { wallet, client } = getCommitWallet();
   const { commitment } = buildCommitment(item);
 
-  // Check if already committed on-chain
+  // Skip if already committed on-chain
   const commitBlock = await client.readContract({
     address: CONTRACT_ADDRESS,
     abi: CONTRACT_ABI,
@@ -441,32 +505,31 @@ async function commitItem(item: QueueItem): Promise<void> {
     args: [commitment],
   });
   if (commitBlock > 0n) {
-    console.log(`[queue] Item ${item.id} already committed at block ${commitBlock}, skipping commit`);
+    console.log(`[queue] Item ${item.id} already committed at block ${commitBlock}, skipping`);
     return;
   }
 
-  const nonce = await acquireNonce();
+  const nonce = await acquireNonce("commit");
   try {
-    const hash = await wallet.writeContract({
+    await wallet.writeContract({
       address: CONTRACT_ADDRESS,
       abi: writeAbi,
       functionName: "commit",
       args: [commitment],
       nonce,
     });
-    await client.waitForTransactionReceipt({ hash, timeout: 120_000 });
   } catch (err) {
-    // Always reset: can't know if tx landed (timeout, network error, nonce conflict)
-    resetNonce();
+    resetNonce("commit");
     throw err;
   }
 }
 
-async function createItem(item: QueueItem): Promise<string> {
-  const { wallet, client } = getWalletAndClient();
+/** Send createRecord tx (create wallet), return txHash immediately (no receipt wait). */
+async function fireCreateRecord(item: QueueItem): Promise<string> {
+  const { wallet } = getCreateWallet();
   const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
 
-  const nonce = await acquireNonce();
+  const nonce = await acquireNonce("create");
   try {
     const hash = await wallet.writeContract({
       address: CONTRACT_ADDRESS,
@@ -475,11 +538,9 @@ async function createItem(item: QueueItem): Promise<string> {
       args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
       nonce,
     });
-    await client.waitForTransactionReceipt({ hash, timeout: 120_000 });
     return hash;
   } catch (err) {
-    // Always reset: can't know if tx landed
-    resetNonce();
+    resetNonce("create");
     throw err;
   }
 }

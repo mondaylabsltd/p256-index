@@ -1,9 +1,9 @@
 /**
  * Local nonce manager.
  *
- * Prevents nonce collisions when sending multiple transactions in parallel.
- * Fetches the on-chain nonce once, then increments locally. On failure
- * (e.g. nonce already used), resyncs from the chain.
+ * Supports multiple independent nonce pools (one per EOA wallet).
+ * Each pool: fetches on-chain nonce once, then increments locally.
+ * On failure, resyncs from the chain.
  */
 
 import { createPublicClient, http } from "viem";
@@ -12,41 +12,57 @@ import { privateKeyToAccount } from "viem/accounts";
 import { getWriteRpc } from "./rpc.ts";
 import { getConfig } from "./config.ts";
 
-let currentNonce: number | null = null;
-let mutex: Promise<void> = Promise.resolve();
+interface NonceState {
+  current: number | null;
+  mutex: Promise<void>;
+}
 
-function getAccount() {
-  const pk = getConfig().privateKey;
-  if (!pk) throw new Error("Missing env: PRIVATE_KEY");
+// Separate nonce pools: "create" for createRecord, "commit" for commit
+const pools = new Map<string, NonceState>();
+
+function getPool(role: string): NonceState {
+  let pool = pools.get(role);
+  if (!pool) {
+    pool = { current: null, mutex: Promise.resolve() };
+    pools.set(role, pool);
+  }
+  return pool;
+}
+
+function getAccountForRole(role: string) {
+  const cfg = getConfig();
+  const pk = role === "commit" ? cfg.commitPrivateKey : cfg.privateKey;
+  if (!pk) throw new Error(`Missing env: ${role === "commit" ? "COMMIT_PRIVATE_KEY/PRIVATE_KEY" : "PRIVATE_KEY"}`);
   return privateKeyToAccount(pk as `0x${string}`);
 }
 
-async function fetchOnChainNonce(): Promise<number> {
+async function fetchOnChainNonce(role: string): Promise<number> {
   const client = createPublicClient({
     chain: gnosis,
     transport: http(getWriteRpc()),
   });
   const nonce = await client.getTransactionCount({
-    address: getAccount().address,
+    address: getAccountForRole(role).address,
     blockTag: "pending",
   });
   return nonce;
 }
 
 /**
- * Acquire the next nonce. Serialized — only one caller gets a nonce at a time.
+ * Acquire the next nonce for a role. Serialized per role.
  * First call (or after reset) fetches from the chain; subsequent calls increment locally.
  */
-export function acquireNonce(): Promise<number> {
+export function acquireNonce(role: "create" | "commit" = "create"): Promise<number> {
+  const pool = getPool(role);
   return new Promise<number>((resolve, reject) => {
-    mutex = mutex.then(async () => {
+    pool.mutex = pool.mutex.then(async () => {
       try {
-        if (currentNonce === null) {
-          currentNonce = await fetchOnChainNonce();
-          console.log(`[nonce] Synced from chain: ${currentNonce}`);
+        if (pool.current === null) {
+          pool.current = await fetchOnChainNonce(role);
+          console.log(`[nonce:${role}] Synced from chain: ${pool.current}`);
         }
-        const nonce = currentNonce;
-        currentNonce++;
+        const nonce = pool.current;
+        pool.current++;
         resolve(nonce);
       } catch (err) {
         reject(err);
@@ -56,12 +72,12 @@ export function acquireNonce(): Promise<number> {
 }
 
 /**
- * Reset local nonce state. Called when a transaction fails with a nonce error
- * so the next acquireNonce() re-fetches from the chain.
+ * Reset nonce state for a role. Next acquireNonce() will re-fetch from chain.
  */
-export function resetNonce(): void {
-  currentNonce = null;
-  console.log("[nonce] Reset — will resync from chain on next acquire");
+export function resetNonce(role: "create" | "commit" = "create"): void {
+  const pool = getPool(role);
+  pool.current = null;
+  console.log(`[nonce:${role}] Reset — will resync from chain on next acquire`);
 }
 
 /**
