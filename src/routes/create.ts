@@ -5,7 +5,15 @@ import { buildWalletRef } from "../wallet-ref.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
 import { validateStringLength } from "../validation.ts";
 
+const MAX_BODY_SIZE = 32 * 1024; // 32KB
+
 export async function handleCreate(req: Request): Promise<Response> {
+  // Reject oversized bodies before parsing
+  const contentLength = req.headers.get("content-length");
+  if (contentLength && parseInt(contentLength) > MAX_BODY_SIZE) {
+    return Response.json({ error: "request body too large" }, { status: 413 });
+  }
+
   let body: {
     rpId?: string;
     credentialId?: string;
@@ -17,7 +25,11 @@ export async function handleCreate(req: Request): Promise<Response> {
   };
 
   try {
-    body = await req.json();
+    const text = await req.text();
+    if (text.length > MAX_BODY_SIZE) {
+      return Response.json({ error: "request body too large" }, { status: 413 });
+    }
+    body = JSON.parse(text);
   } catch {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
   }

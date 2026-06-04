@@ -32,7 +32,12 @@ const BATCH_SIZE = 100;
 // --- Rate Limiting ---
 
 const RATE_WINDOW = 60_000; // 1 minute
-const RATE_LIMIT = 5; // max requests per IP per window
+let RATE_LIMIT = 5; // max requests per IP per window
+
+/** Override rate limit (for testing only). */
+export function _setRateLimitForTest(limit: number): void {
+  RATE_LIMIT = limit;
+}
 const ipRequests = new Map<string, number[]>(); // ip -> timestamps
 
 async function hashIp(ip: string): Promise<string> {
@@ -180,10 +185,9 @@ async function checkAlerts(): Promise<void> {
   }
   lastFailedCount = failed;
 
-  // 3. Gas balance + gas price check
+  // 3. Gas balance + gas price check (use write RPC for reliability)
   try {
-    const { client } = getPublicClient();
-    const wallet = getWallet();
+    const { wallet, client } = getWalletAndClient();
     const balance = await client.getBalance({ address: wallet.account.address });
     const balanceXdai = Number(balance) / 1e18;
     if (balanceXdai < GAS_BALANCE_THRESHOLD) {
@@ -216,13 +220,18 @@ export function startQueueWorker() {
 async function processQueue() {
   workerRunning = true;
   try {
-    // Check gas price before processing
-    const { client } = getPublicClient();
-    const gasPrice = await client.getGasPrice();
-    const gasPriceGwei = Number(gasPrice) / 1e9;
-    if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
-      console.warn(`[queue] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), pausing`);
-      await checkAlerts();
+    // Check gas price using write RPC (known-good, not the rotating public list)
+    try {
+      const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+      const gasPrice = await writeClient.getGasPrice();
+      const gasPriceGwei = Number(gasPrice) / 1e9;
+      if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
+        console.warn(`[queue] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), pausing`);
+        await checkAlerts();
+        return;
+      }
+    } catch (err) {
+      console.warn(`[queue] Gas price check failed, skipping cycle:`, err instanceof Error ? err.message : err);
       return;
     }
 
@@ -270,8 +279,8 @@ async function processCommitted() {
 
   if (items.length === 0) return;
 
-  // Check each item's commit block to ensure REVEAL_DELAY has passed
-  const { client } = getPublicClient();
+  // Use write RPC for chain reads — public RPC list has too many dead nodes
+  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
   const currentBlock = await client.getBlockNumber();
   const ready: QueueItem[] = [];
   for (const item of items) {
@@ -297,9 +306,15 @@ async function processCommitted() {
         db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
         console.log(`[queue] Item ${item.id} already on-chain, marking done`);
       } else {
-        // Need to re-commit
-        db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-        console.warn(`[queue] Item ${item.id} commitment missing, resetting to pending`);
+        // Only reset to pending if item has been in 'committed' state long enough (2 minutes).
+        // This prevents premature resets when the commit tx just landed but RPC hasn't synced yet.
+        const COMMIT_COOLDOWN = 2 * 60_000; // 2 minutes
+        if (Date.now() - item.updatedAt < COMMIT_COOLDOWN) {
+          console.log(`[queue] Item ${item.id} commitment not found yet, waiting (updated ${Math.round((Date.now() - item.updatedAt) / 1000)}s ago)`);
+        } else {
+          db.prepare("UPDATE create_queue SET status = 'pending', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
+          console.warn(`[queue] Item ${item.id} commitment missing after ${COMMIT_COOLDOWN / 1000}s, resetting to pending`);
+        }
       }
     } else {
       console.log(`[queue] Item ${item.id} waiting for reveal delay (commit block: ${commitBlock}, current: ${currentBlock})`);
@@ -349,12 +364,12 @@ function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | 
 
 // --- On-chain operations ---
 
-import { createWalletClient, http, keccak256, encodeAbiParameters } from "viem";
+import { createWalletClient, createPublicClient, http, keccak256, encodeAbiParameters } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { gnosis } from "viem/chains";
 import { getWriteRpc } from "./rpc.ts";
 import { getConfig } from "./config.ts";
-import { getClient as getPublicClient, CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
+import { CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
 import { acquireNonce, resetNonce } from "./nonce.ts";
 
 const writeAbi = [
@@ -382,14 +397,18 @@ const writeAbi = [
   },
 ] as const;
 
-function getWallet() {
+function getWalletAndClient() {
   const pk = getConfig().privateKey;
   if (!pk) throw new Error("Missing env: PRIVATE_KEY");
-  return createWalletClient({
+  const rpcUrl = getWriteRpc();
+  const wallet = createWalletClient({
     account: privateKeyToAccount(pk as `0x${string}`),
     chain: gnosis,
-    transport: http(getWriteRpc()),
+    transport: http(rpcUrl),
   });
+  // Use the SAME RPC for receipt polling to avoid sync delays between nodes
+  const client = createPublicClient({ chain: gnosis, transport: http(rpcUrl) });
+  return { wallet, client };
 }
 
 function buildCommitment(item: QueueItem) {
@@ -411,8 +430,7 @@ function buildCommitment(item: QueueItem) {
 }
 
 async function commitItem(item: QueueItem): Promise<void> {
-  const { client } = getPublicClient();
-  const wallet = getWallet();
+  const { wallet, client } = getWalletAndClient();
   const { commitment } = buildCommitment(item);
 
   // Check if already committed on-chain
@@ -436,7 +454,7 @@ async function commitItem(item: QueueItem): Promise<void> {
       args: [commitment],
       nonce,
     });
-    await client.waitForTransactionReceipt({ hash, timeout: 60_000 });
+    await client.waitForTransactionReceipt({ hash, timeout: 120_000 });
   } catch (err) {
     // Always reset: can't know if tx landed (timeout, network error, nonce conflict)
     resetNonce();
@@ -445,8 +463,7 @@ async function commitItem(item: QueueItem): Promise<void> {
 }
 
 async function createItem(item: QueueItem): Promise<string> {
-  const { client } = getPublicClient();
-  const wallet = getWallet();
+  const { wallet, client } = getWalletAndClient();
   const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
 
   const nonce = await acquireNonce();
@@ -458,7 +475,7 @@ async function createItem(item: QueueItem): Promise<string> {
       args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
       nonce,
     });
-    await client.waitForTransactionReceipt({ hash, timeout: 60_000 });
+    await client.waitForTransactionReceipt({ hash, timeout: 120_000 });
     return hash;
   } catch (err) {
     // Always reset: can't know if tx landed

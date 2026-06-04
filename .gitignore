@@ -43,3 +43,4 @@ backups/
 
 # build generated
 src/index.html
+.VSCodeCounter
