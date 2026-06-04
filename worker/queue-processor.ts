@@ -142,8 +142,8 @@ export class QueueProcessor implements DurableObject {
         }
       }
       if (doneCount > 0) console.log(`[queue-processor] ${doneCount} items confirmed on-chain`);
-    } catch {
-      // multicall failed, retry next cycle
+    } catch (err) {
+      console.warn(`[queue-processor] processCreating multicall failed:`, err instanceof Error ? err.message : err);
     }
   }
 
@@ -168,7 +168,8 @@ export class QueueProcessor implements DurableObject {
     let results: { status: "success" | "failure"; result?: unknown; error?: unknown }[];
     try {
       results = await client.multicall({ contracts: calls }) as typeof results;
-    } catch {
+    } catch (err) {
+      console.warn(`[queue-processor] processCommitted multicall failed:`, err instanceof Error ? err.message : err);
       return;
     }
 
@@ -210,7 +211,7 @@ export class QueueProcessor implements DurableObject {
             }
           }
         }
-      } catch { /* retry next cycle */ }
+      } catch (err) { console.warn(`[queue-processor] hasRecord multicall failed:`, err instanceof Error ? err.message : err); }
     }
 
     if (ready.length === 0) return;
@@ -391,7 +392,7 @@ export class QueueProcessor implements DurableObject {
           await this.ensureCommitWalletFunded(config);
         }
       }
-    } catch { /* ignore */ }
+    } catch (err) { console.warn(`[queue-processor] checkAlerts gas/balance check failed:`, err instanceof Error ? err.message : err); }
 
     if (alerts.length > 0) {
       await sendTelegram(config, `[webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${alerts.join("\n")}`);

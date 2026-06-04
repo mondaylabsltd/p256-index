@@ -10,7 +10,8 @@ const MAX_BODY_SIZE = 32 * 1024; // 32KB
 export async function handleCreate(req: Request): Promise<Response> {
   // Reject oversized bodies before parsing
   const contentLength = req.headers.get("content-length");
-  if (contentLength && parseInt(contentLength) > MAX_BODY_SIZE) {
+  const contentLengthNum = Number(contentLength);
+  if (contentLength && (Number.isNaN(contentLengthNum) || contentLengthNum > MAX_BODY_SIZE)) {
     return Response.json({ error: "request body too large" }, { status: 413 });
   }
 

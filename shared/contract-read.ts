@@ -50,7 +50,8 @@ export async function getPublicKey(rpId: string, credentialId: string) {
       args: [rpId, credentialId],
     });
     return formatRecord(record);
-  } catch {
+  } catch (err) {
+    console.warn(`[contract-read] getRecord(${rpId}, ${credentialId}) failed:`, err instanceof Error ? err.message : err);
     return null;
   }
 }
@@ -62,7 +63,8 @@ export async function getPublicKeyByWalletRef(walletRef: `0x${string}`) {
       args: [walletRef],
     });
     return formatRecord(record);
-  } catch {
+  } catch (err) {
+    console.warn(`[contract-read] getRecordByWalletRef(${walletRef}) failed:`, err instanceof Error ? err.message : err);
     return null;
   }
 }

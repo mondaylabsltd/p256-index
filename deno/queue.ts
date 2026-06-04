@@ -71,6 +71,7 @@ export function initQueue(dbPath = "queue.db") {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec(CREATE_QUEUE_DDL);
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status_created ON create_queue(status, createdAt)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)");
 
   // Migrations for existing databases
@@ -179,7 +180,7 @@ async function checkAlerts(): Promise<void> {
         await ensureCommitWalletFunded();
       }
     }
-  } catch { /* ignore check failures */ }
+  } catch (err) { console.warn(`[queue] checkAlerts gas/balance check failed:`, err instanceof Error ? err.message : err); }
 
   if (alerts.length > 0) {
     await sendTelegram(cfg(), `[webauthnp256-publickey-index] [Deno] [Gnosis]\n${alerts.join("\n")}`);
@@ -294,8 +295,8 @@ async function processCreating() {
       }
     }
     if (doneCount > 0) console.log(`[queue] ${doneCount} items confirmed on-chain, done`);
-  } catch {
-    // Entire multicall failed, retry next cycle
+  } catch (err) {
+    console.warn(`[queue] processCreating multicall failed, retry next cycle:`, err instanceof Error ? err.message : err);
   }
 }
 
@@ -321,7 +322,8 @@ async function processCommitted() {
   let results: { status: "success" | "failure"; result?: unknown; error?: unknown }[];
   try {
     results = await client.multicall({ contracts: calls }) as typeof results;
-  } catch {
+  } catch (err) {
+    console.warn(`[queue] processCommitted multicall failed:`, err instanceof Error ? err.message : err);
     return;
   }
 
@@ -361,7 +363,7 @@ async function processCommitted() {
           }
         }
       }
-    } catch { /* multicall failed, retry next cycle */ }
+    } catch (err) { console.warn(`[queue] hasRecord multicall failed:`, err instanceof Error ? err.message : err); }
   }
 
   if (ready.length === 0) return;

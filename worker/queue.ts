@@ -18,6 +18,7 @@ export async function initQueue(db: D1Database): Promise<void> {
   await db.batch([
     db.prepare(CREATE_QUEUE_DDL),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_status_created ON create_queue(status, createdAt)"),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_queue_rpid_credid ON create_queue(rpId, credentialId)"),
     db.prepare(`
       CREATE TABLE IF NOT EXISTS rate_limits (

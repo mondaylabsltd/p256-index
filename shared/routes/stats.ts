@@ -5,8 +5,8 @@ import { validateStringLength } from "../validation.ts";
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
 function parsePagination(url: URL) {
-  const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
-  const pageSize = Math.min(100, Math.max(1, parseInt(url.searchParams.get("pageSize") || "20", 10)));
+  const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(url.searchParams.get("pageSize") || "20", 10) || 20));
   const order = url.searchParams.get("order") === "asc" ? "asc" as const : "desc" as const;
   return { page, pageSize, order };
 }
