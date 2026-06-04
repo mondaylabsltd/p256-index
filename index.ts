@@ -1,5 +1,5 @@
 import { initConfig } from "./src/config.ts";
-import { initRpc } from "./src/rpc.ts";
+import { initRpc, setAlchemyRpc } from "./src/rpc.ts";
 import { CONTRACT_ADDRESS } from "./src/contract.ts";
 import { handleQuery } from "./src/routes/query.ts";
 import { handleChallenge } from "./src/routes/challenge.ts";
@@ -10,6 +10,7 @@ import { initQueue, startQueueWorker } from "./src/queue.ts";
 const HOME_HTML = await Deno.readTextFile(new URL("./src/index.html", import.meta.url));
 
 const config = initConfig();
+if (config.alchemyApiKey) setAlchemyRpc(config.alchemyApiKey);
 await initRpc();
 initQueue(config.queueDbPath);
 

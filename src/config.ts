@@ -9,6 +9,7 @@ export interface AppConfig {
   port: number;
   privateKey: string;
   commitPrivateKey: string; // derived from PRIVATE_KEY via SHA-256 for commit txs
+  alchemyApiKey: string;
   queueDbPath: string;
   telegramBotToken: string;
   telegramChatId: string;
@@ -23,6 +24,7 @@ export function initConfig(): AppConfig {
     privateKey,
     commitPrivateKey: privateKey ? deriveCommitKey(privateKey) : "",
     queueDbPath: Deno.env.get("QUEUE_DB_PATH") || "queue.db",
+    alchemyApiKey: Deno.env.get("ALCHEMY_API_KEY") || "",
     telegramBotToken: Deno.env.get("TELEGRAM_BOT_TOKEN") || "",
     telegramChatId: Deno.env.get("TELEGRAM_CHAT_ID") || "",
   };

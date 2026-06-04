@@ -88,14 +88,24 @@ export function getCurrentRpc(): string {
   return rpc;
 }
 
+let alchemyRpc: string | null = null;
+
+/** Set Alchemy RPC URL. Called once from initRpc if ALCHEMY_API_KEY is configured. */
+export function setAlchemyRpc(apiKey: string): void {
+  alchemyRpc = `https://gnosis-mainnet.g.alchemy.com/v2/${apiKey}`;
+  console.log(`[rpc] Alchemy RPC configured (priority write endpoint)`);
+}
+
 export function getWriteRpc(): string {
-  // Round-robin over known-good write RPCs, skipping failed ones
+  // Alchemy first if configured and available
+  if (alchemyRpc && isAvailable(alchemyRpc)) return alchemyRpc;
+
+  // Fallback: round-robin over known-good write RPCs
   for (let i = 0; i < WRITE_RPCS.length; i++) {
     const rpc = WRITE_RPCS[writeIndex % WRITE_RPCS.length];
     writeIndex = (writeIndex + 1) % WRITE_RPCS.length;
     if (isAvailable(rpc)) return rpc;
   }
-  // All marked bad — return first (cooldowns will expire)
   const rpc = WRITE_RPCS[writeIndex % WRITE_RPCS.length];
   writeIndex = (writeIndex + 1) % WRITE_RPCS.length;
   return rpc;
