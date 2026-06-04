@@ -28,7 +28,7 @@ export interface QueueItem {
 const MAX_RETRIES = 10;
 const WORKER_INTERVAL = 2000; // 2s
 const QUERY_BATCH_SIZE = 100;  // multicall queries — can be large
-const TX_BATCH_SIZE = 20;      // tx sends per cycle — keep small to avoid nonce gaps
+const TX_BATCH_SIZE = 5;       // tx sends per cycle — small batches to avoid pushing gas price up
 
 // --- Rate Limiting ---
 
