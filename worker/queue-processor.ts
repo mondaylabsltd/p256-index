@@ -288,7 +288,7 @@ export class QueueProcessor implements DurableObject {
         args: [CONTRACT_ADDRESS, commitments],
         account: wallet.account,
       });
-      await wallet.writeContract({
+      const hash = await wallet.writeContract({
         address: BATCH_HELPER_ADDRESS,
         abi: BATCH_ABI,
         functionName: "batchCommit",
@@ -297,13 +297,16 @@ export class QueueProcessor implements DurableObject {
         gas: gasEstimate * 120n / 100n,
       });
 
+      // Wait for receipt to ensure commit tx is actually mined
+      await commitClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+
       const now = Date.now();
       const stmts = items.map((item) =>
         this.db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?")
           .bind(now, item.id)
       );
       await this.db.batch(stmts);
-      console.log(`[queue-processor] batchCommit: ${items.length} items in 1 tx`);
+      console.log(`[queue-processor] batchCommit: ${items.length} items confirmed in 1 tx`);
     } catch (err) {
       handle.release();
       console.warn(`[queue-processor] batchCommit failed: ${err instanceof Error ? err.message : err}`);
