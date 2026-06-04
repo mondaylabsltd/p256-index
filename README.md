@@ -39,6 +39,17 @@ Every key traces directly back to the origin credential.
 | `commit(bytes32)` | Submit commitment hash |
 | `createRecord(rpId, credentialId, walletRef, publicKey, name, initialCredentialId, metadata)` | Register a passkey (requires prior commit) |
 
+### Batch helper (WebAuthnP256BatchHelper)
+
+A separate stateless contract for batching multiple operations into a single transaction:
+
+| Function | Description |
+|---|---|
+| `batchCommit(index, bytes32[])` | Batch commit N commitments in one tx |
+| `batchCreateRecord(index, CreateParams[])` | Batch create N records in one tx |
+
+Batch operations are atomic — if any record fails, the entire batch reverts.
+
 ### Read — single record
 
 | Function | Description |
