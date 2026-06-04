@@ -25,7 +25,7 @@ MemoryHigh=200M
 
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/webauthnp256-publickey-index/data
+ReadWritePaths=/opt/webauthnp256-publickey-index/data /opt/webauthnp256-publickey-index/releases
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
