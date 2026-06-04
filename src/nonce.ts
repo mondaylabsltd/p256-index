@@ -1,9 +1,12 @@
 /**
- * Local nonce manager.
+ * Local nonce manager for fire-and-forget tx pattern.
  *
  * Supports multiple independent nonce pools (one per EOA wallet).
- * Each pool: fetches on-chain nonce once, then increments locally.
- * On failure, resyncs from the chain.
+ * Each pool: syncs from chain, increments locally, handles failures.
+ *
+ * Key design: acquireNonce returns a nonce and a release function.
+ * On success (tx sent to RPC): do nothing — nonce is consumed.
+ * On failure (tx NOT sent): call release() to return the nonce to the pool.
  */
 
 import { createPublicClient, http } from "viem";
@@ -17,7 +20,6 @@ interface NonceState {
   mutex: Promise<void>;
 }
 
-// Separate nonce pools: "create" for createRecord, "commit" for commit
 const pools = new Map<string, NonceState>();
 
 function getPool(role: string): NonceState {
@@ -48,13 +50,20 @@ async function fetchOnChainNonce(role: string): Promise<number> {
   return nonce;
 }
 
+export interface NonceHandle {
+  nonce: number;
+  /** Call on send failure to return the nonce to the pool (prevents gaps). */
+  release: () => void;
+}
+
 /**
- * Acquire the next nonce for a role. Serialized per role.
- * First call (or after reset) fetches from the chain; subsequent calls increment locally.
+ * Acquire the next nonce for a role. Returns { nonce, release }.
+ * If the tx fails to send, call release() to avoid nonce gaps.
+ * If the tx is sent successfully, do nothing (nonce is consumed).
  */
-export function acquireNonce(role: "create" | "commit" = "create"): Promise<number> {
+export function acquireNonce(role: "create" | "commit" = "create"): Promise<NonceHandle> {
   const pool = getPool(role);
-  return new Promise<number>((resolve, reject) => {
+  return new Promise<NonceHandle>((resolve, reject) => {
     pool.mutex = pool.mutex.then(async () => {
       try {
         if (pool.current === null) {
@@ -63,7 +72,15 @@ export function acquireNonce(role: "create" | "commit" = "create"): Promise<numb
         }
         const nonce = pool.current;
         pool.current++;
-        resolve(nonce);
+        resolve({
+          nonce,
+          release: () => {
+            // Return nonce to pool — force resync on next acquire
+            // (can't just decrement because other nonces may have been issued)
+            pool.current = null;
+            console.log(`[nonce:${role}] Released nonce ${nonce}, will resync`);
+          },
+        });
       } catch (err) {
         reject(err);
       }

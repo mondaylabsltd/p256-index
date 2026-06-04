@@ -204,21 +204,8 @@ async function checkAlerts(): Promise<void> {
     if (commitWallet.account.address !== createWallet.account.address) {
       const commitBalance = await client.getBalance({ address: commitWallet.account.address });
       const commitBalanceXdai = Number(commitBalance) / 1e18;
-      const FUND_THRESHOLD = 0.005; // xDAI
-      const FUND_AMOUNT = 0.02;     // xDAI
-      if (commitBalanceXdai < FUND_THRESHOLD && balanceXdai > FUND_AMOUNT + GAS_BALANCE_THRESHOLD) {
-        console.log(`[queue] Auto-funding commit wallet: ${commitBalanceXdai.toFixed(6)} xDAI < ${FUND_THRESHOLD}, sending ${FUND_AMOUNT} xDAI`);
-        try {
-          const hash = await createWallet.sendTransaction({
-            to: commitWallet.account.address,
-            value: BigInt(Math.floor(FUND_AMOUNT * 1e18)),
-          });
-          console.log(`[queue] Funded commit wallet: ${hash}`);
-        } catch (err) {
-          console.warn(`[queue] Auto-fund failed:`, err instanceof Error ? err.message : err);
-        }
-      } else if (commitBalanceXdai < FUND_THRESHOLD) {
-        alerts.push(`🪫 Commit wallet balance low: ${commitBalanceXdai.toFixed(6)} xDAI (${commitWallet.account.address}), main wallet too low to auto-fund`);
+      if (commitBalanceXdai < FUND_THRESHOLD) {
+        await ensureCommitWalletFunded();
       }
     }
   } catch { /* ignore check failures */ }
@@ -234,10 +221,48 @@ let workerRunning = false;
 
 export function startQueueWorker() {
   console.log("[queue] Worker started, interval: 2s");
+  // Ensure commit wallet is funded before first cycle
+  ensureCommitWalletFunded().catch(() => {});
   setInterval(() => {
     if (workerRunning) return;
     processQueue().catch((err) => console.error("[queue] Worker error:", err));
   }, WORKER_INTERVAL);
+}
+
+const FUND_THRESHOLD = 0.005; // xDAI
+const FUND_AMOUNT = 0.05;     // xDAI
+
+async function ensureCommitWalletFunded(): Promise<void> {
+  try {
+    const { wallet: createWallet, client } = getCreateWallet();
+    const { wallet: commitWallet } = getCommitWallet();
+    if (commitWallet.account.address === createWallet.account.address) return;
+
+    const commitBalance = await client.getBalance({ address: commitWallet.account.address });
+    const commitBalanceXdai = Number(commitBalance) / 1e18;
+    if (commitBalanceXdai >= FUND_THRESHOLD) {
+      console.log(`[queue] Commit wallet ${commitWallet.account.address} balance: ${commitBalanceXdai.toFixed(6)} xDAI (ok)`);
+      return;
+    }
+
+    const mainBalance = await client.getBalance({ address: createWallet.account.address });
+    const mainBalanceXdai = Number(mainBalance) / 1e18;
+    if (mainBalanceXdai < FUND_AMOUNT + GAS_BALANCE_THRESHOLD) {
+      console.warn(`[queue] Cannot fund commit wallet: main balance too low (${mainBalanceXdai.toFixed(6)} xDAI)`);
+      return;
+    }
+
+    console.log(`[queue] Funding commit wallet ${commitWallet.account.address}: ${commitBalanceXdai.toFixed(6)} → +${FUND_AMOUNT} xDAI`);
+    const hash = await createWallet.sendTransaction({
+      to: commitWallet.account.address,
+      value: BigInt(Math.floor(FUND_AMOUNT * 1e18)),
+    });
+    // Wait for fund tx to be confirmed
+    await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
+    console.log(`[queue] Commit wallet funded: ${hash}`);
+  } catch (err) {
+    console.warn(`[queue] Auto-fund failed:`, err instanceof Error ? err.message : err);
+  }
 }
 
 async function processQueue() {
@@ -354,19 +379,35 @@ async function processCommitted() {
   if (ready.length === 0) return;
   console.log(`[queue] Sending ${ready.length} createRecord txs...`);
 
-  // Fire all createRecord txs — no waiting for receipt (verified in processCreating)
+  // Acquire all nonces upfront, then fire all createRecord txs truly in parallel
+  const handles = await Promise.all(ready.map(() => acquireNonce("create")));
   const results = await Promise.allSettled(
-    ready.map((item) => fireCreateRecord(item))
+    ready.map((item, i) => {
+      const { wallet } = getCreateWallet();
+      const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
+      return wallet.writeContract({
+        address: CONTRACT_ADDRESS,
+        abi: writeAbi,
+        functionName: "createRecord",
+        args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
+        nonce: handles[i].nonce,
+      });
+    })
   );
 
+  let createSuccess = 0;
   for (let i = 0; i < ready.length; i++) {
     const result = results[i];
     if (result.status === "fulfilled") {
       db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
         .run(result.value, Date.now(), ready[i].id);
+      createSuccess++;
     } else {
       handleFailure(ready[i], result.reason?.message ?? "createRecord send failed", "committed");
     }
+  }
+  if (createSuccess < ready.length) {
+    resetNonce("create");
   }
 }
 
@@ -379,19 +420,37 @@ async function processPending() {
   if (items.length === 0) return;
   console.log(`[queue] Sending ${items.length} commit txs...`);
 
-  // Fire all commit txs — no waiting for receipt (verified by getCommitBlock in processCommitted)
+  // Acquire all nonces upfront, then fire all commit txs truly in parallel
+  const handles = await Promise.all(items.map(() => acquireNonce("commit")));
+  const { wallet } = getCommitWallet();
   const results = await Promise.allSettled(
-    items.map((item) => fireCommit(item))
+    items.map((item, i) => {
+      const { commitment } = buildCommitment(item);
+      return wallet.writeContract({
+        address: CONTRACT_ADDRESS,
+        abi: writeAbi,
+        functionName: "commit",
+        args: [commitment],
+        nonce: handles[i].nonce,
+      });
+    })
   );
 
+  let successCount = 0;
   for (let i = 0; i < items.length; i++) {
     const result = results[i];
     if (result.status === "fulfilled") {
-      // fulfilled = tx sent (or already committed). Mark 'committed', processCommitted will verify.
       db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
+      successCount++;
     } else {
+      // Don't release nonce — tx may have been sent but response timed out.
+      // Failed items will retry next cycle; nonce will resync from chain.
       handleFailure(items[i], result.reason?.message ?? "commit send failed");
     }
+  }
+  if (successCount < items.length) {
+    // Some txs failed — force nonce resync next cycle to account for possible gaps
+    resetNonce("commit");
   }
 }
 
@@ -492,55 +551,3 @@ function buildCommitment(item: QueueItem) {
   };
 }
 
-/** Send commit tx (commit wallet), return immediately (no receipt wait). */
-async function fireCommit(item: QueueItem): Promise<void> {
-  const { wallet, client } = getCommitWallet();
-  const { commitment } = buildCommitment(item);
-
-  // Skip if already committed on-chain
-  const commitBlock = await client.readContract({
-    address: CONTRACT_ADDRESS,
-    abi: CONTRACT_ABI,
-    functionName: "getCommitBlock",
-    args: [commitment],
-  });
-  if (commitBlock > 0n) {
-    console.log(`[queue] Item ${item.id} already committed at block ${commitBlock}, skipping`);
-    return;
-  }
-
-  const nonce = await acquireNonce("commit");
-  try {
-    await wallet.writeContract({
-      address: CONTRACT_ADDRESS,
-      abi: writeAbi,
-      functionName: "commit",
-      args: [commitment],
-      nonce,
-    });
-  } catch (err) {
-    resetNonce("commit");
-    throw err;
-  }
-}
-
-/** Send createRecord tx (create wallet), return txHash immediately (no receipt wait). */
-async function fireCreateRecord(item: QueueItem): Promise<string> {
-  const { wallet } = getCreateWallet();
-  const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
-
-  const nonce = await acquireNonce("create");
-  try {
-    const hash = await wallet.writeContract({
-      address: CONTRACT_ADDRESS,
-      abi: writeAbi,
-      functionName: "createRecord",
-      args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
-      nonce,
-    });
-    return hash;
-  } catch (err) {
-    resetNonce("create");
-    throw err;
-  }
-}
