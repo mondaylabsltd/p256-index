@@ -415,42 +415,57 @@ async function processCommitted() {
 
   if (ready.length === 0) return;
 
-  // Build params for batchCreateRecord
-  const params = ready.map((item) => {
-    const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
-    return {
-      rpId: item.rpId,
-      credentialId: item.credentialId,
-      walletRef: walletRefHex,
-      publicKey: publicKeyHex,
-      name: item.name,
-      initialCredentialId: item.initialCredentialId,
-      metadata: metadataHex,
-    };
-  });
+  // Process in sub-batches to stay within block gas limit
+  // Each createRecord ~200k gas, block limit ~17M → max ~80 per tx, use 10 to be safe
+  const CREATE_SUB_BATCH = 10;
+  const { wallet, client: walletClient } = getCreateWallet();
 
-  // Single batchCreateRecord tx for all items — 1 nonce, no gaps
-  const { wallet } = getCreateWallet();
-  const handle = await acquireNonce("create");
-  try {
-    const hash = await wallet.writeContract({
-      address: BATCH_HELPER_ADDRESS,
-      abi: batchAbi,
-      functionName: "batchCreateRecord",
-      args: [CONTRACT_ADDRESS, params],
-      nonce: handle.nonce,
+  for (let offset = 0; offset < ready.length; offset += CREATE_SUB_BATCH) {
+    const batch = ready.slice(offset, offset + CREATE_SUB_BATCH);
+    const params = batch.map((item) => {
+      const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
+      return {
+        rpId: item.rpId,
+        credentialId: item.credentialId,
+        walletRef: walletRefHex,
+        publicKey: publicKeyHex,
+        name: item.name,
+        initialCredentialId: item.initialCredentialId,
+        metadata: metadataHex,
+      };
     });
-    // Mark all as creating
-    const now = Date.now();
-    for (const item of ready) {
-      db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
-        .run(hash, now, item.id);
+
+    const handle = await acquireNonce("create");
+    try {
+      // Estimate gas first to catch reverts early
+      const gasEstimate = await walletClient.estimateContractGas({
+        address: BATCH_HELPER_ADDRESS,
+        abi: batchAbi,
+        functionName: "batchCreateRecord",
+        args: [CONTRACT_ADDRESS, params],
+        account: wallet.account,
+      });
+      console.log(`[queue] batchCreateRecord: ${batch.length} items, estimated gas: ${gasEstimate}`);
+
+      const hash = await wallet.writeContract({
+        address: BATCH_HELPER_ADDRESS,
+        abi: batchAbi,
+        functionName: "batchCreateRecord",
+        args: [CONTRACT_ADDRESS, params],
+        nonce: handle.nonce,
+        gas: gasEstimate * 120n / 100n, // 20% buffer
+      });
+      const now = Date.now();
+      for (const item of batch) {
+        db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
+          .run(hash, now, item.id);
+      }
+    } catch (err) {
+      handle.release();
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[queue] batchCreateRecord failed (${batch.length} items): ${msg.slice(0, 200)}`);
+      break; // Stop processing further sub-batches this cycle
     }
-    console.log(`[queue] batchCreateRecord: ${ready.length} items in 1 tx`);
-  } catch (err) {
-    handle.release();
-    console.warn(`[queue] batchCreateRecord failed: ${err instanceof Error ? err.message : err}`);
-    // Items stay committed, will retry next cycle
   }
 }
 
