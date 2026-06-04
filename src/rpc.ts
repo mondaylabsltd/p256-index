@@ -148,6 +148,15 @@ export async function getHealthyRpc(): Promise<string> {
   return getCurrentRpc();
 }
 
+/** Reset internal state (for testing only). */
+export function _resetForTest(rpcs?: string[]): void {
+  rpcList = rpcs ?? [...FALLBACK_RPCS];
+  currentIndex = 0;
+  writeIndex = 0;
+  failedRpcs.clear();
+  lastRefresh = Date.now();
+}
+
 async function isHealthy(url: string): Promise<boolean> {
   try {
     const res = await fetch(url, {

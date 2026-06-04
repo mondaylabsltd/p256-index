@@ -1,5 +1,8 @@
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const MAX_MEMORY_BYTES = 100 * 1024 * 1024; // 100MB
+const DEFAULT_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_MAX_MEMORY_BYTES = 100 * 1024 * 1024; // 100MB
+
+let CACHE_TTL = DEFAULT_CACHE_TTL;
+let MAX_MEMORY_BYTES = DEFAULT_MAX_MEMORY_BYTES;
 
 interface CacheEntry {
   value: unknown;
@@ -63,4 +66,16 @@ export function cacheSize(): number {
 
 export function cacheMemoryUsage(): number {
   return totalSize;
+}
+
+/** Override TTL and memory limit (for testing only). */
+export function _configureForTest(opts: { ttl?: number; maxBytes?: number }): void {
+  if (opts.ttl !== undefined) CACHE_TTL = opts.ttl;
+  if (opts.maxBytes !== undefined) MAX_MEMORY_BYTES = opts.maxBytes;
+}
+
+/** Reset configuration to defaults (for testing only). */
+export function _resetConfigForTest(): void {
+  CACHE_TTL = DEFAULT_CACHE_TTL;
+  MAX_MEMORY_BYTES = DEFAULT_MAX_MEMORY_BYTES;
 }

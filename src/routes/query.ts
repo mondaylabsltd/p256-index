@@ -1,6 +1,7 @@
 import { getPublicKey, getPublicKeyByWalletRef } from "../contract.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
 import { findDuplicate } from "../queue.ts";
+import { validateStringLength } from "../validation.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
@@ -9,6 +10,11 @@ export async function handleQuery(req: Request): Promise<Response> {
   const rpId = url.searchParams.get("rpId");
   const credentialId = url.searchParams.get("credentialId");
   const walletRef = url.searchParams.get("walletRef");
+
+  const lengthError = validateStringLength({ rpId: rpId ?? undefined, credentialId: credentialId ?? undefined, walletRef: walletRef ?? undefined });
+  if (lengthError) {
+    return Response.json({ error: lengthError }, { status: 400 });
+  }
 
   // Query by walletRef
   if (walletRef) {

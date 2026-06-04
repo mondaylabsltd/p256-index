@@ -27,7 +27,7 @@ export interface QueueItem {
 
 const MAX_RETRIES = 10;
 const WORKER_INTERVAL = 2000; // 2s
-const BATCH_SIZE = 50;
+const BATCH_SIZE = 100;
 
 // --- Rate Limiting ---
 
@@ -355,7 +355,7 @@ import { gnosis } from "viem/chains";
 import { getWriteRpc } from "./rpc.ts";
 import { getConfig } from "./config.ts";
 import { getClient as getPublicClient, CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
-import { acquireNonce, resetNonce, isNonceError } from "./nonce.ts";
+import { acquireNonce, resetNonce } from "./nonce.ts";
 
 const writeAbi = [
   {
@@ -436,9 +436,10 @@ async function commitItem(item: QueueItem): Promise<void> {
       args: [commitment],
       nonce,
     });
-    await client.waitForTransactionReceipt({ hash });
+    await client.waitForTransactionReceipt({ hash, timeout: 60_000 });
   } catch (err) {
-    if (isNonceError(err)) resetNonce();
+    // Always reset: can't know if tx landed (timeout, network error, nonce conflict)
+    resetNonce();
     throw err;
   }
 }
@@ -457,10 +458,11 @@ async function createItem(item: QueueItem): Promise<string> {
       args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
       nonce,
     });
-    await client.waitForTransactionReceipt({ hash });
+    await client.waitForTransactionReceipt({ hash, timeout: 60_000 });
     return hash;
   } catch (err) {
-    if (isNonceError(err)) resetNonce();
+    // Always reset: can't know if tx landed
+    resetNonce();
     throw err;
   }
 }

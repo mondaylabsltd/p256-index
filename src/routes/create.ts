@@ -3,6 +3,7 @@ import { enqueue, findDuplicate, getQueueItem, checkRateLimit } from "../queue.t
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../wallet-ref.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
+import { validateStringLength } from "../validation.ts";
 
 export async function handleCreate(req: Request): Promise<Response> {
   let body: {
@@ -29,6 +30,16 @@ export async function handleCreate(req: Request): Promise<Response> {
       { error: "rpId, credentialId, publicKey, and name are required" },
       { status: 400 },
     );
+  }
+
+  const lengthError = validateStringLength({
+    rpId, credentialId, publicKey, name,
+    walletRef: body.walletRef,
+    initialCredentialId: body.initialCredentialId,
+    metadata: body.metadata,
+  });
+  if (lengthError) {
+    return Response.json({ error: lengthError }, { status: 400 });
   }
 
   // Rate limit by IP (hashed for GDPR)
