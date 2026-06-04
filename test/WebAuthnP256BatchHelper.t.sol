@@ -22,8 +22,13 @@ contract WebAuthnP256BatchHelperTest is Test {
     }
 
     function _commitment(
-        string memory rpId, string memory credentialId, bytes32 walletRef,
-        bytes memory pk, string memory name, string memory initCredId, bytes memory metadata
+        string memory rpId,
+        string memory credentialId,
+        bytes32 walletRef,
+        bytes memory pk,
+        string memory name,
+        string memory initCredId,
+        bytes memory metadata
     ) internal pure returns (bytes32) {
         return keccak256(abi.encode(rpId, credentialId, walletRef, pk, name, initCredId, metadata));
     }
