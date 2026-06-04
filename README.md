@@ -91,6 +91,7 @@ Pagination: `offset` = items to skip, `limit` = max items. `desc = true` for new
 | Version | Address | Networks |
 |---|---|---|
 | v2 | `0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3` | Gnosis (CREATE2, salt=0) |
+| v2 BatchHelper | `0xc7B0db5d4974abA3EA25780f40Bf369CC013a16E` | Gnosis |
 | v1 (legacy) | `0xc1f7Ef155a0ee1B48edbbB5195608e336ae6542b` | Gnosis |
 
 Deployed via CREATE2 ([Deterministic Deployment Proxy](https://github.com/Arachnid/deterministic-deployment-proxy)) for consistent address across chains.
