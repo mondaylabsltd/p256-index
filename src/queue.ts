@@ -1,51 +1,45 @@
 import { DatabaseSync as Database } from "node:sqlite";
+import { createPublicClient, http } from "viem";
+import { gnosis } from "viem/chains";
+import { getWriteRpc } from "./rpc.ts";
+import { getConfig } from "./config.ts";
+import { CONTRACT_ADDRESS, CONTRACT_ABI, BATCH_HELPER_ADDRESS, BATCH_ABI } from "./contract-shared.ts";
+import { acquireNonce } from "./nonce.ts";
+import {
+  type QueueStatus,
+  type QueueItem,
+  type AppConfig,
+  MAX_RETRIES,
+  WORKER_INTERVAL,
+  QUERY_BATCH_SIZE,
+  TX_BATCH_SIZE,
+  RATE_WINDOW,
+  DEFAULT_RATE_LIMIT,
+  MAX_GAS_PRICE_GWEI,
+  GAS_BALANCE_THRESHOLD,
+  FUND_THRESHOLD,
+  FUND_AMOUNT,
+  DONE_RETENTION,
+  CREATE_SUB_BATCH,
+  CREATE_QUEUE_DDL,
+  hashIp,
+  buildCommitment,
+  getCreateWallet,
+  getCommitWallet,
+  sendTelegram,
+} from "./queue-shared.ts";
 
-// --- Types ---
-
-export type QueueStatus = "pending" | "committed" | "creating" | "done" | "failed";
-
-export interface QueueItem {
-  id: string;
-  status: QueueStatus;
-  rpId: string;
-  credentialId: string;
-  walletRef: string;
-  publicKey: string;
-  name: string;
-  initialCredentialId: string;
-  metadata: string;
-  txHash: string;
-  error: string;
-  retries: number;
-  retryAfter: number;
-  ip: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-// --- Config ---
-
-const MAX_RETRIES = 10;
-const WORKER_INTERVAL = 2000; // 2s
-const QUERY_BATCH_SIZE = 100;  // multicall queries — can be large
-const TX_BATCH_SIZE = 50;      // items per batch tx (batchCommit/batchCreateRecord handles all in 1 tx)
+export type { QueueStatus, QueueItem };
 
 // --- Rate Limiting ---
 
-const RATE_WINDOW = 60_000; // 1 minute
-let RATE_LIMIT = 5; // max requests per IP per window
+let RATE_LIMIT = DEFAULT_RATE_LIMIT;
 
 /** Override rate limit (for testing only). */
 export function _setRateLimitForTest(limit: number): void {
   RATE_LIMIT = limit;
 }
-const ipRequests = new Map<string, number[]>(); // ip -> timestamps
-
-async function hashIp(ip: string): Promise<string> {
-  const data = new TextEncoder().encode(ip);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
-}
+const ipRequests = new Map<string, number[]>();
 
 export async function checkRateLimit(ip: string): Promise<boolean> {
   const hashed = await hashIp(ip);
@@ -75,26 +69,7 @@ let db: Database;
 export function initQueue(dbPath = "queue.db") {
   db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS create_queue (
-      id TEXT PRIMARY KEY,
-      status TEXT NOT NULL DEFAULT 'pending',
-      rpId TEXT NOT NULL,
-      credentialId TEXT NOT NULL,
-      walletRef TEXT NOT NULL,
-      publicKey TEXT NOT NULL,
-      name TEXT NOT NULL,
-      initialCredentialId TEXT NOT NULL,
-      metadata TEXT NOT NULL,
-      txHash TEXT NOT NULL DEFAULT '',
-      error TEXT NOT NULL DEFAULT '',
-      retries INTEGER NOT NULL DEFAULT 0,
-      retryAfter INTEGER NOT NULL DEFAULT 0,
-      ip TEXT NOT NULL DEFAULT '',
-      createdAt INTEGER NOT NULL,
-      updatedAt INTEGER NOT NULL
-    )
-  `);
+  db.exec(CREATE_QUEUE_DDL);
   db.exec("CREATE INDEX IF NOT EXISTS idx_queue_status ON create_queue(status)");
 
   // Migrations for existing databases
@@ -111,10 +86,6 @@ export function getQueueDb(): Database {
   return db;
 }
 
-function generateId(): string {
-  return crypto.randomUUID();
-}
-
 export async function enqueue(params: {
   rpId: string;
   credentialId: string;
@@ -125,7 +96,7 @@ export async function enqueue(params: {
   metadata: string;
   ip: string;
 }): Promise<string> {
-  const id = generateId();
+  const id = crypto.randomUUID();
   const now = Date.now();
   const ipHash = await hashIp(params.ip);
   db.prepare(`
@@ -147,32 +118,21 @@ export function findDuplicate(rpId: string, credentialId: string): QueueItem | n
 
 // --- Telegram Notifications ---
 
-const ALERT_INTERVAL = 5 * 60_000; // check every 5 minutes
+const ALERT_INTERVAL = 5 * 60_000;
 const QUEUE_BACKLOG_THRESHOLD = 100;
-const GAS_BALANCE_THRESHOLD = 0.01; // xDAI
-const MAX_GAS_PRICE_GWEI = 0.1;
 let lastAlertAt = 0;
-let lastFailedCount = 0; // only alert when failed count changes
-
-async function sendTelegram(message: string): Promise<void> {
-  const { telegramBotToken: botToken, telegramChatId: chatId } = getConfig();
-  if (!botToken || !chatId) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: message }),
-    });
-  } catch { /* ignore send failures */ }
-}
-
-const DONE_RETENTION = 7 * 24 * 60 * 60_000; // 7 days
+let lastFailedCount = 0;
 
 function cleanupDoneRecords(): void {
   const cutoff = Date.now() - DONE_RETENTION;
   const result = db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?").run(cutoff);
   const deleted = (result as unknown as { changes: number }).changes;
   if (deleted > 0) console.log(`[queue] Cleaned up ${deleted} done records older than 7 days`);
+}
+
+function cfg(): AppConfig {
+  const c = getConfig();
+  return { privateKey: c.privateKey, commitPrivateKey: c.commitPrivateKey, telegramBotToken: c.telegramBotToken, telegramChatId: c.telegramChatId };
 }
 
 async function checkAlerts(): Promise<void> {
@@ -195,9 +155,9 @@ async function checkAlerts(): Promise<void> {
   }
   lastFailedCount = failed;
 
-  // 3. Gas balance + gas price check (use write RPC for reliability)
+  // 3. Gas balance + gas price check
   try {
-    const { wallet: createWallet, client } = getCreateWallet();
+    const { wallet: createWallet, client } = getCreateWallet(cfg());
     const balance = await client.getBalance({ address: createWallet.account.address });
     const balanceXdai = Number(balance) / 1e18;
     if (balanceXdai < GAS_BALANCE_THRESHOLD) {
@@ -209,8 +169,8 @@ async function checkAlerts(): Promise<void> {
       alerts.push(`⛽ Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), queue paused`);
     }
 
-    // Auto-fund commit wallet if balance is low (transfer from create wallet)
-    const { wallet: commitWallet } = getCommitWallet();
+    // Auto-fund commit wallet if balance is low
+    const { wallet: commitWallet } = getCommitWallet(cfg());
     if (commitWallet.account.address !== createWallet.account.address) {
       const commitBalance = await client.getBalance({ address: commitWallet.account.address });
       const commitBalanceXdai = Number(commitBalance) / 1e18;
@@ -221,7 +181,7 @@ async function checkAlerts(): Promise<void> {
   } catch { /* ignore check failures */ }
 
   if (alerts.length > 0) {
-    await sendTelegram(`[webauthnp256-publickey-index]\n${alerts.join("\n")}`);
+    await sendTelegram(cfg(), `[webauthnp256-publickey-index]\n${alerts.join("\n")}`);
   }
 }
 
@@ -231,7 +191,6 @@ let workerRunning = false;
 
 export function startQueueWorker() {
   console.log("[queue] Worker started, interval: 2s");
-  // Ensure commit wallet is funded before first cycle
   ensureCommitWalletFunded().catch(() => {});
   setInterval(() => {
     if (workerRunning) return;
@@ -239,13 +198,10 @@ export function startQueueWorker() {
   }, WORKER_INTERVAL);
 }
 
-const FUND_THRESHOLD = 0.005; // xDAI
-const FUND_AMOUNT = 0.05;     // xDAI
-
 async function ensureCommitWalletFunded(): Promise<void> {
   try {
-    const { wallet: createWallet, client } = getCreateWallet();
-    const { wallet: commitWallet } = getCommitWallet();
+    const { wallet: createWallet, client } = getCreateWallet(cfg());
+    const { wallet: commitWallet } = getCommitWallet(cfg());
     if (commitWallet.account.address === createWallet.account.address) return;
 
     const commitBalance = await client.getBalance({ address: commitWallet.account.address });
@@ -267,7 +223,6 @@ async function ensureCommitWalletFunded(): Promise<void> {
       to: commitWallet.account.address,
       value: BigInt(Math.floor(FUND_AMOUNT * 1e18)),
     });
-    // Wait for fund tx to be confirmed
     await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
     console.log(`[queue] Commit wallet funded: ${hash}`);
   } catch (err) {
@@ -278,7 +233,6 @@ async function ensureCommitWalletFunded(): Promise<void> {
 async function processQueue() {
   workerRunning = true;
   try {
-    // Check gas price using write RPC (known-good, not the rotating public list)
     try {
       const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
       const gasPrice = await writeClient.getGasPrice();
@@ -293,8 +247,6 @@ async function processQueue() {
       return;
     }
 
-    // Priority order: verify creating → advance committed → send pending commits
-    // Items closest to done get processed first; nonces prioritize createRecord over commit.
     await processCreating();
     await processCommitted();
     await processPending();
@@ -305,7 +257,7 @@ async function processQueue() {
   }
 }
 
-// Phase 1: Verify items in 'creating' status — batch hasRecord via multicall
+// Phase 1: Verify items in 'creating' status
 async function processCreating() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
@@ -315,7 +267,6 @@ async function processCreating() {
 
   const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
 
-  // Single multicall: check hasRecord for all items at once
   const calls = items.map((item) => ({
     address: CONTRACT_ADDRESS as `0x${string}`,
     abi: CONTRACT_ABI,
@@ -337,15 +288,14 @@ async function processCreating() {
           handleFailure(items[i], "createRecord tx not confirmed after 2min", "committed");
         }
       }
-      // result.status === "failure" → RPC error for this call, skip
     }
     if (doneCount > 0) console.log(`[queue] ${doneCount} items confirmed on-chain, done`);
   } catch {
-    // Entire multicall failed (RPC error), retry next cycle
+    // Entire multicall failed, retry next cycle
   }
 }
 
-// Phase 2: Advance committed items — batch getCommitBlock via multicall, fire createRecord
+// Phase 2: Advance committed items
 async function processCommitted() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
@@ -356,7 +306,6 @@ async function processCommitted() {
   const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
   const currentBlock = await client.getBlockNumber();
 
-  // Single multicall: check getCommitBlock for all items at once
   const commitments = items.map((item) => buildCommitment(item).commitment);
   const calls = commitments.map((commitment) => ({
     address: CONTRACT_ADDRESS as `0x${string}`,
@@ -369,7 +318,7 @@ async function processCommitted() {
   try {
     results = await client.multicall({ contracts: calls }) as typeof results;
   } catch {
-    return; // multicall failed, retry next cycle
+    return;
   }
 
   const ready: QueueItem[] = [];
@@ -384,10 +333,8 @@ async function processCommitted() {
     } else if (commitBlock === 0n) {
       needsHasRecordCheck.push(items[i]);
     }
-    // commitBlock > 0 but not enough delay → just wait
   }
 
-  // Batch check hasRecord for items with commitBlock === 0 (maybe already on-chain or never committed)
   if (needsHasRecordCheck.length > 0) {
     const hasRecordCalls = needsHasRecordCheck.map((item) => ({
       address: CONTRACT_ADDRESS as `0x${string}`,
@@ -415,10 +362,7 @@ async function processCommitted() {
 
   if (ready.length === 0) return;
 
-  // Process in sub-batches to stay within block gas limit
-  // Each createRecord ~200k gas, block limit ~17M → max ~80 per tx, use 10 to be safe
-  const CREATE_SUB_BATCH = 10;
-  const { wallet, client: walletClient } = getCreateWallet();
+  const { wallet, client: walletClient } = getCreateWallet(cfg());
 
   for (let offset = 0; offset < ready.length; offset += CREATE_SUB_BATCH) {
     const batch = ready.slice(offset, offset + CREATE_SUB_BATCH);
@@ -437,10 +381,9 @@ async function processCommitted() {
 
     const handle = await acquireNonce("create");
     try {
-      // Estimate gas first to catch reverts early
       const gasEstimate = await walletClient.estimateContractGas({
         address: BATCH_HELPER_ADDRESS,
-        abi: batchAbi,
+        abi: BATCH_ABI,
         functionName: "batchCreateRecord",
         args: [CONTRACT_ADDRESS, params],
         account: wallet.account,
@@ -449,27 +392,30 @@ async function processCommitted() {
 
       const hash = await wallet.writeContract({
         address: BATCH_HELPER_ADDRESS,
-        abi: batchAbi,
+        abi: BATCH_ABI,
         functionName: "batchCreateRecord",
         args: [CONTRACT_ADDRESS, params],
         nonce: handle.nonce,
-        gas: gasEstimate * 120n / 100n, // 20% buffer
+        gas: gasEstimate * 120n / 100n,
       });
+      // Wait for receipt — single batch tx, ~5-10s is acceptable
+      await walletClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
       const now = Date.now();
       for (const item of batch) {
-        db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
+        db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
           .run(hash, now, item.id);
       }
+      console.log(`[queue] batchCreateRecord: ${batch.length} items confirmed, done`);
     } catch (err) {
       handle.release();
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[queue] batchCreateRecord failed (${batch.length} items): ${msg.slice(0, 200)}`);
-      break; // Stop processing further sub-batches this cycle
+      break;
     }
   }
 }
 
-// Phase 3: Send commit txs for pending items (no waiting for receipt)
+// Phase 3: Send commit txs for pending items
 async function processPending() {
   const items = db.prepare(
     "SELECT * FROM create_queue WHERE status = 'pending' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
@@ -477,38 +423,36 @@ async function processPending() {
 
   if (items.length === 0) return;
 
-  // Build all commitments
   const commitments = items.map((item) => buildCommitment(item).commitment);
 
-  // Single batchCommit tx for all items — 1 nonce, no gaps
-  const { wallet, client: commitClient } = getCommitWallet();
+  const { wallet, client: commitClient } = getCommitWallet(cfg());
   const handle = await acquireNonce("commit");
   try {
     const gasEstimate = await commitClient.estimateContractGas({
       address: BATCH_HELPER_ADDRESS,
-      abi: batchAbi,
+      abi: BATCH_ABI,
       functionName: "batchCommit",
       args: [CONTRACT_ADDRESS, commitments],
       account: wallet.account,
     });
-    await wallet.writeContract({
+    const hash = await wallet.writeContract({
       address: BATCH_HELPER_ADDRESS,
-      abi: batchAbi,
+      abi: BATCH_ABI,
       functionName: "batchCommit",
       args: [CONTRACT_ADDRESS, commitments],
       nonce: handle.nonce,
       gas: gasEstimate * 120n / 100n,
     });
-    // Mark all as committed
+    // Wait for receipt — single batch tx, ~5-10s is acceptable
+    await commitClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
     const now = Date.now();
     for (const item of items) {
       db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(now, item.id);
     }
-    console.log(`[queue] batchCommit: ${items.length} items in 1 tx`);
+    console.log(`[queue] batchCommit: ${items.length} items confirmed`);
   } catch (err) {
     handle.release();
     console.warn(`[queue] batchCommit failed: ${err instanceof Error ? err.message : err}`);
-    // Individual items will retry next cycle (still pending)
   }
 }
 
@@ -522,7 +466,6 @@ function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | 
       .run(error, retries, Date.now(), item.id);
     console.error(`[queue] Item ${item.id} permanently failed after ${retries} attempts: ${error}`);
   } else {
-    // Exponential backoff: 5s, 15s, 45s, 2m, 6m, 20m, 1h, 3h, 9h, 12h
     const delay = Math.min(5000 * Math.pow(3, retries - 1), 12 * 60 * 60_000);
     const retryAfter = Date.now() + delay;
     db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
@@ -533,101 +476,7 @@ function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | 
   failuresSinceLastAlert++;
   if (failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
     const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
-    sendTelegram(`🔴 [webauthnp256-publickey-index] ${failuresSinceLastAlert} tx failures since last alert\nTotal permanently failed: ${failed}\nLatest error: ${error}`);
+    sendTelegram(cfg(), `🔴 [webauthnp256-publickey-index] ${failuresSinceLastAlert} tx failures since last alert\nTotal permanently failed: ${failed}\nLatest error: ${error}`);
     failuresSinceLastAlert = 0;
   }
 }
-
-// --- On-chain operations ---
-
-import { createWalletClient, createPublicClient, http, keccak256, encodeAbiParameters } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
-import { gnosis } from "viem/chains";
-import { getWriteRpc } from "./rpc.ts";
-import { getConfig } from "./config.ts";
-import { CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
-import { acquireNonce } from "./nonce.ts";
-
-const BATCH_HELPER_ADDRESS = "0xc7b0db5d4974aba3ea25780f40bf369cc013a16e" as const;
-
-const batchAbi = [
-  {
-    type: "function",
-    name: "batchCommit",
-    inputs: [
-      { name: "index", type: "address" },
-      { name: "commitments", type: "bytes32[]" },
-    ],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "batchCreateRecord",
-    inputs: [
-      { name: "index", type: "address" },
-      {
-        name: "params",
-        type: "tuple[]",
-        components: [
-          { name: "rpId", type: "string" },
-          { name: "credentialId", type: "string" },
-          { name: "walletRef", type: "bytes32" },
-          { name: "publicKey", type: "bytes" },
-          { name: "name", type: "string" },
-          { name: "initialCredentialId", type: "string" },
-          { name: "metadata", type: "bytes" },
-        ],
-      },
-    ],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-] as const;
-
-function getCreateWallet() {
-  const pk = getConfig().privateKey;
-  if (!pk) throw new Error("Missing env: PRIVATE_KEY");
-  const rpcUrl = getWriteRpc();
-  return {
-    wallet: createWalletClient({
-      account: privateKeyToAccount(pk as `0x${string}`),
-      chain: gnosis,
-      transport: http(rpcUrl),
-    }),
-    client: createPublicClient({ chain: gnosis, transport: http(rpcUrl) }),
-  };
-}
-
-function getCommitWallet() {
-  const pk = getConfig().commitPrivateKey;
-  if (!pk) throw new Error("Missing env: COMMIT_PRIVATE_KEY or PRIVATE_KEY");
-  const rpcUrl = getWriteRpc();
-  return {
-    wallet: createWalletClient({
-      account: privateKeyToAccount(pk as `0x${string}`),
-      chain: gnosis,
-      transport: http(rpcUrl),
-    }),
-    client: createPublicClient({ chain: gnosis, transport: http(rpcUrl) }),
-  };
-}
-
-function buildCommitment(item: QueueItem) {
-  const walletRefHex = item.walletRef as `0x${string}`;
-  const publicKeyHex = (item.publicKey.startsWith("0x") ? item.publicKey : `0x${item.publicKey}`) as `0x${string}`;
-  const metadataHex = (item.metadata.startsWith("0x") ? item.metadata : `0x${item.metadata}`) as `0x${string}`;
-
-  return {
-    commitment: keccak256(
-      encodeAbiParameters(
-        [{ type: "string" }, { type: "string" }, { type: "bytes32" }, { type: "bytes" }, { type: "string" }, { type: "string" }, { type: "bytes" }],
-        [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
-      ),
-    ),
-    walletRefHex,
-    publicKeyHex,
-    metadataHex,
-  };
-}
-
