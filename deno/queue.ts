@@ -181,7 +181,7 @@ async function checkAlerts(): Promise<void> {
   } catch { /* ignore check failures */ }
 
   if (alerts.length > 0) {
-    await sendTelegram(cfg(), `[webauthnp256-publickey-index]\n${alerts.join("\n")}`);
+    await sendTelegram(cfg(), `[webauthnp256-publickey-index] [Deno] [Gnosis]\n${alerts.join("\n")}`);
   }
 }
 
@@ -223,7 +223,10 @@ async function ensureCommitWalletFunded(): Promise<void> {
       to: commitWallet.account.address,
       value: BigInt(Math.floor(FUND_AMOUNT * 1e18)),
     });
-    await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
+    const fundReceipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
+    if (fundReceipt.status === "reverted") {
+      throw new Error(`Fund tx reverted: ${hash}`);
+    }
     console.log(`[queue] Commit wallet funded: ${hash}`);
   } catch (err) {
     console.warn(`[queue] Auto-fund failed:`, err instanceof Error ? err.message : err);
@@ -398,8 +401,11 @@ async function processCommitted() {
         nonce: handle.nonce,
         gas: gasEstimate * 120n / 100n,
       });
-      // Wait for receipt — single batch tx, ~5-10s is acceptable
-      await walletClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+      // Wait for receipt and verify success
+      const createReceipt = await walletClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+      if (createReceipt.status === "reverted") {
+        throw new Error(`batchCreateRecord tx reverted: ${hash}`);
+      }
       const now = Date.now();
       for (const item of batch) {
         db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
@@ -443,8 +449,11 @@ async function processPending() {
       nonce: handle.nonce,
       gas: gasEstimate * 120n / 100n,
     });
-    // Wait for receipt — single batch tx, ~5-10s is acceptable
-    await commitClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+    // Wait for receipt and verify success
+    const commitReceipt = await commitClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+    if (commitReceipt.status === "reverted") {
+      throw new Error(`batchCommit tx reverted: ${hash}`);
+    }
     const now = Date.now();
     for (const item of items) {
       db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(now, item.id);
@@ -476,7 +485,7 @@ function handleFailure(item: QueueItem, error: string, retryStatus: "pending" | 
   failuresSinceLastAlert++;
   if (failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
     const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
-    sendTelegram(cfg(), `🔴 [webauthnp256-publickey-index] ${failuresSinceLastAlert} tx failures since last alert\nTotal permanently failed: ${failed}\nLatest error: ${error}`);
+    sendTelegram(cfg(), `🔴 [webauthnp256-publickey-index] [Deno] [Gnosis]\n${failuresSinceLastAlert} tx failures since last alert\nTotal permanently failed: ${failed}\nLatest error: ${error}`);
     failuresSinceLastAlert = 0;
   }
 }

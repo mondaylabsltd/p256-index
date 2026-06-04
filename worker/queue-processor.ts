@@ -251,8 +251,11 @@ export class QueueProcessor implements DurableObject {
           gas: gasEstimate * 120n / 100n,
         });
 
-        // Wait for receipt before marking done (CF DO has 30s CPU limit, this is fine)
-        await walletClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+        // Wait for receipt and verify success before marking done
+        const createReceipt = await walletClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+        if (createReceipt.status === "reverted") {
+          throw new Error(`batchCreateRecord tx reverted: ${hash}`);
+        }
         const now = Date.now();
         const stmts = batch.map((item) =>
           this.db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
@@ -297,8 +300,11 @@ export class QueueProcessor implements DurableObject {
         gas: gasEstimate * 120n / 100n,
       });
 
-      // Wait for receipt to ensure commit tx is actually mined
-      await commitClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+      // Wait for receipt and verify success
+      const commitReceipt = await commitClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+      if (commitReceipt.status === "reverted") {
+        throw new Error(`batchCommit tx reverted: ${hash}`);
+      }
 
       const now = Date.now();
       const stmts = items.map((item) =>
@@ -341,7 +347,7 @@ export class QueueProcessor implements DurableObject {
       const config = await this.getConfig();
       const failed = await this.db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'")
         .first<{ count: number }>();
-      await sendTelegram(config, `🔴 [webauthnp256-publickey-index] ${this.failuresSinceLastAlert} tx failures\nTotal failed: ${failed?.count ?? 0}\nLatest: ${error}`);
+      await sendTelegram(config, `🔴 [webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${this.failuresSinceLastAlert} tx failures\nTotal failed: ${failed?.count ?? 0}\nLatest: ${error}`);
       this.failuresSinceLastAlert = 0;
     }
   }
@@ -373,7 +379,7 @@ export class QueueProcessor implements DurableObject {
       const balance = await client.getBalance({ address: createWallet.account.address });
       const balanceXdai = Number(balance) / 1e18;
       if (balanceXdai < GAS_BALANCE_THRESHOLD) {
-        alerts.push(`🪫 Create wallet balance low: ${balanceXdai.toFixed(6)} xDAI`);
+        alerts.push(`🪫 Create wallet balance low: ${balanceXdai.toFixed(6)} xDAI (${createWallet.account.address})`);
       }
 
       // Auto-fund commit wallet
@@ -388,7 +394,7 @@ export class QueueProcessor implements DurableObject {
     } catch { /* ignore */ }
 
     if (alerts.length > 0) {
-      await sendTelegram(config, `[webauthnp256-publickey-index]\n${alerts.join("\n")}`);
+      await sendTelegram(config, `[webauthnp256-publickey-index] [CF Worker] [Gnosis]\n${alerts.join("\n")}`);
     }
   }
 
@@ -408,7 +414,10 @@ export class QueueProcessor implements DurableObject {
         to: commitWallet.account.address,
         value: BigInt(Math.floor(FUND_AMOUNT * 1e18)),
       });
-      await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
+      const fundReceipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
+      if (fundReceipt.status === "reverted") {
+        throw new Error(`Fund tx reverted: ${hash}`);
+      }
       console.log(`[queue-processor] Commit wallet funded: ${hash}`);
     } catch (err) {
       console.warn(`[queue-processor] Auto-fund failed:`, err instanceof Error ? err.message : err);
