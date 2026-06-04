@@ -99,7 +99,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     // Use disk-based SQLite for realistic throughput measurement
-    const perfDb = "/tmp/e2e-perf-queue.db";
+    const perfDb = "./e2e-perf-queue.db";
     try { Deno.removeSync(perfDb); } catch { /* ok */ }
     try { Deno.removeSync(perfDb + "-shm"); } catch { /* ok */ }
     try { Deno.removeSync(perfDb + "-wal"); } catch { /* ok */ }
