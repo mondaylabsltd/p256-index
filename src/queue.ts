@@ -150,7 +150,7 @@ export function findDuplicate(rpId: string, credentialId: string): QueueItem | n
 const ALERT_INTERVAL = 5 * 60_000; // check every 5 minutes
 const QUEUE_BACKLOG_THRESHOLD = 100;
 const GAS_BALANCE_THRESHOLD = 0.01; // xDAI
-const MAX_GAS_PRICE_GWEI = 0.01;
+const MAX_GAS_PRICE_GWEI = 1; // Gnosis Chain normal range: 0.01-0.1 Gwei
 let lastAlertAt = 0;
 let lastFailedCount = 0; // only alert when failed count changes
 
