@@ -432,19 +432,17 @@ async function processCommitted() {
     })
   );
 
-  let createSuccess = 0;
   for (let i = 0; i < ready.length; i++) {
     const result = txResults[i];
     if (result.status === "fulfilled") {
       db.prepare("UPDATE create_queue SET status = 'creating', txHash = ?, updatedAt = ? WHERE id = ?")
         .run(result.value, Date.now(), ready[i].id);
-      createSuccess++;
     } else {
-      handleFailure(ready[i], result.reason?.message ?? "createRecord send failed", "committed");
+      // Mark creating anyway — tx may have reached mempool. processCreating verifies via hasRecord.
+      db.prepare("UPDATE create_queue SET status = 'creating', txHash = '', updatedAt = ? WHERE id = ?")
+        .run(Date.now(), ready[i].id);
+      console.warn(`[queue] Item ${ready[i].id} createRecord send uncertain: ${result.reason?.message ?? "unknown"}`);
     }
-  }
-  if (createSuccess < ready.length) {
-    resetNonce("create");
   }
 }
 
@@ -473,22 +471,19 @@ async function processPending() {
     })
   );
 
-  let successCount = 0;
   for (let i = 0; i < items.length; i++) {
     const result = results[i];
     if (result.status === "fulfilled") {
       db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
-      successCount++;
     } else {
-      // Don't release nonce — tx may have been sent but response timed out.
-      // Failed items will retry next cycle; nonce will resync from chain.
-      handleFailure(items[i], result.reason?.message ?? "commit send failed");
+      // Mark committed anyway — the tx may have reached the mempool despite the error.
+      // processCommitted will verify via getCommitBlock(); if not on-chain after cooldown, it resets to pending.
+      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
+      console.warn(`[queue] Item ${items[i].id} commit send uncertain: ${result.reason?.message ?? "unknown"}`);
     }
   }
-  if (successCount < items.length) {
-    // Some txs failed — force nonce resync next cycle to account for possible gaps
-    resetNonce("commit");
-  }
+  // Never resetNonce here — nonces are consumed even if RPC response timed out.
+  // Gap nonces will resolve when pending txs are mined or dropped from mempool.
 }
 
 const FAILURE_ALERT_BATCH = 10;
@@ -525,7 +520,7 @@ import { gnosis } from "viem/chains";
 import { getWriteRpc } from "./rpc.ts";
 import { getConfig } from "./config.ts";
 import { CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
-import { acquireNonce, resetNonce } from "./nonce.ts";
+import { acquireNonce } from "./nonce.ts";
 
 const writeAbi = [
   {
