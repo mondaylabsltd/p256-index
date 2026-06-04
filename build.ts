@@ -1,10 +1,10 @@
 import { marked } from "marked";
 
-// 1. Convert readme.md to index.html
-const markdown = await Deno.readTextFile("readme.md");
+// 1. Convert README.md (English) to index.html
+const markdown = await Deno.readTextFile("README.md");
 const htmlBody = await marked(markdown);
 const html = `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

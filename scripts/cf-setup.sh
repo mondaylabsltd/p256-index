@@ -52,6 +52,13 @@ cat > "$CONFIG_OUTPUT" <<TMPL
   ],
   "triggers": {
     "crons": ["* * * * *"]
+  },
+  "observability": {
+    "enabled": false,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
   }
 }
 TMPL

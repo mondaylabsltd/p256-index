@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -33,13 +33,13 @@
   </a>
 </div>
 <h1>WebAuthn P256 Public Key Index Service</h1>
-<p>WebAuthn P256 公钥索引服务。数据存储在 Gnosis 链上的智能合约 (V2) 中，本服务作为读写代理，提供 REST API。</p>
-<p>合约源码: <a href="https://github.com/atshelchin/webauthnp256-publickey-index-contracts">webauthnp256-publickey-index-contracts</a></p>
+<p>WebAuthn P256 Public Key Index Service. Data is stored in a smart contract (V2) on Gnosis Chain; this service acts as a read/write proxy, exposing a REST API.</p>
+<p>Contract source: <a href="https://github.com/atshelchin/webauthnp256-publickey-index-contracts">webauthnp256-publickey-index-contracts</a></p>
 <table>
 <thead>
 <tr>
-<th>合约</th>
-<th>地址 (Gnosis Chain)</th>
+<th>Contract</th>
+<th>Address (Gnosis Chain)</th>
 </tr>
 </thead>
 <tbody><tr>
@@ -51,115 +51,115 @@
 <td><code>0xc7B0db5d4974abA3EA25780f40Bf369CC013a16E</code></td>
 </tr>
 </tbody></table>
-<p>公共端点: <code>https://webauthnp256-publickey-index.biubiu.tools</code></p>
+<p>Public endpoint: <code>https://webauthnp256-publickey-index.biubiu.tools</code></p>
 <ul>
-<li>运行时: Deno</li>
-<li>数据源: Gnosis 链上合约 (通过 viem 读写, RPC 轮询 + 自动故障转移)</li>
-<li>写入: 异步队列 (SQLite 暂存, 后台批量 commit-reveal 上链)</li>
-<li>批量上链: 通过 BatchHelper 合约, 单笔 tx 处理多条 commit/createRecord</li>
-<li>双钱包: commit 和 createRecord 使用独立 EOA, nonce 互不干扰</li>
-<li>默认端口: 11256</li>
-<li>CORS: 允许所有来源</li>
+<li>Runtime: Deno (self-hosted) or Cloudflare Workers (edge deployment), two independent deployments</li>
+<li>Data source: Gnosis on-chain contract (read/write via viem, RPC polling + automatic failover)</li>
+<li>Write path: async queue (Deno: SQLite / CF: D1), background batch commit-reveal on-chain</li>
+<li>Batch on-chain: via BatchHelper contract, single tx handles multiple commit/createRecord calls</li>
+<li>Dual wallet: commit and createRecord use separate EOAs, nonces never interfere</li>
+<li>Default port: 11256 (Deno) / N/A (CF Workers)</li>
+<li>CORS: allows all origins</li>
 </ul>
-<h2>API 参考</h2>
-<p>Base URL: <code>https://webauthnp256-publickey-index.biubiu.tools</code> (或自部署地址)</p>
+<h2>API Reference</h2>
+<p>Base URL: <code>https://webauthnp256-publickey-index.biubiu.tools</code> (or your self-hosted address)</p>
 <hr>
 <h3>GET /api/challenge</h3>
-<p>获取一个随机 challenge (向后兼容)。</p>
-<p><strong>响应</strong> (200):</p>
+<p>Get a random challenge (backward compatible).</p>
+<p><strong>Response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;challenge&quot;: &quot;a1b2c3d4...&quot;
 }
 </code></pre>
 <hr>
 <h3>POST /api/create</h3>
-<p>创建一条公钥记录。请求立即返回 202, 后台异步执行链上 commit-reveal 流程。</p>
-<p><strong>请求体</strong> (JSON):</p>
+<p>Create a public key record. The request returns 202 immediately; the on-chain commit-reveal flow runs asynchronously in the background.</p>
+<p><strong>Request body</strong> (JSON):</p>
 <table>
 <thead>
 <tr>
-<th>字段</th>
-<th>类型</th>
-<th>必填</th>
-<th>说明</th>
+<th>Field</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
 </tr>
 </thead>
 <tbody><tr>
 <td>rpId</td>
 <td>string</td>
-<td>是</td>
-<td>站点域名 (如 <code>example.com</code>)</td>
+<td>Yes</td>
+<td>Site domain (e.g. <code>example.com</code>)</td>
 </tr>
 <tr>
 <td>credentialId</td>
 <td>string</td>
-<td>是</td>
-<td>凭证 ID</td>
+<td>Yes</td>
+<td>Credential ID</td>
 </tr>
 <tr>
 <td>publicKey</td>
 <td>string</td>
-<td>是</td>
-<td>P256 公钥 (hex 格式, 含 04 前缀的非压缩格式, 65 字节)</td>
+<td>Yes</td>
+<td>P256 public key (hex, uncompressed with 04 prefix, 65 bytes)</td>
 </tr>
 <tr>
 <td>name</td>
 <td>string</td>
-<td>是</td>
-<td>passkey 的显示名称</td>
+<td>Yes</td>
+<td>Display name of the passkey</td>
 </tr>
 <tr>
 <td>walletRef</td>
 <td>string</td>
-<td>否</td>
-<td>钱包标识 (bytes32 hex), 默认从 publicKey 计算确定性 Safe 地址</td>
+<td>No</td>
+<td>Wallet identifier (bytes32 hex), defaults to a deterministic Safe address derived from publicKey</td>
 </tr>
 <tr>
 <td>initialCredentialId</td>
 <td>string</td>
-<td>否</td>
-<td>初始凭证 ID, 默认等于 credentialId (密钥轮换时指向根凭证)</td>
+<td>No</td>
+<td>Initial credential ID, defaults to credentialId (points to root credential during key rotation)</td>
 </tr>
 <tr>
 <td>metadata</td>
 <td>string</td>
-<td>否</td>
-<td>附加元数据 (hex), 默认 <code>abi.encode(&quot;VelaWalletV1&quot;, publicKey)</code></td>
+<td>No</td>
+<td>Additional metadata (hex), defaults to <code>abi.encode(&quot;VelaWalletV1&quot;, publicKey)</code></td>
 </tr>
 </tbody></table>
-<p><strong>请求示例</strong>:</p>
+<p><strong>Request example</strong>:</p>
 <pre><code class="language-json">{
   &quot;rpId&quot;: &quot;example.com&quot;,
   &quot;credentialId&quot;: &quot;abc123&quot;,
   &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
-  &quot;name&quot;: &quot;我的 MacBook&quot;
+  &quot;name&quot;: &quot;My MacBook&quot;
 }
 </code></pre>
-<p><strong>响应</strong> (202 - 已入队):</p>
+<p><strong>Response</strong> (202 - Enqueued):</p>
 <pre><code class="language-json">{
   &quot;id&quot;: &quot;uuid&quot;,
   &quot;status&quot;: &quot;pending&quot;
 }
 </code></pre>
-<p><strong>响应</strong> (201 - 已存在, 幂等):</p>
+<p><strong>Response</strong> (201 - Already exists, idempotent):</p>
 <pre><code class="language-json">{
   &quot;rpId&quot;: &quot;example.com&quot;,
   &quot;credentialId&quot;: &quot;abc123&quot;,
   &quot;walletRef&quot;: &quot;0x000...abc&quot;,
   &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
-  &quot;name&quot;: &quot;我的 MacBook&quot;,
+  &quot;name&quot;: &quot;My MacBook&quot;,
   &quot;status&quot;: &quot;done&quot;
 }
 </code></pre>
-<p><strong>错误响应</strong>:</p>
+<p><strong>Error responses</strong>:</p>
 <ul>
-<li><code>400</code> - 参数缺失</li>
-<li><code>429</code> - 超过限流 (每 IP 每分钟 5 次)</li>
+<li><code>400</code> - Missing parameters</li>
+<li><code>429</code> - Rate limiting exceeded (5 requests per IP per minute)</li>
 </ul>
 <hr>
 <h3>GET /api/create/:id</h3>
-<p>查询异步创建任务的状态。</p>
-<p><strong>响应 - 完成</strong> (200, status=done):</p>
+<p>Query the status of an async creation task.</p>
+<p><strong>Response - Completed</strong> (200, status=done):</p>
 <pre><code class="language-json">{
   &quot;id&quot;: &quot;uuid&quot;,
   &quot;status&quot;: &quot;done&quot;,
@@ -167,104 +167,104 @@
   &quot;credentialId&quot;: &quot;abc123&quot;,
   &quot;walletRef&quot;: &quot;0x000...abc&quot;,
   &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
-  &quot;name&quot;: &quot;我的 MacBook&quot;,
+  &quot;name&quot;: &quot;My MacBook&quot;,
   &quot;txHash&quot;: &quot;0x...&quot;,
   &quot;createdAt&quot;: 1711000000000
 }
 </code></pre>
-<p><strong>响应 - 进行中</strong> (200, status≠done):</p>
+<p><strong>Response - In progress</strong> (200, status≠done):</p>
 <pre><code class="language-json">{
   &quot;id&quot;: &quot;uuid&quot;,
-  &quot;status&quot;: &quot;pending | committing | committed | creating&quot;,
+  &quot;status&quot;: &quot;pending | committed&quot;,
   &quot;rpId&quot;: &quot;example.com&quot;,
   &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
-  &quot;name&quot;: &quot;我的 MacBook&quot;,
+  &quot;name&quot;: &quot;My MacBook&quot;,
   &quot;createdAt&quot;: 1711000000000
 }
 </code></pre>
 <blockquote>
-<p>进行中时不返回 <code>credentialId</code> 和 <code>walletRef</code>, 防止 commit-reveal 阶段被抢跑。失败时附带 <code>error</code> 字段。</p>
+<p>While in progress, <code>credentialId</code> and <code>walletRef</code> are not returned to prevent front-running during the commit-reveal phase. On failure, an <code>error</code> field is included.</p>
 </blockquote>
-<p>status 状态机: <code>pending → committing → committed → creating → done</code>。失败时自动重试最多 3 次。</p>
+<p>Status machine: <code>pending → committed → done</code>. Automatic retry up to 3 times on failure.</p>
 <hr>
 <h3>GET /api/query</h3>
-<p>查询公钥记录。支持两种查询方式:</p>
-<p><strong>方式一: 按 rpId + credentialId</strong></p>
+<p>Query public key records. Two query methods are supported:</p>
+<p><strong>Method 1: By rpId + credentialId</strong></p>
 <p><code>GET /api/query?rpId=example.com&amp;credentialId=abc123</code></p>
-<p><strong>方式二: 按 walletRef</strong></p>
+<p><strong>Method 2: By walletRef</strong></p>
 <p><code>GET /api/query?walletRef=0x000...abc</code></p>
-<p><strong>成功响应</strong> (200):</p>
+<p><strong>Success response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;rpId&quot;: &quot;example.com&quot;,
   &quot;credentialId&quot;: &quot;abc123&quot;,
   &quot;walletRef&quot;: &quot;0x000...abc&quot;,
   &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
-  &quot;name&quot;: &quot;我的 MacBook&quot;,
+  &quot;name&quot;: &quot;My MacBook&quot;,
   &quot;initialCredentialId&quot;: &quot;abc123&quot;,
   &quot;metadata&quot;: &quot;0000...00&quot;,
   &quot;createdAt&quot;: 1711000000000
 }
 </code></pre>
-<p>如果链上未找到但队列中有 (正在上链), 会返回队列中的部分数据并附带 <code>_queue</code> 字段 (隐去 <code>credentialId</code>/<code>walletRef</code>/<code>initialCredentialId</code> 以防抢跑):</p>
+<p>If not found on-chain but present in the queue (being submitted on-chain), partial data from the queue is returned with a <code>_queue</code> field (<code>credentialId</code>/<code>walletRef</code>/<code>initialCredentialId</code> are hidden to prevent front-running):</p>
 <pre><code class="language-json">{
   &quot;rpId&quot;: &quot;example.com&quot;,
   &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
-  &quot;name&quot;: &quot;我的 MacBook&quot;,
+  &quot;name&quot;: &quot;My MacBook&quot;,
   &quot;metadata&quot;: &quot;0000...00&quot;,
   &quot;createdAt&quot;: 1711000000000,
   &quot;_queue&quot;: { &quot;id&quot;: &quot;uuid&quot;, &quot;status&quot;: &quot;committing&quot; }
 }
 </code></pre>
-<p><strong>错误响应</strong>:</p>
+<p><strong>Error responses</strong>:</p>
 <ul>
-<li><code>400</code> - 参数缺失 (需要 rpId+credentialId 或 walletRef)</li>
-<li><code>404</code> - 未找到</li>
+<li><code>400</code> - Missing parameters (requires rpId+credentialId or walletRef)</li>
+<li><code>404</code> - Not found</li>
 </ul>
 <hr>
 <h3>GET /api/stats/total</h3>
-<p>查询全网凭证总数。</p>
-<p><strong>响应</strong> (200):</p>
+<p>Query the total number of credentials across all sites.</p>
+<p><strong>Response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;totalCredentials&quot;: 1234
 }
 </code></pre>
 <hr>
 <h3>GET /api/stats/sites</h3>
-<p>分页查询所有站点。</p>
-<p><strong>Query 参数</strong>:</p>
+<p>Paginated query of all sites.</p>
+<p><strong>Query parameters</strong>:</p>
 <table>
 <thead>
 <tr>
-<th>参数</th>
-<th>类型</th>
-<th>必填</th>
-<th>默认值</th>
-<th>说明</th>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Default</th>
+<th>Description</th>
 </tr>
 </thead>
 <tbody><tr>
 <td>page</td>
 <td>number</td>
-<td>否</td>
+<td>No</td>
 <td>1</td>
-<td>页码</td>
+<td>Page number</td>
 </tr>
 <tr>
 <td>pageSize</td>
 <td>number</td>
-<td>否</td>
+<td>No</td>
 <td>20</td>
-<td>每页数量 (最大 100)</td>
+<td>Items per page (max 100)</td>
 </tr>
 <tr>
 <td>order</td>
 <td>string</td>
-<td>否</td>
+<td>No</td>
 <td>desc</td>
-<td>排序方向: <code>asc</code> 或 <code>desc</code></td>
+<td>Sort direction: <code>asc</code> or <code>desc</code></td>
 </tr>
 </tbody></table>
-<p><strong>响应</strong> (200):</p>
+<p><strong>Response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;total&quot;: 42,
   &quot;page&quot;: 1,
@@ -276,48 +276,48 @@
 </code></pre>
 <hr>
 <h3>GET /api/stats/keys</h3>
-<p>分页查询某站点下的所有公钥。</p>
-<p><strong>Query 参数</strong>:</p>
+<p>Paginated query of all public keys under a given site.</p>
+<p><strong>Query parameters</strong>:</p>
 <table>
 <thead>
 <tr>
-<th>参数</th>
-<th>类型</th>
-<th>必填</th>
-<th>默认值</th>
-<th>说明</th>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Default</th>
+<th>Description</th>
 </tr>
 </thead>
 <tbody><tr>
 <td>rpId</td>
 <td>string</td>
-<td>是</td>
+<td>Yes</td>
 <td>-</td>
-<td>站点域名</td>
+<td>Site domain</td>
 </tr>
 <tr>
 <td>page</td>
 <td>number</td>
-<td>否</td>
+<td>No</td>
 <td>1</td>
-<td>页码</td>
+<td>Page number</td>
 </tr>
 <tr>
 <td>pageSize</td>
 <td>number</td>
-<td>否</td>
+<td>No</td>
 <td>20</td>
-<td>每页数量 (最大 100)</td>
+<td>Items per page (max 100)</td>
 </tr>
 <tr>
 <td>order</td>
 <td>string</td>
-<td>否</td>
+<td>No</td>
 <td>desc</td>
-<td>排序方向: <code>asc</code> 或 <code>desc</code></td>
+<td>Sort direction: <code>asc</code> or <code>desc</code></td>
 </tr>
 </tbody></table>
-<p><strong>响应</strong> (200):</p>
+<p><strong>Response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;total&quot;: 5,
   &quot;page&quot;: 1,
@@ -328,7 +328,7 @@
       &quot;credentialId&quot;: &quot;abc123&quot;,
       &quot;walletRef&quot;: &quot;0x000...abc&quot;,
       &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
-      &quot;name&quot;: &quot;我的 MacBook&quot;,
+      &quot;name&quot;: &quot;My MacBook&quot;,
       &quot;initialCredentialId&quot;: &quot;abc123&quot;,
       &quot;metadata&quot;: &quot;0000...00&quot;,
       &quot;createdAt&quot;: 1711000000000
@@ -336,11 +336,11 @@
   ]
 }
 </code></pre>
-<p><strong>错误响应</strong>: <code>400</code> - rpId 缺失</p>
+<p><strong>Error responses</strong>: <code>400</code> - rpId missing</p>
 <hr>
 <h3>GET /api/health</h3>
-<p>健康检查。</p>
-<p><strong>响应</strong> (200):</p>
+<p>Health check.</p>
+<p><strong>Response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;service&quot;: &quot;webauthn-p256-publickey-index&quot;,
   &quot;version&quot;: &quot;1.0.0&quot;,
@@ -351,90 +351,101 @@
 </code></pre>
 <hr>
 <h3>GET /</h3>
-<p>返回本文档的 HTML 渲染版本 (GitHub 风格)。</p>
+<p>Returns an HTML-rendered version of this document (GitHub style).</p>
 <hr>
-<h2>完整调用流程示例</h2>
+<h2>Full Call Flow Example</h2>
 <pre><code>1. POST /api/create                           → 202 { id, status: &quot;pending&quot; }
    Body: { rpId, credentialId, publicKey, name }
 2. GET  /api/create/:id                       → { status: &quot;done&quot;, txHash: &quot;0x...&quot; }
 3. GET  /api/query?rpId=...&amp;credentialId=...  → { publicKey, walletRef, ... }
-   或 GET /api/query?walletRef=0x...          → 同上
+   or GET /api/query?walletRef=0x...          → same as above
 </code></pre>
-<h2>隐私与合规</h2>
+<h2>Privacy &amp; Compliance</h2>
 <ul>
-<li>IP 地址经 SHA-256 哈希后存储, 无法反推原始 IP, 符合 GDPR</li>
-<li>不收集用户身份信息, 仅存储公钥和站点域名 (公开数据)</li>
-<li>所有数据上链后不可删除 (区块链特性), 用户应知悉</li>
+<li>IP addresses are stored after SHA-256 hashing; the original IP cannot be recovered, GDPR compliant</li>
+<li>No user identity information is collected; only public keys and site domains (public data) are stored</li>
+<li>All data is immutable once on-chain (blockchain property); users should be aware of this</li>
 </ul>
-<h2>缓存策略</h2>
-<p>双层缓存:</p>
+<h2>Caching Strategy</h2>
+<p>Dual-layer caching:</p>
 <ul>
-<li>服务端内存缓存: 5 分钟 TTL, 上限 100MB, 满时淘汰最早条目</li>
-<li>CDN 缓存: <code>Cache-Control: public, max-age=3600</code> (1 小时)</li>
+<li>Server-side in-memory cache: 5-minute TTL, 100 MB cap, oldest entries evicted when full</li>
+<li>CDN cache: <code>Cache-Control: public, max-age=3600</code> (1 hour)</li>
 </ul>
-<p>规则:</p>
+<p>Rules:</p>
 <ul>
-<li>仅缓存 200 响应, 404 不缓存</li>
+<li>Only 200 responses are cached; 404 responses are not cached</li>
 </ul>
-<h2>项目结构</h2>
-<pre><code>index.ts                     主入口, Deno.serve() 路由
-build.ts                     构建脚本 (readme→HTML + 编译二进制)
-src/
-  config.ts                  配置 (从环境变量读取)
-  contract.ts                链上合约交互 (viem, Gnosis Chain)
-  queue.ts                   异步队列 (SQLite + 后台 worker + 重试 + 限流)
-  rpc.ts                     RPC 轮询 + 自动故障转移 (从 ethereum-data 获取节点列表)
-  wallet-ref.ts              walletRef 计算 (P256 公钥 → Safe 地址 → bytes32)
-  cache.ts                   内存缓存 (TTL + 内存上限 + 淘汰)
-  index.html                 首页 HTML (由 build.ts 从 README 生成)
+<h2>Project Structure</h2>
+<pre><code>shared/                      Platform-agnostic shared code (imported directly by both runtimes)
+  contract.ts                ABI, contract addresses, formatRecord, buildCommitment
+  contract-read.ts           On-chain read operations (getPublicKey, listRpIds, etc.)
+  queue.ts                   Types, constants, DDL, hashIp, wallet helpers, sendTelegram
+  rpc.ts                     RPC polling + automatic failover
+  cache.ts                   In-memory cache (TTL + memory cap + eviction)
+  validation.ts              Input length validation
+  wallet-ref.ts              walletRef computation (P256 public key → Safe address → bytes32)
   routes/
     challenge.ts             GET /api/challenge
-    query.ts                 GET /api/query (支持 rpId+credentialId 和 walletRef)
-    create.ts                POST /api/create + GET /api/create/:id
-    stats.ts                 GET /api/stats/total + /sites + /keys
-scripts/
-  deploy.ts                 部署脚本 (SSH + systemd)
-  deploy/
-    config.ts               部署目标配置管理
-    remote.ts               远程服务器操作
-    ssh.ts                  SSH 连接封装
-deploy/
-  systemd/                  systemd 服务配置
-.github/workflows/ci.yml    CI (type-check + test)
-</code></pre>
-<h2>本地开发</h2>
-<pre><code class="language-bash">deno task dev          # 热重载开发 (自动加载 .env)
-deno task test         # 运行测试
-deno task build        # 编译为二进制
-</code></pre>
-<h2>部署</h2>
-<p>通过 <code>deno task deploy</code> 手动部署到服务器, 交互式选择目标。</p>
-<pre><code class="language-bash">deno task deploy              # 部署: 选目标 → 配置 → 上传 → 健康检查
-deno task deploy status       # 查看远程服务状态
-deno task deploy rollback     # 回滚到上一版本
-</code></pre>
-<p>首次部署自动: 安装 Deno → 创建用户/目录 → 提示配置 .env → 安装 systemd 服务。</p>
-<h3>服务器目录结构</h3>
-<pre><code>/opt/webauthnp256-publickey-index/
-  releases/          各版本目录 (YYYYMMDD-HHMMSS)
-  current/           -&gt; 当前版本的符号链接
-  data/
-    .env             环境变量
-    queue.db         异步队列数据库
-</code></pre>
-<h3>环境变量</h3>
-<pre><code class="language-env"># 服务端口 (可选, 默认 11256)
-PORT=11256
+    stats.ts                 GET /api/stats/*
 
-# 队列数据库路径 (可选)
+deno/                        Deno runtime specific
+  index.ts                   Entry point (Deno.serve)
+  config.ts                  Configuration (Deno.env + node:crypto)
+  queue.ts                   SQLite queue + setInterval background worker
+  nonce.ts                   Nonce management
+  routes/
+    query.ts                 GET /api/query
+    create.ts                POST /api/create
+  tests/                     Deno tests
+
+worker/                      Cloudflare Worker runtime specific
+  index.ts                   Entry point (fetch + scheduled)
+  config.ts                  Configuration (crypto.subtle + env bindings)
+  queue.ts                   D1 queue (async)
+  nonce.ts                   Nonce management (config parameter injection)
+  queue-processor.ts         Durable Object + alarm (replaces setInterval)
+  types.ts                   CF environment type definitions
+  routes/
+    query.ts                 GET /api/query (async D1)
+    create.ts                POST /api/create (async D1)
+  tests/                     CF Worker tests
+
+scripts/                     Deployment scripts
+build.ts                     Build script (readme→HTML + compile binary)
+</code></pre>
+<h2>Local Development</h2>
+<pre><code class="language-bash"># Deno
+deno task dev          # Hot-reload dev (auto-loads .env)
+deno task test         # Run tests (69 tests)
+
+# Cloudflare Worker
+npm install            # Install dependencies
+npm test               # Run tests (vitest + miniflare)
+npm run dev            # Local wrangler dev
+</code></pre>
+<h2>Deployment (Deno - Self-hosted Server)</h2>
+<p>Deploy to a server via <code>deno task deploy</code>, interactively selecting the target.</p>
+<pre><code class="language-bash">deno task deploy              # Deploy: select target → upload → health check
+deno task deploy status       # Check remote service status
+deno task deploy rollback     # Roll back to previous version
+</code></pre>
+<p>First deployment automatically: installs Deno → creates user/directories → prompts for .env configuration → installs systemd service.</p>
+<h3>Server Environment Variables</h3>
+<pre><code class="language-env">PORT=11256
 QUEUE_DB_PATH=/opt/webauthnp256-publickey-index/data/queue.db
-
-# 服务器钱包私钥 (创建公钥记录时需要, 用于签名链上交易)
 PRIVATE_KEY=0x...
-
-# Telegram 告警通知 (可选, 队列积压/失败/Gas 余额/Gas 价格)
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 </code></pre>
+<h2>Deployment (Cloudflare Workers)</h2>
+<pre><code class="language-bash">npm install                                    # Install dependencies
+npm run setup                                  # Auto-create D1 database, generate wrangler.json (idempotent)
+npx wrangler secret put PRIVATE_KEY            # Set Secrets
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_CHAT_ID
+npm run deploy                                 # Deploy
+</code></pre>
+<p>Queue processing is handled via Durable Object + Alarm (~10s interval), with a Cron Trigger (every minute) as a backup to ensure the DO alarm is running.</p>
 </body>
 </html>
