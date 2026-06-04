@@ -355,6 +355,7 @@ import { gnosis } from "viem/chains";
 import { getWriteRpc } from "./rpc.ts";
 import { getConfig } from "./config.ts";
 import { getClient as getPublicClient, CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
+import { acquireNonce, resetNonce, isNonceError } from "./nonce.ts";
 
 const writeAbi = [
   {
@@ -426,13 +427,20 @@ async function commitItem(item: QueueItem): Promise<void> {
     return;
   }
 
-  const hash = await wallet.writeContract({
-    address: CONTRACT_ADDRESS,
-    abi: writeAbi,
-    functionName: "commit",
-    args: [commitment],
-  });
-  await client.waitForTransactionReceipt({ hash });
+  const nonce = await acquireNonce();
+  try {
+    const hash = await wallet.writeContract({
+      address: CONTRACT_ADDRESS,
+      abi: writeAbi,
+      functionName: "commit",
+      args: [commitment],
+      nonce,
+    });
+    await client.waitForTransactionReceipt({ hash });
+  } catch (err) {
+    if (isNonceError(err)) resetNonce();
+    throw err;
+  }
 }
 
 async function createItem(item: QueueItem): Promise<string> {
@@ -440,12 +448,19 @@ async function createItem(item: QueueItem): Promise<string> {
   const wallet = getWallet();
   const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
 
-  const hash = await wallet.writeContract({
-    address: CONTRACT_ADDRESS,
-    abi: writeAbi,
-    functionName: "createRecord",
-    args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
-  });
-  await client.waitForTransactionReceipt({ hash });
-  return hash;
+  const nonce = await acquireNonce();
+  try {
+    const hash = await wallet.writeContract({
+      address: CONTRACT_ADDRESS,
+      abi: writeAbi,
+      functionName: "createRecord",
+      args: [item.rpId, item.credentialId, walletRefHex, publicKeyHex, item.name, item.initialCredentialId, metadataHex],
+      nonce,
+    });
+    await client.waitForTransactionReceipt({ hash });
+    return hash;
+  } catch (err) {
+    if (isNonceError(err)) resetNonce();
+    throw err;
+  }
 }
