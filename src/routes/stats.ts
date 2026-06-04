@@ -1,5 +1,6 @@
 import { listRpIds, listPublicKeysByRpId, getTotalCredentials } from "../contract.ts";
 import { cacheGet, cacheSet } from "../cache.ts";
+import { validateStringLength } from "../validation.ts";
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=3600" };
 
@@ -46,6 +47,10 @@ export async function handleListPublicKeys(req: Request): Promise<Response> {
 
   if (!rpId) {
     return Response.json({ error: "rpId is required" }, { status: 400 });
+  }
+  const lengthError = validateStringLength({ rpId });
+  if (lengthError) {
+    return Response.json({ error: lengthError }, { status: 400 });
   }
 
   const { page, pageSize, order } = parsePagination(url);

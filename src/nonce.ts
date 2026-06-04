@@ -97,10 +97,3 @@ export function resetNonce(role: "create" | "commit" = "create"): void {
   console.log(`[nonce:${role}] Reset — will resync from chain on next acquire`);
 }
 
-/**
- * Check if an error is a nonce-related error.
- */
-export function isNonceError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /nonce too low|nonce.*already|replacement transaction underpriced|already known/i.test(msg);
-}

@@ -298,7 +298,7 @@ Deno.test({
 // ── E2E: Queue state transitions ──
 
 Deno.test({
-  name: "E2E: queue state machine transitions (pending → committing → committed → creating → done)",
+  name: "E2E: queue state machine transitions (pending → committed → creating → done)",
   ignore: !Deno.env.get("PRIVATE_KEY"),
   sanitizeOps: false,
   sanitizeResources: false,
@@ -333,8 +333,8 @@ Deno.test({
     console.log(`\n  📊 Observed states: ${[...seenStates].join(" → ")}`);
     assert(seenStates.has("pending"), "should pass through pending");
     assert(seenStates.has("done"), "should reach done");
-    // committing/committed/creating may be too fast to catch, but at least one intermediate
-    const intermediates = ["committing", "committed", "creating"].filter((s) => seenStates.has(s));
+    // committed/creating may be too fast to catch, but at least one intermediate
+    const intermediates = ["committed", "creating"].filter((s) => seenStates.has(s));
     console.log(`  📊 Intermediate states caught: ${intermediates.length > 0 ? intermediates.join(", ") : "(too fast to observe)"}`);
   },
 });

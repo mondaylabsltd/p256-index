@@ -2,7 +2,7 @@ import { DatabaseSync as Database } from "node:sqlite";
 
 // --- Types ---
 
-export type QueueStatus = "pending" | "committing" | "committed" | "creating" | "done" | "failed";
+export type QueueStatus = "pending" | "committed" | "creating" | "done" | "failed";
 
 export interface QueueItem {
   id: string;
@@ -183,7 +183,7 @@ async function checkAlerts(): Promise<void> {
   const alerts: string[] = [];
 
   // 1. Queue backlog
-  const pending = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committing', 'committed', 'creating')").get() as unknown as { count: number }).count;
+  const pending = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committed', 'creating')").get() as unknown as { count: number }).count;
   if (pending >= QUEUE_BACKLOG_THRESHOLD) {
     alerts.push(`⚠️ Queue backlog: ${pending} items pending`);
   }
@@ -481,15 +481,23 @@ async function processPending() {
   const commitments = items.map((item) => buildCommitment(item).commitment);
 
   // Single batchCommit tx for all items — 1 nonce, no gaps
-  const { wallet } = getCommitWallet();
+  const { wallet, client: commitClient } = getCommitWallet();
   const handle = await acquireNonce("commit");
   try {
+    const gasEstimate = await commitClient.estimateContractGas({
+      address: BATCH_HELPER_ADDRESS,
+      abi: batchAbi,
+      functionName: "batchCommit",
+      args: [CONTRACT_ADDRESS, commitments],
+      account: wallet.account,
+    });
     await wallet.writeContract({
       address: BATCH_HELPER_ADDRESS,
       abi: batchAbi,
       functionName: "batchCommit",
       args: [CONTRACT_ADDRESS, commitments],
       nonce: handle.nonce,
+      gas: gasEstimate * 120n / 100n,
     });
     // Mark all as committed
     const now = Date.now();
