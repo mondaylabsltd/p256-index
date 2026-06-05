@@ -87,13 +87,23 @@ export class QueueProcessor implements DurableObject {
       return;
     }
 
+    // Skip gas price check and RPC calls if nothing to process
+    const pending = await this.db.prepare(
+      "SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committed', 'creating')"
+    ).first<{ count: number }>();
+
+    if (!pending || pending.count === 0) {
+      await this.cleanupDoneRecords();
+      return;
+    }
+
     // Check gas price
     try {
       const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
       const gasPrice = await writeClient.getGasPrice();
       const gasPriceGwei = Number(gasPrice) / 1e9;
       if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
-        console.warn(`[queue-processor] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei, pausing`);
+        console.warn(`[queue-processor] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei, ${pending.count} items waiting`);
         await this.checkAlerts(config);
         return;
       }

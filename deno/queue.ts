@@ -239,12 +239,22 @@ async function processQueue() {
   workerRunning = true;
   const start = performance.now();
   try {
+    // Skip gas price check and RPC calls if nothing to process
+    const pending = (db.prepare(
+      "SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committed', 'creating')"
+    ).get() as unknown as { count: number }).count;
+
+    if (pending === 0) {
+      cleanupDoneRecords();
+      return;
+    }
+
     try {
       const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
       const gasPrice = await writeClient.getGasPrice();
       const gasPriceGwei = Number(gasPrice) / 1e9;
       if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
-        console.warn(`[queue] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), pausing`);
+        console.warn(`[queue] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), ${pending} items waiting`);
         await checkAlerts();
         return;
       }
