@@ -33,7 +33,7 @@ export interface QueueItem {
 // --- Constants ---
 
 export const MAX_RETRIES = 10;
-export const WORKER_INTERVAL = 2000;
+export const WORKER_INTERVAL = 60_000;
 export const QUERY_BATCH_SIZE = 100;
 export const TX_BATCH_SIZE = 50;
 export const RATE_WINDOW = 60_000;

@@ -192,7 +192,7 @@ async function checkAlerts(): Promise<void> {
 let workerRunning = false;
 
 export function startQueueWorker() {
-  console.log("[queue] Worker started, interval: 2s");
+  console.log("[queue] Worker started, interval: 60s");
   ensureCommitWalletFunded().catch(() => {});
   setInterval(() => {
     if (workerRunning) return;
