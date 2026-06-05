@@ -34,6 +34,8 @@ const server = Deno.serve({ port: config.port }, async (req) => {
 
   const url = new URL(req.url);
   const path = url.pathname;
+  const start = performance.now();
+  console.log(`[http] → ${req.method} ${path}${url.search}`);
 
   let response: Response;
 
@@ -72,6 +74,8 @@ const server = Deno.serve({ port: config.port }, async (req) => {
     response = Response.json({ error: "internal server error" }, { status: 500 });
   }
 
+  const ms = (performance.now() - start).toFixed(0);
+  console.log(`[http] ← ${req.method} ${path} ${response.status} ${ms}ms`);
   return withCors(response);
 });
 

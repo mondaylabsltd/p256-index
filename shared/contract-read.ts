@@ -11,11 +11,13 @@ import {
 
 export { CONTRACT_ADDRESS, CONTRACT_ABI } from "./contract.ts";
 
+const RPC_TIMEOUT = 10_000; // 10s per RPC request
+
 export function getClient() {
   const rpcUrl = getCurrentRpc();
   const client = createPublicClient({
     chain: gnosis,
-    transport: http(rpcUrl),
+    transport: http(rpcUrl, { timeout: RPC_TIMEOUT }),
   });
   return { client, rpcUrl };
 }
@@ -30,10 +32,18 @@ async function readWithRetry(params: any): Promise<any> {
   let lastErr: unknown;
   for (let i = 0; i < MAX_RPC_RETRIES; i++) {
     const { client, rpcUrl } = getClient();
+    const start = performance.now();
     try {
-      return await client.readContract({ address: CONTRACT_ADDRESS, abi: CONTRACT_ABI, ...params });
+      const result = await client.readContract({ address: CONTRACT_ADDRESS, abi: CONTRACT_ABI, ...params });
+      console.log(`[contract-read] ${params.functionName} via ${rpcUrl} — ${(performance.now() - start).toFixed(0)}ms`);
+      return result;
     } catch (err) {
-      if (isContractRevert(err)) throw err; // contract revert, no retry
+      const ms = (performance.now() - start).toFixed(0);
+      if (isContractRevert(err)) {
+        console.warn(`[contract-read] ${params.functionName} reverted via ${rpcUrl} — ${ms}ms`);
+        throw err;
+      }
+      console.warn(`[contract-read] ${params.functionName} failed via ${rpcUrl} — ${ms}ms:`, err instanceof Error ? err.message : err);
       markFailed(rpcUrl);
       lastErr = err;
     }

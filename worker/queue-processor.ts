@@ -89,7 +89,7 @@ export class QueueProcessor implements DurableObject {
 
     // Check gas price
     try {
-      const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+      const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
       const gasPrice = await writeClient.getGasPrice();
       const gasPriceGwei = Number(gasPrice) / 1e9;
       if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
@@ -116,7 +116,7 @@ export class QueueProcessor implements DurableObject {
 
     if (results.length === 0) return;
 
-    const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+    const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
 
     const calls = results.map((item) => ({
       address: CONTRACT_ADDRESS as `0x${string}`,
@@ -154,7 +154,7 @@ export class QueueProcessor implements DurableObject {
 
     if (items.length === 0) return;
 
-    const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+    const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
     const currentBlock = await client.getBlockNumber();
 
     const commitments = items.map((item) => buildCommitment(item).commitment);

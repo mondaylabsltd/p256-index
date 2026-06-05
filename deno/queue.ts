@@ -237,9 +237,10 @@ async function ensureCommitWalletFunded(): Promise<void> {
 
 async function processQueue() {
   workerRunning = true;
+  const start = performance.now();
   try {
     try {
-      const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+      const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
       const gasPrice = await writeClient.getGasPrice();
       const gasPriceGwei = Number(gasPrice) / 1e9;
       if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
@@ -258,6 +259,8 @@ async function processQueue() {
     cleanupDoneRecords();
     await checkAlerts();
   } finally {
+    const ms = (performance.now() - start).toFixed(0);
+    console.log(`[queue] Worker cycle done — ${ms}ms`);
     workerRunning = false;
   }
 }
@@ -270,7 +273,7 @@ async function processCreating() {
 
   if (items.length === 0) return;
 
-  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
 
   const calls = items.map((item) => ({
     address: CONTRACT_ADDRESS as `0x${string}`,
@@ -308,7 +311,7 @@ async function processCommitted() {
 
   if (items.length === 0) return;
 
-  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc()) });
+  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
   const currentBlock = await client.getBlockNumber();
 
   const commitments = items.map((item) => buildCommitment(item).commitment);
