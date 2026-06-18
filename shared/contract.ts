@@ -116,6 +116,29 @@ export const CONTRACT_ABI = [
     ],
     stateMutability: "view",
   },
+  // Custom errors — included so viem decodes reverts by name (e.g. RecordNotFound,
+  // selector 0x85da2f88, which is the normal "not registered yet" case) instead of
+  // logging a raw, undecodable selector. Purely additive; does not affect calls.
+  { type: "error", name: "EmptyRpId", inputs: [] },
+  { type: "error", name: "EmptyCredentialId", inputs: [] },
+  { type: "error", name: "InvalidPublicKeyLength", inputs: [{ name: "length", type: "uint256" }] },
+  { type: "error", name: "RpIdTooLong", inputs: [{ name: "length", type: "uint256" }] },
+  { type: "error", name: "CredentialIdTooLong", inputs: [{ name: "length", type: "uint256" }] },
+  { type: "error", name: "NameTooLong", inputs: [{ name: "length", type: "uint256" }] },
+  { type: "error", name: "RecordAlreadyExists", inputs: [{ name: "rpId", type: "string" }, { name: "credentialId", type: "string" }] },
+  { type: "error", name: "RecordNotFound", inputs: [{ name: "rpId", type: "string" }, { name: "credentialId", type: "string" }] },
+  { type: "error", name: "InvalidPublicKeyPrefix", inputs: [{ name: "prefix", type: "bytes1" }] },
+  { type: "error", name: "InitialCredentialIdTooLong", inputs: [{ name: "length", type: "uint256" }] },
+  { type: "error", name: "MetadataTooLong", inputs: [{ name: "length", type: "uint256" }] },
+  { type: "error", name: "InitialRecordNotFound", inputs: [{ name: "rpId", type: "string" }, { name: "initialCredentialId", type: "string" }] },
+  { type: "error", name: "InitialRecordNotRoot", inputs: [{ name: "rpId", type: "string" }, { name: "initialCredentialId", type: "string" }] },
+  { type: "error", name: "NotCommitted", inputs: [] },
+  { type: "error", name: "RevealTooEarly", inputs: [] },
+  { type: "error", name: "EmptyWalletRef", inputs: [] },
+  { type: "error", name: "WalletRefNotFound", inputs: [{ name: "walletRef", type: "bytes32" }] },
+  { type: "error", name: "WalletRefAlreadyExists", inputs: [{ name: "walletRef", type: "bytes32" }] },
+  { type: "error", name: "InvalidPublicKeyCoordinate", inputs: [] },
+  { type: "error", name: "InvalidPublicKeyPoint", inputs: [] },
 ] as const satisfies Abi;
 
 export const CONTRACT_ADDRESS = "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3" as const;

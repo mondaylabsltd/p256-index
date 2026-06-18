@@ -40,7 +40,9 @@ async function readWithRetry(params: any): Promise<any> {
     } catch (err) {
       const ms = (performance.now() - start).toFixed(0);
       if (isContractRevert(err)) {
-        console.warn(`[contract-read] ${params.functionName} reverted via ${rpcUrl} — ${ms}ms`);
+        // Expected for existence checks (getRecord/getRecordByWalletRef on a new
+        // credential). The caller decides whether the revert is benign.
+        console.log(`[contract-read] ${params.functionName} reverted via ${rpcUrl} — ${ms}ms`);
         throw err;
       }
       console.warn(`[contract-read] ${params.functionName} failed via ${rpcUrl} — ${ms}ms:`, err instanceof Error ? err.message : err);
@@ -61,7 +63,14 @@ export async function getPublicKey(rpId: string, credentialId: string) {
     });
     return formatRecord(record);
   } catch (err) {
-    console.warn(`[contract-read] getRecord(${rpId}, ${credentialId}) failed:`, err instanceof Error ? err.message : err);
+    // A revert means the record simply isn't on-chain yet (RecordNotFound) —
+    // the normal case for a brand-new credential being registered. Log quietly;
+    // reserve warn for genuine RPC failures.
+    if (isContractRevert(err)) {
+      console.log(`[contract-read] getRecord(${rpId}, ${credentialId}): no record yet`);
+    } else {
+      console.warn(`[contract-read] getRecord(${rpId}, ${credentialId}) failed:`, err instanceof Error ? err.message : err);
+    }
     return null;
   }
 }
@@ -74,7 +83,11 @@ export async function getPublicKeyByWalletRef(walletRef: `0x${string}`) {
     });
     return formatRecord(record);
   } catch (err) {
-    console.warn(`[contract-read] getRecordByWalletRef(${walletRef}) failed:`, err instanceof Error ? err.message : err);
+    if (isContractRevert(err)) {
+      console.log(`[contract-read] getRecordByWalletRef(${walletRef}): no record yet`);
+    } else {
+      console.warn(`[contract-read] getRecordByWalletRef(${walletRef}) failed:`, err instanceof Error ? err.message : err);
+    }
     return null;
   }
 }
