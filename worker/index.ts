@@ -13,6 +13,7 @@ import { handleCreate, handleCreateStatus } from "./routes/create.ts";
 import { initQueue, getQueueStats } from "./queue.ts";
 import { setIpHashSalt } from "../shared/queue.ts";
 import { buildHealthBody } from "../shared/routes/health.ts";
+import { withCors } from "../shared/cors.ts";
 import { log, newRequestId } from "../shared/log.ts";
 import type { Env } from "./types.ts";
 
@@ -23,18 +24,6 @@ const HOME_HTML = `<!DOCTYPE html>
 <body><h1>WebAuthn P256 Public Key Index</h1><p>API running on Cloudflare Workers.</p>
 <p>See <a href="/api/health">/api/health</a> for status.</p></body></html>`;
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-function withCors(response: Response): Response {
-  for (const [key, value] of Object.entries(CORS_HEADERS)) {
-    response.headers.set(key, value);
-  }
-  return response;
-}
 
 let rpcInitialized = false;
 let queueInitialized = false;
@@ -57,7 +46,7 @@ export default {
     }
 
     if (request.method === "OPTIONS") {
-      return withCors(new Response(null, { status: 204 }));
+      return withCors(new Response(null, { status: 204 }), request);
     }
 
     const url = new URL(request.url);
@@ -122,7 +111,7 @@ export default {
       } catch { /* ignore */ }
     })());
 
-    return withCors(response);
+    return withCors(response, request);
   },
 
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {

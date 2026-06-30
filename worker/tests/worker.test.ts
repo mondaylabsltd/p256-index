@@ -53,6 +53,30 @@ describe("API routes", () => {
     expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
   });
 
+  it("preflight allows custom request headers (e.g. idempotency-key)", async () => {
+    const res = await fetchWorker("/api/create", {
+      method: "OPTIONS",
+      headers: {
+        "Origin": "http://localhost:8081",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type, idempotency-key, authorization",
+      },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    // The browser requires every requested header to appear in allow-headers.
+    const allow = (res.headers.get("Access-Control-Allow-Headers") || "").toLowerCase();
+    for (const h of ["content-type", "idempotency-key", "authorization"]) {
+      expect(allow === "*" || allow.includes(h)).toBe(true);
+    }
+  });
+
+  it("a non-OPTIONS response also carries permissive CORS", async () => {
+    const res = await fetchWorker("/api/health");
+    const allow = res.headers.get("Access-Control-Allow-Headers");
+    expect(allow === "*" || (allow || "").toLowerCase().includes("content-type")).toBe(true);
+  });
+
   it("unknown route returns 404", async () => {
     const res = await fetchWorker("/api/nonexistent");
     expect(res.status).toBe(404);

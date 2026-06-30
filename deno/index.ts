@@ -8,6 +8,7 @@ import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from ".
 import { initQueue, startQueueWorker, getQueueStats } from "./queue.ts";
 import { setIpHashSalt } from "../shared/queue.ts";
 import { buildHealthBody } from "../shared/routes/health.ts";
+import { withCors } from "../shared/cors.ts";
 import { log, newRequestId } from "../shared/log.ts";
 
 const HOME_HTML = await Deno.readTextFile(new URL("./index.html", import.meta.url));
@@ -20,22 +21,9 @@ setIpHashSalt(config.privateKey || "webauthnp256-index");
 await initRpc();
 initQueue(config.queueDbPath);
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
-function withCors(response: Response): Response {
-  for (const [key, value] of Object.entries(CORS_HEADERS)) {
-    response.headers.set(key, value);
-  }
-  return response;
-}
-
 const server = Deno.serve({ port: config.port }, async (req) => {
   if (req.method === "OPTIONS") {
-    return withCors(new Response(null, { status: 204 }));
+    return withCors(new Response(null, { status: 204 }), req);
   }
 
   const url = new URL(req.url);
@@ -87,7 +75,7 @@ const server = Deno.serve({ port: config.port }, async (req) => {
   const ms = Math.round(performance.now() - start);
   log.info("http response", { request_id: requestId, method: req.method, path, status: response.status, latency_ms: ms });
   response.headers.set("X-Request-Id", requestId);
-  return withCors(response);
+  return withCors(response, req);
 });
 
 console.log(`Server running at http://localhost:${config.port}`);
