@@ -61,7 +61,7 @@
 - **/api/challenge 装饰性**:从不验证(开放 API 设计);可删或文档标注。(`shared/routes/challenge.ts:1`)
 - **文档漂移**:README "69 tests"(实际 146)、/api/health 示例缺 degraded/queue 字段、walletRef 描述与实现不符;项目 CLAUDE.md 列了 4 个未用依赖(@noble/*、s3-lite-client、@db/sqlite)。(`README.md:342`)
 - **wrangler 配置漂移**:真正用的 `wrangler.json` 被 gitignore(setup 脚本生成),提交的 `wrangler.jsonc` 是死配置(空 database_id)。生产 CF 配置不可从仓库复现。(`package.json:8`)
-- **版本固定缺口**:CI Deno 浮动 v2.x;生产 Deno 首次安装 unpinned-latest;compatibility_date 2024-09-23 约 21 月龄。
+- **版本固定缺口**:~~CI Deno 浮动 v2.x~~(已钉到 v2.7.x,与 02 验证环境同 minor);生产 Deno 首次安装 unpinned-latest;compatibility_date 2024-09-23 约 21 月龄。
 - **IP 哈希盐 = 原始 PRIVATE_KEY**:密钥卫生问题;空 key 时回退公开常量,64 位截断可暴力破解。(`deno/index.ts:20`)
 - **无优雅停机**:SIGTERM(每次部署)杀掉 mid-batch worker → 广播 commit tx 重发多花 gas;in-flight HTTP 丢弃。(`deno/index.ts:82`)
 - **dev 仍加载真实 .env**:手动 create 仍触链;建议独立 `.env.dev`(未充值/测试网 key)。
