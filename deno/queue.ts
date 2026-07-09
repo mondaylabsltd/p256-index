@@ -1,42 +1,30 @@
 import { DatabaseSync as Database } from "node:sqlite";
-import { createPublicClient, http } from "viem";
-import { gnosis } from "viem/chains";
-import { getWriteRpc } from "../shared/rpc.ts";
 import { getConfig } from "./config.ts";
-import { CONTRACT_ADDRESS, CONTRACT_ABI, BATCH_HELPER_ADDRESS, BATCH_ABI } from "../shared/contract.ts";
 import { acquireNonce } from "./nonce.ts";
 import {
   type QueueStatus,
   type QueueItem,
   type AppConfig,
-  MAX_RETRIES,
-  WORKER_INTERVAL,
-  QUERY_BATCH_SIZE,
-  TX_BATCH_SIZE,
   RATE_WINDOW,
   DEFAULT_RATE_LIMIT,
+  WORKER_INTERVAL,
   MAX_GAS_PRICE_GWEI,
   GAS_BALANCE_THRESHOLD,
   FUND_THRESHOLD,
   FUND_AMOUNT,
-  DONE_RETENTION,
-  FAILED_RETENTION,
-  CREATE_SUB_BATCH,
   CREATE_QUEUE_DDL,
   CREATE_ACTIVE_UNIQUE_INDEX,
   DEDUPE_ACTIVE_DUPLICATES_SQL,
   GLOBAL_WRITE_WINDOW,
   DEFAULT_GLOBAL_WRITE_LIMIT,
   isUniqueConstraintError,
-  splitByHasRecord,
-  batchFailureAction,
-  retryDelayMs,
   hashIp,
-  buildCommitment,
   getCreateWallet,
   getCommitWallet,
   sendTelegram,
 } from "../shared/queue.ts";
+import { runQueueCycle, type QueueStore } from "../shared/queue-engine.ts";
+import { createViemChainOps } from "../shared/chain-viem.ts";
 import { log, redactSecrets } from "../shared/log.ts";
 import type { QueueStats } from "../shared/routes/health.ts";
 
@@ -177,21 +165,78 @@ export function findDuplicate(rpId: string, credentialId: string): QueueItem | n
   ).get(rpId, credentialId) as unknown as QueueItem | undefined) ?? null;
 }
 
+// --- Engine wiring: SQLite QueueStore + viem ChainOps ---
+
+// Sync node:sqlite calls wrapped behind the async QueueStore interface the
+// shared engine consumes. All SQL is transcribed from the pre-refactor
+// implementation — semantics must not drift (see shared/queue-engine.ts).
+const sqliteStore: QueueStore = {
+  // deno-lint-ignore require-await
+  async countActive(): Promise<number> {
+    return (db.prepare(
+      "SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committed', 'creating')"
+    ).get() as unknown as { count: number }).count;
+  },
+  // deno-lint-ignore require-await
+  async listCreating(limit: number): Promise<QueueItem[]> {
+    return db.prepare(
+      "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
+    ).all(limit) as unknown as QueueItem[];
+  },
+  // deno-lint-ignore require-await
+  async listCommittedReady(now: number, limit: number): Promise<QueueItem[]> {
+    return db.prepare(
+      "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
+    ).all(now, limit) as unknown as QueueItem[];
+  },
+  // deno-lint-ignore require-await
+  async listPendingReady(now: number, limit: number): Promise<QueueItem[]> {
+    return db.prepare(
+      "SELECT * FROM create_queue WHERE status = 'pending' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
+    ).all(now, limit) as unknown as QueueItem[];
+  },
+  // deno-lint-ignore require-await
+  async markManyDone(ids: string[], now: number, txHash?: string): Promise<void> {
+    if (txHash !== undefined) {
+      const stmt = db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?");
+      for (const id of ids) stmt.run(txHash, now, id);
+    } else {
+      const stmt = db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?");
+      for (const id of ids) stmt.run(now, id);
+    }
+  },
+  // deno-lint-ignore require-await
+  async markManyCommitted(ids: string[], now: number): Promise<void> {
+    const stmt = db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?");
+    for (const id of ids) stmt.run(now, id);
+  },
+  // deno-lint-ignore require-await
+  async applyFailure(id, fields): Promise<void> {
+    if (fields.retryAfter !== undefined) {
+      db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
+        .run(fields.status, fields.error, fields.retries, fields.retryAfter, fields.updatedAt, id);
+    } else {
+      db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, updatedAt = ? WHERE id = ?")
+        .run(fields.status, fields.error, fields.retries, fields.updatedAt, id);
+    }
+  },
+  // deno-lint-ignore require-await
+  async cleanupExpired(doneBefore: number, failedBefore: number): Promise<{ doneDeleted: number }> {
+    const result = db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?").run(doneBefore);
+    // Bound the DLQ: drop 'failed' rows past the retention window.
+    db.prepare("DELETE FROM create_queue WHERE status = 'failed' AND updatedAt < ?").run(failedBefore);
+    return { doneDeleted: (result as unknown as { changes: number }).changes };
+  },
+};
+
+const chainOps = createViemChainOps(cfg);
+
 // --- Telegram Notifications ---
 
 const ALERT_INTERVAL = 5 * 60_000;
 const QUEUE_BACKLOG_THRESHOLD = 100;
 let lastAlertAt = 0;
 let lastFailedCount = 0;
-
-function cleanupDoneRecords(): void {
-  const now = Date.now();
-  const result = db.prepare("DELETE FROM create_queue WHERE status = 'done' AND updatedAt < ?").run(now - DONE_RETENTION);
-  const deleted = (result as unknown as { changes: number }).changes;
-  if (deleted > 0) console.log(`[queue] Cleaned up ${deleted} done records older than 7 days`);
-  // Bound the DLQ: drop 'failed' rows past the retention window.
-  db.prepare("DELETE FROM create_queue WHERE status = 'failed' AND updatedAt < ?").run(now - FAILED_RETENTION);
-}
 
 function cfg(): AppConfig {
   const c = getConfig();
@@ -241,10 +286,27 @@ async function checkAlerts(): Promise<void> {
         await ensureCommitWalletFunded();
       }
     }
-  } catch (err) { console.warn(`[queue] checkAlerts gas/balance check failed:`, err instanceof Error ? err.message : err); }
+  } catch (err) { console.warn(`[queue] checkAlerts gas/balance check failed:`, shortMsg(err)); }
 
   if (alerts.length > 0) {
     await sendTelegram(cfg(), `[webauthnp256-publickey-index] [Deno] [Gnosis]\n${alerts.join("\n")}`);
+  }
+}
+
+const FAILURE_ALERT_BATCH = 10;
+let failuresSinceLastAlert = 0;
+
+/**
+ * Engine hook: batched operator alert for item failures. Mirrors the
+ * pre-refactor handleFailure side-effect — the DB bookkeeping itself now
+ * lives in shared/queue-engine.ts.
+ */
+function onItemFailure(error: string): void {
+  failuresSinceLastAlert++;
+  if (failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
+    const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
+    sendTelegram(cfg(), `🔴 [webauthnp256-publickey-index] [Deno] [Gnosis]\n${failuresSinceLastAlert} tx failures since last alert\nTotal in DLQ (failed): ${failed}\nLatest error: ${error}`);
+    failuresSinceLastAlert = 0;
   }
 }
 
@@ -306,7 +368,7 @@ async function ensureCommitWalletFunded(): Promise<void> {
     }
     console.log(`[queue] Commit wallet funded: ${hash}`);
   } catch (err) {
-    console.warn(`[queue] Auto-fund failed:`, err instanceof Error ? err.message : err);
+    console.warn(`[queue] Auto-fund failed:`, shortMsg(err));
   }
 }
 
@@ -314,35 +376,16 @@ async function processQueue() {
   workerRunning = true;
   const start = performance.now();
   try {
-    // Skip gas price check and RPC calls if nothing to process
-    const pending = (db.prepare(
-      "SELECT COUNT(*) as count FROM create_queue WHERE status IN ('pending', 'committed', 'creating')"
-    ).get() as unknown as { count: number }).count;
-
-    if (pending === 0) {
-      cleanupDoneRecords();
-      return;
-    }
-
-    try {
-      const writeClient = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
-      const gasPrice = await writeClient.getGasPrice();
-      const gasPriceGwei = Number(gasPrice) / 1e9;
-      if (gasPriceGwei > MAX_GAS_PRICE_GWEI) {
-        console.warn(`[queue] Gas price too high: ${gasPriceGwei.toFixed(4)} Gwei (max: ${MAX_GAS_PRICE_GWEI}), ${pending} items waiting`);
-        await checkAlerts();
-        return;
-      }
-    } catch (err) {
-      console.warn(`[queue] Gas price check failed, skipping cycle:`, err instanceof Error ? err.message : err);
-      return;
-    }
-
-    await processCreating();
-    await processCommitted();
-    await processPending();
-    cleanupDoneRecords();
-    await checkAlerts();
+    await runQueueCycle({
+      store: sqliteStore,
+      chain: chainOps,
+      nonces: { acquire: (role) => acquireNonce(role) },
+      hooks: {
+        onItemFailure,
+        checkAlerts: (_gasPriceGwei?: number) => checkAlerts(),
+      },
+      label: "[queue]",
+    });
   } finally {
     const ms = (performance.now() - start).toFixed(0);
     console.log(`[queue] Worker cycle done — ${ms}ms`);
@@ -350,456 +393,7 @@ async function processQueue() {
   }
 }
 
-// Phase 1: Reconcile any item left in the legacy 'creating' status.
-// The current flow goes committed→done directly (processCommitted), so no NEW
-// item enters 'creating'. This is retained ON PURPOSE as a safety net: during a
-// rolling upgrade an in-flight row written by an older build could be 'creating',
-// and this confirms it on-chain (→ done) or fails it out — never stranded.
-async function processCreating() {
-  const items = db.prepare(
-    "SELECT * FROM create_queue WHERE status = 'creating' ORDER BY createdAt ASC LIMIT ?"
-  ).all(QUERY_BATCH_SIZE) as unknown as QueueItem[];
-
-  if (items.length === 0) return;
-
-  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
-
-  const calls = items.map((item) => ({
-    address: CONTRACT_ADDRESS as `0x${string}`,
-    abi: CONTRACT_ABI,
-    functionName: "hasRecord" as const,
-    args: [item.rpId, item.credentialId] as const,
-  }));
-
-  try {
-    const results = await client.multicall({ contracts: calls });
-    let doneCount = 0;
-    for (let i = 0; i < items.length; i++) {
-      const result = results[i];
-      if (result.status === "success" && result.result) {
-        db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), items[i].id);
-        doneCount++;
-      } else if (result.status === "success" && !result.result) {
-        const CREATING_TIMEOUT = 2 * 60_000;
-        if (Date.now() - items[i].updatedAt > CREATING_TIMEOUT) {
-          handleFailure(items[i], "createRecord tx not confirmed after 2min", "committed");
-        }
-      }
-    }
-    if (doneCount > 0) console.log(`[queue] ${doneCount} items confirmed on-chain, done`);
-  } catch (err) {
-    console.warn(`[queue] processCreating multicall failed, retry next cycle:`, err instanceof Error ? err.message : err);
-  }
-}
-
-// Phase 2: Advance committed items
-async function processCommitted() {
-  const items = db.prepare(
-    "SELECT * FROM create_queue WHERE status = 'committed' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
-  ).all(Date.now(), TX_BATCH_SIZE) as unknown as QueueItem[];
-
-  if (items.length === 0) return;
-
-  const client = createPublicClient({ chain: gnosis, transport: http(getWriteRpc(), { timeout: 10_000 }) });
-  const currentBlock = await client.getBlockNumber();
-
-  // Build commitments, quarantining any row whose stored fields can't be ABI-
-  // encoded (poison). buildCommitment MUST be guarded per item — a single throw
-  // here previously crashed the whole cycle before the try block (queue DoS).
-  const { valid, commitments } = buildCommitmentsSafe(items, "committed");
-  if (commitments.length === 0) return;
-
-  const calls = commitments.map((commitment) => ({
-    address: CONTRACT_ADDRESS as `0x${string}`,
-    abi: CONTRACT_ABI,
-    functionName: "getCommitBlock" as const,
-    args: [commitment] as const,
-  }));
-
-  let results: { status: "success" | "failure"; result?: unknown; error?: unknown }[];
-  try {
-    results = await client.multicall({ contracts: calls }) as typeof results;
-  } catch (err) {
-    console.warn(`[queue] processCommitted multicall failed:`, err instanceof Error ? err.message : err);
-    return;
-  }
-
-  const ready: QueueItem[] = [];
-  const needsHasRecordCheck: QueueItem[] = [];
-
-  for (let i = 0; i < valid.length; i++) {
-    const result = results[i];
-    if (result.status !== "success") continue;
-    const commitBlock = result.result as bigint;
-    if (commitBlock > 0n && currentBlock >= commitBlock + 1n) {
-      ready.push(valid[i]);
-    } else if (commitBlock === 0n) {
-      needsHasRecordCheck.push(valid[i]);
-    }
-  }
-
-  if (needsHasRecordCheck.length > 0) {
-    const hasRecordCalls = needsHasRecordCheck.map((item) => ({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      abi: CONTRACT_ABI,
-      functionName: "hasRecord" as const,
-      args: [item.rpId, item.credentialId] as const,
-    }));
-    try {
-      const hasRecordResults = await client.multicall({ contracts: hasRecordCalls });
-      for (let i = 0; i < needsHasRecordCheck.length; i++) {
-        const item = needsHasRecordCheck[i];
-        const r = hasRecordResults[i];
-        if (r.status === "success" && r.result) {
-          db.prepare("UPDATE create_queue SET status = 'done', error = '', updatedAt = ? WHERE id = ?").run(Date.now(), item.id);
-        } else {
-          const COMMIT_COOLDOWN = 2 * 60_000;
-          if (Date.now() - item.updatedAt >= COMMIT_COOLDOWN) {
-            // Commitment never landed — re-commit, but THROUGH handleFailure so
-            // retries/retryAfter advance. Otherwise an item whose commit never
-            // confirms oscillates committed↔pending forever with no progress.
-            handleFailure(item, "commitment missing after cooldown, re-committing", "pending");
-          }
-        }
-      }
-    } catch (err) { console.warn(`[queue] hasRecord multicall failed:`, err instanceof Error ? err.message : err); }
-  }
-
-  if (ready.length === 0) return;
-
-  const { wallet, client: walletClient } = getCreateWallet(cfg());
-
-  // Reconciliation: some 'ready' items may already be on-chain — a prior
-  // createRecord landed but our receipt wait timed out, or the record was
-  // created out of band. Re-sending those would revert the WHOLE batch
-  // (RecordAlreadyExists). Mark already-present ones done and submit only the
-  // genuinely-missing ones.
-  const missing = await reconcileReady(walletClient, ready);
-  if (missing.length === 0) return;
-
-  for (let offset = 0; offset < missing.length; offset += CREATE_SUB_BATCH) {
-    const batch = missing.slice(offset, offset + CREATE_SUB_BATCH);
-    const params = batch.map((item) => {
-      const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
-      return {
-        rpId: item.rpId,
-        credentialId: item.credentialId,
-        walletRef: walletRefHex,
-        publicKey: publicKeyHex,
-        name: item.name,
-        initialCredentialId: item.initialCredentialId,
-        metadata: metadataHex,
-      };
-    });
-
-    const handle = await acquireNonce("create");
-    try {
-      const gasEstimate = await walletClient.estimateContractGas({
-        address: BATCH_HELPER_ADDRESS,
-        abi: BATCH_ABI,
-        functionName: "batchCreateRecord",
-        args: [CONTRACT_ADDRESS, params],
-        account: wallet.account,
-      });
-
-      const hash = await wallet.writeContract({
-        address: BATCH_HELPER_ADDRESS,
-        abi: BATCH_ABI,
-        functionName: "batchCreateRecord",
-        args: [CONTRACT_ADDRESS, params],
-        nonce: handle.nonce,
-        gas: gasEstimate * 120n / 100n,
-      });
-      // Wait for receipt and verify success
-      const createReceipt = await walletClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
-      if (createReceipt.status === "reverted") {
-        throw new Error(`batchCreateRecord tx reverted: ${hash}`);
-      }
-      const now = Date.now();
-      for (const item of batch) {
-        db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
-          .run(hash, now, item.id);
-      }
-      log.info("batchCreateRecord confirmed", { operation: "batchCreateRecord", count: batch.length, outcome: "success" });
-    } catch (err) {
-      handle.release();
-      const msg = shortMsg(err);
-      if (batchFailureAction(err) === "retry-transient") {
-        // The whole batch is fine — an RPC/gas hiccup. Back each item off and
-        // stop this cycle; they retry (with backoff) on a later cycle.
-        for (const item of batch) handleFailure(item, `batchCreateRecord: ${msg}`, "committed");
-        log.warn("batchCreateRecord transient failure, backing off", { operation: "batchCreateRecord", count: batch.length, error_category: "transient" });
-        break;
-      }
-      // Deterministic revert → at least one poison item. Isolate it so it can
-      // never again block the innocent items in this (or any) batch.
-      log.warn("batchCreateRecord poison batch, isolating", { operation: "batchCreateRecord", count: batch.length, error_category: "poison" });
-      await isolatePoisonCreate(walletClient, wallet, batch);
-      // Do NOT break — let subsequent sub-batches proceed.
-    }
-  }
-}
-
-/**
- * For each 'ready' item, mark those already on-chain as done; return the rest.
- * If the reconciliation read itself fails, fall back to the full set (the next
- * cycle re-reconciles) — never lose items.
- */
-async function reconcileReady(
-  // deno-lint-ignore no-explicit-any
-  client: any,
-  items: QueueItem[],
-): Promise<QueueItem[]> {
-  const calls = items.map((item) => ({
-    address: CONTRACT_ADDRESS as `0x${string}`,
-    abi: CONTRACT_ABI,
-    functionName: "hasRecord" as const,
-    args: [item.rpId, item.credentialId] as const,
-  }));
-  let results;
-  try {
-    results = await client.multicall({ contracts: calls });
-  } catch (err) {
-    log.warn("reconcileReady multicall failed, retrying full set next cycle", { operation: "hasRecord", error_category: "transient", error: shortMsg(err) });
-    return items;
-  }
-  const { present, missing } = splitByHasRecord(items, results);
-  if (present.length > 0) {
-    for (const item of present) markItemDone(item);
-    log.info("reconciled already-on-chain items to done", { operation: "reconcile", count: present.length, outcome: "success" });
-  }
-  return missing;
-}
-
-/**
- * Poison isolation for createRecord: process each item INDIVIDUALLY so the batch
- * always makes forward progress, even when items conflict with EACH OTHER
- * (e.g. two credentials sharing a walletRef — the contract allows only one).
- *
- * Per item, in order: already on-chain → done; else estimate+send a single-item
- * tx. Estimates/sends are sequential, so once item A lands, item B's fresh
- * estimate (or send) reverts (WalletRefAlreadyExists) and B is quarantined.
- * Every item ends done / quarantined / transient-backoff — never livelocked.
- */
-async function isolatePoisonCreate(
-  // deno-lint-ignore no-explicit-any
-  client: any,
-  // deno-lint-ignore no-explicit-any
-  wallet: any,
-  items: QueueItem[],
-): Promise<void> {
-  for (const item of items) {
-    try {
-      const has = await client.readContract({
-        address: CONTRACT_ADDRESS, abi: CONTRACT_ABI, functionName: "hasRecord", args: [item.rpId, item.credentialId],
-      });
-      if (has) { markItemDone(item); continue; }
-    } catch { /* fall through to per-item submit */ }
-
-    const { walletRefHex, publicKeyHex, metadataHex } = buildCommitment(item);
-    const param = {
-      rpId: item.rpId, credentialId: item.credentialId, walletRef: walletRefHex,
-      publicKey: publicKeyHex, name: item.name, initialCredentialId: item.initialCredentialId, metadata: metadataHex,
-    };
-
-    // 1. Fresh estimate (reflects any sibling we just sent this pass).
-    let gasEstimate: bigint;
-    try {
-      gasEstimate = await client.estimateContractGas({
-        address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCreateRecord",
-        args: [CONTRACT_ADDRESS, [param]], account: wallet.account,
-      });
-    } catch (err) {
-      if (batchFailureAction(err) === "isolate-poison") {
-        handleFailure(item, `batchCreateRecord poison: ${shortMsg(err)}`, "committed", { poison: true });
-      } else {
-        handleFailure(item, `batchCreateRecord transient during isolation: ${shortMsg(err)}`, "committed");
-      }
-      continue;
-    }
-
-    // 2. Submit this item alone, wait the receipt, verify it didn't revert.
-    const handle = await acquireNonce("create");
-    try {
-      const hash = await wallet.writeContract({
-        address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCreateRecord",
-        args: [CONTRACT_ADDRESS, [param]], nonce: handle.nonce, gas: gasEstimate * 120n / 100n,
-      });
-      const receipt = await client.waitForTransactionReceipt({ hash, timeout: 60_000 });
-      if (receipt.status === "reverted") throw new Error(`reverted: ${hash}`);
-      markItemDone(item, hash);
-      log.info("isolated item created individually", { job_id: item.id, operation: "batchCreateRecord", outcome: "success" });
-    } catch (err) {
-      handle.release();
-      if (batchFailureAction(err) === "isolate-poison") {
-        handleFailure(item, `batchCreateRecord poison (individual send): ${shortMsg(err)}`, "committed", { poison: true });
-      } else {
-        handleFailure(item, `batchCreateRecord transient (individual send): ${shortMsg(err)}`, "committed");
-      }
-    }
-  }
-}
-
-// Phase 3: Send commit txs for pending items
-async function processPending() {
-  const items = db.prepare(
-    "SELECT * FROM create_queue WHERE status = 'pending' AND retryAfter <= ? ORDER BY createdAt ASC LIMIT ?"
-  ).all(Date.now(), TX_BATCH_SIZE) as unknown as QueueItem[];
-
-  if (items.length === 0) return;
-
-  // Guard commitment building per item — a poison row must be quarantined, not
-  // crash the cycle before the try block (was a queue-wide DoS).
-  const { valid: items2, commitments } = buildCommitmentsSafe(items, "pending");
-  if (commitments.length === 0) return;
-
-  const { wallet, client: commitClient } = getCommitWallet(cfg());
-  const handle = await acquireNonce("commit");
-  try {
-    const gasEstimate = await commitClient.estimateContractGas({
-      address: BATCH_HELPER_ADDRESS,
-      abi: BATCH_ABI,
-      functionName: "batchCommit",
-      args: [CONTRACT_ADDRESS, commitments],
-      account: wallet.account,
-    });
-    const hash = await wallet.writeContract({
-      address: BATCH_HELPER_ADDRESS,
-      abi: BATCH_ABI,
-      functionName: "batchCommit",
-      args: [CONTRACT_ADDRESS, commitments],
-      nonce: handle.nonce,
-      gas: gasEstimate * 120n / 100n,
-    });
-    // Wait for receipt and verify success
-    const commitReceipt = await commitClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
-    if (commitReceipt.status === "reverted") {
-      throw new Error(`batchCommit tx reverted: ${hash}`);
-    }
-    const now = Date.now();
-    for (const item of items2) {
-      db.prepare("UPDATE create_queue SET status = 'committed', updatedAt = ? WHERE id = ?").run(now, item.id);
-    }
-    log.info("batchCommit confirmed", { operation: "batchCommit", count: items2.length, outcome: "success" });
-  } catch (err) {
-    handle.release();
-    const msg = shortMsg(err);
-    if (batchFailureAction(err) === "retry-transient") {
-      for (const item of items2) handleFailure(item, `batchCommit: ${msg}`, "pending");
-      log.warn("batchCommit transient failure, backing off", { operation: "batchCommit", count: items2.length, error_category: "transient" });
-    } else {
-      log.warn("batchCommit poison batch, isolating", { operation: "batchCommit", count: items2.length, error_category: "poison" });
-      await isolatePoisonCommit(commitClient, wallet, items2);
-    }
-  }
-}
-
-/**
- * Poison isolation for batchCommit: re-estimate each commitment individually;
- * quarantine the item(s) that deterministically revert, leave the rest 'pending'
- * to be re-batched cleanly next cycle.
- */
-async function isolatePoisonCommit(
-  // deno-lint-ignore no-explicit-any
-  client: any,
-  // deno-lint-ignore no-explicit-any
-  wallet: any,
-  items: QueueItem[],
-): Promise<void> {
-  for (const item of items) {
-    const { commitment } = buildCommitment(item);
-    try {
-      await client.estimateContractGas({
-        address: BATCH_HELPER_ADDRESS, abi: BATCH_ABI, functionName: "batchCommit",
-        args: [CONTRACT_ADDRESS, [commitment]], account: wallet.account,
-      });
-      // Estimable individually → innocent; leave 'pending' for next cycle.
-    } catch (err) {
-      if (batchFailureAction(err) === "isolate-poison") {
-        handleFailure(item, `batchCommit poison: ${shortMsg(err)}`, "pending", { poison: true });
-      } else {
-        handleFailure(item, `batchCommit transient during isolation: ${shortMsg(err)}`, "pending");
-      }
-    }
-  }
-}
-
-const FAILURE_ALERT_BATCH = 10;
-let failuresSinceLastAlert = 0;
-
-/**
- * Record a queue item failure.
- * - poison (deterministic): quarantine immediately to 'failed' (the DLQ) — no
- *   retry, prefixed "POISON:" so operators know it needs a code/data fix.
- * - transient: schedule a backed-off retry; after MAX_RETRIES give up with
- *   "EXHAUSTED:". Either way the item never blocks the rest of the queue.
- */
-function handleFailure(
-  item: QueueItem,
-  error: string,
-  retryStatus: "pending" | "committed" = "pending",
-  opts?: { poison?: boolean },
-) {
-  const retries = item.retries + 1;
-  const terminal = opts?.poison || retries >= MAX_RETRIES;
-  if (terminal) {
-    const prefix = opts?.poison ? "POISON" : "EXHAUSTED";
-    db.prepare("UPDATE create_queue SET status = 'failed', error = ?, retries = ?, updatedAt = ? WHERE id = ?")
-      .run(`${prefix}: ${error}`, retries, Date.now(), item.id);
-    log.error("queue item quarantined to DLQ", {
-      job_id: item.id, operation: "tx", outcome: opts?.poison ? "poison" : "exhausted",
-      error_category: opts?.poison ? "poison" : "transient", retries,
-    });
-  } else {
-    const delay = retryDelayMs(retries);
-    const retryAfter = Date.now() + delay;
-    db.prepare("UPDATE create_queue SET status = ?, error = ?, retries = ?, retryAfter = ?, updatedAt = ? WHERE id = ?")
-      .run(retryStatus, error, retries, retryAfter, Date.now(), item.id);
-    log.warn("queue item retry scheduled", {
-      job_id: item.id, operation: "tx", outcome: "retry", attempt: retries,
-      error_category: "transient", next_retry_in_s: Math.round(delay / 1000),
-    });
-  }
-
-  failuresSinceLastAlert++;
-  if (failuresSinceLastAlert >= FAILURE_ALERT_BATCH) {
-    const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
-    sendTelegram(cfg(), `🔴 [webauthnp256-publickey-index] [Deno] [Gnosis]\n${failuresSinceLastAlert} tx failures since last alert\nTotal in DLQ (failed): ${failed}\nLatest error: ${error}`);
-    failuresSinceLastAlert = 0;
-  }
-}
-
 function shortMsg(err: unknown): string {
-  // Redact any embedded RPC credentials before this string is stored in the
-  // queue 'error' column (surfaced to operators / the status endpoint) or logged.
+  // Redact any embedded RPC credentials before logging.
   return redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 200);
-}
-
-/**
- * Build commitments for a batch, quarantining any row whose stored fields can't
- * be ABI-encoded (e.g. a malformed walletRef/publicKey/metadata that slipped in
- * before validation was tightened). MUST be used instead of items.map(build...)
- * so one poison row is sent to the DLQ rather than throwing and aborting the
- * whole worker cycle (which was a queue-wide DoS).
- */
-function buildCommitmentsSafe(
-  items: QueueItem[],
-  retryStatus: "pending" | "committed",
-): { valid: QueueItem[]; commitments: `0x${string}`[] } {
-  const valid: QueueItem[] = [];
-  const commitments: `0x${string}`[] = [];
-  for (const item of items) {
-    try {
-      commitments.push(buildCommitment(item).commitment);
-      valid.push(item);
-    } catch (err) {
-      handleFailure(item, `uncommittable (bad encoding): ${shortMsg(err)}`, retryStatus, { poison: true });
-    }
-  }
-  return { valid, commitments };
-}
-
-function markItemDone(item: QueueItem, txHash = ""): void {
-  db.prepare("UPDATE create_queue SET status = 'done', txHash = ?, error = '', updatedAt = ? WHERE id = ?")
-    .run(txHash || item.txHash || "", Date.now(), item.id);
 }

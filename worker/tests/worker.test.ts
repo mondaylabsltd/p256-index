@@ -1,6 +1,9 @@
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { describe, it, expect, beforeAll } from "vitest";
 import worker from "../index.ts";
+import { QueueProcessor } from "../queue-processor.ts";
+import { getWriteRpc, _resetForTest } from "../../shared/rpc.ts";
+import type { Env } from "../types.ts";
 import {
   initQueue, enqueue, getQueueItem, findDuplicate, checkRateLimit,
   getQueueStats, withD1Retry, isTransientD1Error,
@@ -267,5 +270,27 @@ describe("withD1Retry", () => {
       throw new Error("UNIQUE constraint failed: create_queue.rpId, create_queue.credentialId");
     })).rejects.toThrow(/UNIQUE constraint/);
     expect(calls).toBe(1);
+  });
+});
+
+// --- QueueProcessor RPC wiring ---
+//
+// The Durable Object runs in its own isolate and never passes through the fetch
+// entry's initRpc path. Its constructor must wire ALCHEMY_API_KEY itself, or
+// every write tx (commit/createRecord/nonce/gas) silently falls back to public
+// endpoints. This pins the wiring so it can't regress.
+describe("QueueProcessor Alchemy wiring", () => {
+  it("constructor registers ALCHEMY_API_KEY as the priority write RPC", () => {
+    _resetForTest();
+    const fakeEnv = { ...env, ALCHEMY_API_KEY: "test-alchemy-key-123456" } as Env;
+    new QueueProcessor({} as DurableObjectState, fakeEnv);
+    expect(getWriteRpc()).toBe("https://gnosis-mainnet.g.alchemy.com/v2/test-alchemy-key-123456");
+    _resetForTest(); // don't leak the priority endpoint into other tests
+  });
+
+  it("without ALCHEMY_API_KEY the write RPC stays on public endpoints", () => {
+    _resetForTest();
+    new QueueProcessor({} as DurableObjectState, { ...env, ALCHEMY_API_KEY: undefined } as Env);
+    expect(getWriteRpc()).toMatch(/^https:\/\/(rpc\.gnosischain\.com|gnosis-rpc\.publicnode\.com|gnosis\.drpc\.org)/);
   });
 });
