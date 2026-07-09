@@ -10,6 +10,7 @@ import {
 } from "./contract.ts";
 import {
   withRetry,
+  withDeadline,
   classifyError,
   DependencyError,
   type RetryAttemptInfo,
@@ -67,13 +68,24 @@ async function readWithRetry(params: any): Promise<any> {
     );
   }
 
+  const deadlineStart = Date.now();
   try {
     return await withRetry(
       async () => {
         const { client, rpcUrl } = getClient();
         const start = performance.now();
         try {
-          const result = await client.readContract({ address: CONTRACT_ADDRESS, abi: CONTRACT_ABI, ...params });
+          // In-flight budget enforcement: withRetry checks the deadline only
+          // BETWEEN attempts, so an attempt started at t=11.9s could still run
+          // its full 10s transport timeout (worst case ~22s). Racing each
+          // attempt against the REMAINING budget makes READ_DEADLINE a real
+          // ceiling for the synchronous request path.
+          const remaining = Math.max(1, READ_DEADLINE - (Date.now() - deadlineStart));
+          const result = await withDeadline(
+            client.readContract({ address: CONTRACT_ADDRESS, abi: CONTRACT_ABI, ...params }),
+            remaining,
+            operation,
+          );
           markHealthy(rpcUrl); // a working read clears any prior cooldown → fast circuit recovery
           log.debug("rpc read ok", {
             dependency: "rpc", operation, outcome: "success",
