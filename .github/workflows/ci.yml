@@ -26,3 +26,18 @@ jobs:
         with:
           deno-version: v2.x
       - run: deno task test
+
+  worker:
+    name: CF Worker (type-check + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # The CF Worker moves real funds via the QueueProcessor Durable Object but
+      # was previously invisible to CI (only `deno check deno/index.ts` ran, which
+      # can't resolve CF ambient types). vitest type-checks + exercises the worker
+      # + D1 queue path so a shared/*.ts change can't silently break the CF runtime.
+      - run: npm ci
+      - run: npm test

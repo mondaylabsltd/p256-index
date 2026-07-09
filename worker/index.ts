@@ -4,7 +4,7 @@
  * challenge.ts, stats.ts routes with Deno version.
  * Only queue (D1 vs SQLite) and config (env bindings vs Deno.env) differ.
  */
-import { initRpc, getReadCircuitState } from "../shared/rpc.ts";
+import { initRpc, setAlchemyRpc, getReadCircuitState } from "../shared/rpc.ts";
 import { CONTRACT_ADDRESS } from "../shared/contract.ts";
 import { handleChallenge } from "../shared/routes/challenge.ts";
 import { handleListRpIds, handleListPublicKeys, handleTotalCredentials } from "../shared/routes/stats.ts";
@@ -33,6 +33,7 @@ export default {
     // Initialize RPC list (lazy, once per isolate lifetime)
     if (!rpcInitialized) {
       await initRpc();
+      if (env.ALCHEMY_API_KEY) setAlchemyRpc(env.ALCHEMY_API_KEY);
       // Salt IP hashing with a server secret so stored hashes can't be brute-
       // forced back to raw IPs if D1 leaks.
       setIpHashSalt(env.PRIVATE_KEY || "webauthnp256-index");

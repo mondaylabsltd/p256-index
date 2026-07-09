@@ -79,6 +79,16 @@ const server = Deno.serve({ port: config.port }, async (req) => {
 });
 
 console.log(`Server running at http://localhost:${config.port}`);
-startQueueWorker();
+
+// The background worker signs mainnet txs and (via ensureCommitWalletFunded) can
+// send real xDAI on startup / every hot-reload. Opt-OUT so `deno task dev` — which
+// auto-loads the funded .env — never turns a laptop into a second live mainnet
+// signer racing the production host's nonces. Production leaves this unset (worker
+// runs); the dev task sets QUEUE_WORKER=0. Read-only APIs work either way.
+if ((Deno.env.get("QUEUE_WORKER") ?? "1") !== "0") {
+  startQueueWorker();
+} else {
+  console.warn("[queue] QUEUE_WORKER=0 — background worker DISABLED (read-only / dev mode); creates will queue but not be processed on-chain");
+}
 
 export { server };

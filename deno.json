@@ -9,7 +9,7 @@
     "marked": "npm:marked@17"
   },
   "tasks": {
-    "dev": "deno run --watch --allow-net --allow-read=. --allow-write=. --allow-env --unstable-node-globals --env deno/index.ts",
+    "dev": "QUEUE_WORKER=0 deno run --watch --allow-net --allow-read=. --allow-write=. --allow-env --unstable-node-globals --env deno/index.ts",
     "start": "deno run --frozen --allow-net --allow-read --allow-write --allow-env --unstable-node-globals deno/index.ts",
     "test": "deno test --allow-net --allow-read --allow-write=. --allow-env --unstable-node-globals deno/tests/",
     "build": "deno run --allow-read=. --allow-write=deno/index.html,dist --allow-run=deno build.ts",

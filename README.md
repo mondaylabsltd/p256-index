@@ -377,6 +377,7 @@ npm run setup                                  # Auto-create D1 database, genera
 npx wrangler secret put PRIVATE_KEY            # Set secrets
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
+npx wrangler secret put ALCHEMY_API_KEY        # Optional: priority write RPC
 npm run deploy                                 # Deploy
 ```
 

@@ -251,6 +251,7 @@ export function _resetForTest(rpcs?: string[]): void {
   failedRpcs.clear();
   lastRefresh = Date.now();
   lastProbeAt = 0;
+  alchemyRpc = null;
 }
 
 async function isHealthy(url: string): Promise<boolean> {

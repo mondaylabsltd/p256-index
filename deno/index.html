@@ -33,7 +33,7 @@
   </a>
 </div>
 <h1>WebAuthn P256 Public Key Index Service</h1>
-<p>WebAuthn P256 Public Key Index Service. Data is stored in a smart contract (V2) on Gnosis Chain; this service acts as a read/write proxy, exposing a REST API.</p>
+<p>A public key index service for WebAuthn P256 credentials. Data is stored on-chain via a smart contract (V2) on Gnosis Chain. This service acts as a read/write proxy, providing a REST API.</p>
 <p>Contract source: <a href="https://github.com/atshelchin/webauthnp256-publickey-index-contracts">webauthnp256-publickey-index-contracts</a></p>
 <table>
 <thead>
@@ -53,13 +53,13 @@
 </tbody></table>
 <p>Public endpoint: <code>https://webauthnp256-publickey-index.biubiu.tools</code></p>
 <ul>
-<li>Runtime: Deno (self-hosted) or Cloudflare Workers (edge deployment), two independent deployments</li>
-<li>Data source: Gnosis on-chain contract (read/write via viem, RPC polling + automatic failover)</li>
-<li>Write path: async queue (Deno: SQLite / CF: D1), background batch commit-reveal on-chain</li>
-<li>Batch on-chain: via BatchHelper contract, single tx handles multiple commit/createRecord calls</li>
-<li>Dual wallet: commit and createRecord use separate EOAs, nonces never interfere</li>
+<li>Runtime: Deno (self-hosted) or Cloudflare Workers (edge), two independent deployments</li>
+<li>Data source: On-chain contract on Gnosis (via viem, RPC round-robin + auto failover)</li>
+<li>Write path: Async queue (Deno: SQLite / CF: D1), background batch commit-reveal on-chain</li>
+<li>Batch on-chain: Via BatchHelper contract, single tx for multiple commit/createRecord calls</li>
+<li>Dual wallet: commit and createRecord use separate EOAs, independent nonce management</li>
 <li>Default port: 11256 (Deno) / N/A (CF Workers)</li>
-<li>CORS: allows all origins</li>
+<li>CORS: Allow all origins</li>
 </ul>
 <h2>API Reference</h2>
 <p>Base URL: <code>https://webauthnp256-publickey-index.biubiu.tools</code> (or your self-hosted address)</p>
@@ -73,7 +73,7 @@
 </code></pre>
 <hr>
 <h3>POST /api/create</h3>
-<p>Create a public key record. The request returns 202 immediately; the on-chain commit-reveal flow runs asynchronously in the background.</p>
+<p>Create a public key record. Returns 202 immediately; the on-chain commit-reveal process runs asynchronously in the background.</p>
 <p><strong>Request body</strong> (JSON):</p>
 <table>
 <thead>
@@ -106,13 +106,13 @@
 <td>name</td>
 <td>string</td>
 <td>Yes</td>
-<td>Display name of the passkey</td>
+<td>Passkey display name</td>
 </tr>
 <tr>
 <td>walletRef</td>
 <td>string</td>
 <td>No</td>
-<td>Wallet identifier (bytes32 hex), defaults to a deterministic Safe address derived from publicKey</td>
+<td>Wallet identifier (bytes32 hex), defaults to deterministic Safe address from publicKey</td>
 </tr>
 <tr>
 <td>initialCredentialId</td>
@@ -135,7 +135,7 @@
   &quot;name&quot;: &quot;My MacBook&quot;
 }
 </code></pre>
-<p><strong>Response</strong> (202 - Enqueued):</p>
+<p><strong>Response</strong> (202 - Queued):</p>
 <pre><code class="language-json">{
   &quot;id&quot;: &quot;uuid&quot;,
   &quot;status&quot;: &quot;pending&quot;
@@ -154,12 +154,12 @@
 <p><strong>Error responses</strong>:</p>
 <ul>
 <li><code>400</code> - Missing parameters</li>
-<li><code>429</code> - Rate limiting exceeded (5 requests per IP per minute)</li>
+<li><code>429</code> - Rate limit exceeded (5 requests per IP per minute)</li>
 </ul>
 <hr>
 <h3>GET /api/create/:id</h3>
-<p>Query the status of an async creation task.</p>
-<p><strong>Response - Completed</strong> (200, status=done):</p>
+<p>Query the status of an async create task.</p>
+<p><strong>Response - Complete</strong> (200, status=done):</p>
 <pre><code class="language-json">{
   &quot;id&quot;: &quot;uuid&quot;,
   &quot;status&quot;: &quot;done&quot;,
@@ -172,7 +172,7 @@
   &quot;createdAt&quot;: 1711000000000
 }
 </code></pre>
-<p><strong>Response - In progress</strong> (200, status≠done):</p>
+<p><strong>Response - In progress</strong> (200, status != done):</p>
 <pre><code class="language-json">{
   &quot;id&quot;: &quot;uuid&quot;,
   &quot;status&quot;: &quot;pending | committed&quot;,
@@ -183,15 +183,15 @@
 }
 </code></pre>
 <blockquote>
-<p>While in progress, <code>credentialId</code> and <code>walletRef</code> are not returned to prevent front-running during the commit-reveal phase. On failure, an <code>error</code> field is included.</p>
+<p>In-progress responses omit <code>credentialId</code> and <code>walletRef</code> to prevent front-running during the commit-reveal phase. Failed tasks include an <code>error</code> field.</p>
 </blockquote>
-<p>Status machine: <code>pending → committed → done</code>. Automatic retry up to 3 times on failure.</p>
+<p>Status machine: <code>pending → committed → done</code>. Failed tasks auto-retry up to 10 times with exponential backoff.</p>
 <hr>
 <h3>GET /api/query</h3>
-<p>Query public key records. Two query methods are supported:</p>
-<p><strong>Method 1: By rpId + credentialId</strong></p>
+<p>Query a public key record. Supports two query modes:</p>
+<p><strong>Mode 1: By rpId + credentialId</strong></p>
 <p><code>GET /api/query?rpId=example.com&amp;credentialId=abc123</code></p>
-<p><strong>Method 2: By walletRef</strong></p>
+<p><strong>Mode 2: By walletRef</strong></p>
 <p><code>GET /api/query?walletRef=0x000...abc</code></p>
 <p><strong>Success response</strong> (200):</p>
 <pre><code class="language-json">{
@@ -205,24 +205,24 @@
   &quot;createdAt&quot;: 1711000000000
 }
 </code></pre>
-<p>If not found on-chain but present in the queue (being submitted on-chain), partial data from the queue is returned with a <code>_queue</code> field (<code>credentialId</code>/<code>walletRef</code>/<code>initialCredentialId</code> are hidden to prevent front-running):</p>
+<p>If not found on-chain but in the queue (being submitted), partial data is returned with a <code>_queue</code> field (sensitive fields redacted to prevent front-running):</p>
 <pre><code class="language-json">{
   &quot;rpId&quot;: &quot;example.com&quot;,
   &quot;publicKey&quot;: &quot;04a1b2c3...&quot;,
   &quot;name&quot;: &quot;My MacBook&quot;,
   &quot;metadata&quot;: &quot;0000...00&quot;,
   &quot;createdAt&quot;: 1711000000000,
-  &quot;_queue&quot;: { &quot;id&quot;: &quot;uuid&quot;, &quot;status&quot;: &quot;committing&quot; }
+  &quot;_queue&quot;: { &quot;id&quot;: &quot;uuid&quot;, &quot;status&quot;: &quot;committed&quot; }
 }
 </code></pre>
 <p><strong>Error responses</strong>:</p>
 <ul>
-<li><code>400</code> - Missing parameters (requires rpId+credentialId or walletRef)</li>
+<li><code>400</code> - Missing parameters (need rpId+credentialId or walletRef)</li>
 <li><code>404</code> - Not found</li>
 </ul>
 <hr>
 <h3>GET /api/stats/total</h3>
-<p>Query the total number of credentials across all sites.</p>
+<p>Get total credential count across all sites.</p>
 <p><strong>Response</strong> (200):</p>
 <pre><code class="language-json">{
   &quot;totalCredentials&quot;: 1234
@@ -230,12 +230,12 @@
 </code></pre>
 <hr>
 <h3>GET /api/stats/sites</h3>
-<p>Paginated query of all sites.</p>
+<p>Paginated list of all sites.</p>
 <p><strong>Query parameters</strong>:</p>
 <table>
 <thead>
 <tr>
-<th>Parameter</th>
+<th>Param</th>
 <th>Type</th>
 <th>Required</th>
 <th>Default</th>
@@ -276,12 +276,12 @@
 </code></pre>
 <hr>
 <h3>GET /api/stats/keys</h3>
-<p>Paginated query of all public keys under a given site.</p>
+<p>Paginated list of public keys for a specific site.</p>
 <p><strong>Query parameters</strong>:</p>
 <table>
 <thead>
 <tr>
-<th>Parameter</th>
+<th>Param</th>
 <th>Type</th>
 <th>Required</th>
 <th>Default</th>
@@ -336,7 +336,7 @@
   ]
 }
 </code></pre>
-<p><strong>Error responses</strong>: <code>400</code> - rpId missing</p>
+<p><strong>Error response</strong>: <code>400</code> - rpId missing</p>
 <hr>
 <h3>GET /api/health</h3>
 <p>Health check.</p>
@@ -351,47 +351,47 @@
 </code></pre>
 <hr>
 <h3>GET /</h3>
-<p>Returns an HTML-rendered version of this document (GitHub style).</p>
+<p>Returns an HTML-rendered version of this documentation (GitHub style).</p>
 <hr>
-<h2>Full Call Flow Example</h2>
+<h2>Example Flow</h2>
 <pre><code>1. POST /api/create                           → 202 { id, status: &quot;pending&quot; }
    Body: { rpId, credentialId, publicKey, name }
 2. GET  /api/create/:id                       → { status: &quot;done&quot;, txHash: &quot;0x...&quot; }
 3. GET  /api/query?rpId=...&amp;credentialId=...  → { publicKey, walletRef, ... }
-   or GET /api/query?walletRef=0x...          → same as above
+   or GET /api/query?walletRef=0x...          → same
 </code></pre>
 <h2>Privacy &amp; Compliance</h2>
 <ul>
-<li>IP addresses are stored after SHA-256 hashing; the original IP cannot be recovered, GDPR compliant</li>
-<li>No user identity information is collected; only public keys and site domains (public data) are stored</li>
-<li>All data is immutable once on-chain (blockchain property); users should be aware of this</li>
+<li>IP addresses are SHA-256 hashed before storage, cannot be reversed, GDPR compliant</li>
+<li>No user identity data collected, only public keys and site domains (public data)</li>
+<li>All data is immutable once on-chain (blockchain property), users should be aware</li>
 </ul>
 <h2>Caching Strategy</h2>
-<p>Dual-layer caching:</p>
+<p>Two-layer cache:</p>
 <ul>
-<li>Server-side in-memory cache: 5-minute TTL, 100 MB cap, oldest entries evicted when full</li>
+<li>Server-side in-memory cache: 5-minute TTL, 100MB limit, evicts oldest entries when full</li>
 <li>CDN cache: <code>Cache-Control: public, max-age=3600</code> (1 hour)</li>
 </ul>
 <p>Rules:</p>
 <ul>
-<li>Only 200 responses are cached; 404 responses are not cached</li>
+<li>Only 200 responses are cached, 404s are not</li>
 </ul>
 <h2>Project Structure</h2>
-<pre><code>shared/                      Platform-agnostic shared code (imported directly by both runtimes)
-  contract.ts                ABI, contract addresses, formatRecord, buildCommitment
+<pre><code>shared/                      Platform-agnostic shared code (imported by both runtimes)
+  contract.ts                ABI, contract address, formatRecord, buildCommitment
   contract-read.ts           On-chain read operations (getPublicKey, listRpIds, etc.)
   queue.ts                   Types, constants, DDL, hashIp, wallet helpers, sendTelegram
-  rpc.ts                     RPC polling + automatic failover
-  cache.ts                   In-memory cache (TTL + memory cap + eviction)
+  rpc.ts                     RPC round-robin + auto failover
+  cache.ts                   In-memory cache (TTL + memory limit + eviction)
   validation.ts              Input length validation
-  wallet-ref.ts              walletRef computation (P256 public key → Safe address → bytes32)
+  wallet-ref.ts              walletRef computation (P256 pubkey → Safe address → bytes32)
   routes/
     challenge.ts             GET /api/challenge
     stats.ts                 GET /api/stats/*
 
 deno/                        Deno runtime specific
   index.ts                   Entry point (Deno.serve)
-  config.ts                  Configuration (Deno.env + node:crypto)
+  config.ts                  Config (Deno.env + node:crypto)
   queue.ts                   SQLite queue + setInterval background worker
   nonce.ts                   Nonce management
   routes/
@@ -401,9 +401,9 @@ deno/                        Deno runtime specific
 
 worker/                      Cloudflare Worker runtime specific
   index.ts                   Entry point (fetch + scheduled)
-  config.ts                  Configuration (crypto.subtle + env bindings)
+  config.ts                  Config (crypto.subtle + env bindings)
   queue.ts                   D1 queue (async)
-  nonce.ts                   Nonce management (config parameter injection)
+  nonce.ts                   Nonce management (config param injection)
   queue-processor.ts         Durable Object + alarm (replaces setInterval)
   types.ts                   CF environment type definitions
   routes/
@@ -412,7 +412,7 @@ worker/                      Cloudflare Worker runtime specific
   tests/                     CF Worker tests
 
 scripts/                     Deployment scripts
-build.ts                     Build script (readme→HTML + compile binary)
+build.ts                     Build script (README → HTML + compile binary)
 </code></pre>
 <h2>Local Development</h2>
 <pre><code class="language-bash"># Deno
@@ -424,13 +424,13 @@ npm install            # Install dependencies
 npm test               # Run tests (vitest + miniflare)
 npm run dev            # Local wrangler dev
 </code></pre>
-<h2>Deployment (Deno - Self-hosted Server)</h2>
-<p>Deploy to a server via <code>deno task deploy</code>, interactively selecting the target.</p>
+<h2>Deploy (Deno - Self-hosted Server)</h2>
+<p>Deploy to your server via <code>deno task deploy</code>, interactive target selection.</p>
 <pre><code class="language-bash">deno task deploy              # Deploy: select target → upload → health check
 deno task deploy status       # Check remote service status
-deno task deploy rollback     # Roll back to previous version
+deno task deploy rollback     # Rollback to previous version
 </code></pre>
-<p>First deployment automatically: installs Deno → creates user/directories → prompts for .env configuration → installs systemd service.</p>
+<p>First deploy auto-provisions: install Deno → create user/directories → prompt .env config → install systemd service.</p>
 <h3>Server Environment Variables</h3>
 <pre><code class="language-env">PORT=11256
 QUEUE_DB_PATH=/opt/webauthnp256-publickey-index/data/queue.db
@@ -438,14 +438,15 @@ PRIVATE_KEY=0x...
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 </code></pre>
-<h2>Deployment (Cloudflare Workers)</h2>
+<h2>Deploy (Cloudflare Workers)</h2>
 <pre><code class="language-bash">npm install                                    # Install dependencies
 npm run setup                                  # Auto-create D1 database, generate wrangler.json (idempotent)
-npx wrangler secret put PRIVATE_KEY            # Set Secrets
+npx wrangler secret put PRIVATE_KEY            # Set secrets
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
+npx wrangler secret put ALCHEMY_API_KEY        # Optional: priority write RPC
 npm run deploy                                 # Deploy
 </code></pre>
-<p>Queue processing is handled via Durable Object + Alarm (~10s interval), with a Cron Trigger (every minute) as a backup to ensure the DO alarm is running.</p>
+<p>Queue processing uses Durable Object + Alarm (~10s interval), with a Cron Trigger (every minute) as backup to ensure the DO alarm is running.</p>
 </body>
 </html>

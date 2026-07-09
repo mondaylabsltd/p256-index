@@ -1,5 +1,5 @@
 import { assertEquals, assertNotEquals, assert } from "@std/assert/";
-import { getCurrentRpc, getWriteRpc, markFailed, markHealthy, tryReadProbe, getReadCircuitState, readCircuitRetryAfterMs, _resetForTest } from "../../shared/rpc.ts";
+import { getCurrentRpc, getWriteRpc, markFailed, markHealthy, setAlchemyRpc, tryReadProbe, getReadCircuitState, readCircuitRetryAfterMs, _resetForTest } from "../../shared/rpc.ts";
 
 const TEST_RPCS = ["https://rpc-a.test", "https://rpc-b.test", "https://rpc-c.test"];
 
@@ -48,6 +48,27 @@ Deno.test("getWriteRpc skips failed RPCs", () => {
   markFailed(first);
   const second = getWriteRpc();
   assertNotEquals(first, second);
+});
+
+// Regression: a pinned-but-dead Alchemy write endpoint must be rotatable. Before
+// the write-path health-tracking fix, getWriteRpc returned the Alchemy URL
+// unconditionally (isAvailable was never false for it because markFailed was only
+// called on the READ path), so a dead/rate-limited Alchemy stalled the whole
+// write pipeline forever. The queue's gas-check now calls markFailed on failure.
+Deno.test("getWriteRpc rotates OFF a failed Alchemy endpoint to a public write RPC", () => {
+  _resetForTest();
+  setAlchemyRpc("test-key-abc123");
+  const alchemy = "https://gnosis-mainnet.g.alchemy.com/v2/test-key-abc123";
+  assertEquals(getWriteRpc(), alchemy); // Alchemy is preferred while healthy
+
+  markFailed(alchemy); // simulate the gas-check catch cooling it down
+  const afterFail = getWriteRpc();
+  assertNotEquals(afterFail, alchemy); // must fall back to a public write RPC
+  assert(afterFail.startsWith("https://"), `expected a real RPC url, got ${afterFail}`);
+
+  markHealthy(alchemy); // a later successful cycle clears the cooldown
+  assertEquals(getWriteRpc(), alchemy); // and Alchemy is preferred again
+  _resetForTest(); // don't leak the Alchemy endpoint into other tests
 });
 
 // --- Cooldown recovery ---
