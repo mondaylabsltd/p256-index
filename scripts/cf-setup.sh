@@ -3,10 +3,10 @@
 set -e
 
 DB_NAME="webauthnp256-queue"
-CONFIG_OUTPUT="wrangler.json"
+CONFIG_FILE="wrangler.jsonc"
 
 echo "Checking for existing D1 database '$DB_NAME'..."
-DB_ID=$(npx wrangler d1 list 2>/dev/null | grep "$DB_NAME" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1 || true)
+DB_ID=$(npx wrangler d1 list 2>/dev/null | grep -E "(^|[[:space:]|])$DB_NAME([[:space:]|]|$)" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1 || true)
 
 if [ -z "$DB_ID" ]; then
   echo "Creating D1 database '$DB_NAME'..."
@@ -22,48 +22,17 @@ else
   echo "Found existing D1 database: $DB_ID"
 fi
 
-# Generate wrangler.json (pure JSON, no comments)
-cat > "$CONFIG_OUTPUT" <<TMPL
-{
-  "name": "webauthnp256-publickey-index",
-  "main": "worker/index.ts",
-  "compatibility_date": "2024-09-23",
-  "compatibility_flags": ["nodejs_compat"],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "$DB_NAME",
-      "database_id": "$DB_ID"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "QUEUE_PROCESSOR",
-        "class_name": "QueueProcessor"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_classes": ["QueueProcessor"]
-    }
-  ],
-  "triggers": {
-    "crons": ["* * * * *"]
-  },
-  "observability": {
-    "enabled": false,
-    "logs": {
-      "enabled": true,
-      "invocation_logs": true
-    }
-  }
-}
-TMPL
+# Patch the COMMITTED wrangler.jsonc in place (idempotent). The config is now
+# version-controlled — production CF deployment is reproducible from the repo
+# (previously the deployed wrangler.json was generated and gitignored while the
+# committed wrangler.jsonc was dead, so prod config drifted invisibly).
+if grep -q "\"database_id\": \"$DB_ID\"" "$CONFIG_FILE"; then
+  echo "$CONFIG_FILE already references database_id: $DB_ID"
+else
+  sed -i.bak -E "s/\"database_id\": \"[^\"]*\"/\"database_id\": \"$DB_ID\"/" "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
+  echo "Updated $CONFIG_FILE with database_id: $DB_ID (commit this change)"
+fi
 
-echo "Generated $CONFIG_OUTPUT with database_id: $DB_ID"
 echo ""
 echo "Next steps:"
 echo "  npx wrangler secret put PRIVATE_KEY"

@@ -14,9 +14,6 @@
 #     auto-skips them here; run locally per the docs 05 pre-deploy checklist.
 #   - `deno lint`: 3 known require-await hits in test files would fail the
 #     gate (docs 02). Enable once cleaned up.
-#   - Standalone `tsc --noEmit` for worker/: vitest bundles via esbuild without
-#     a full type-check (docs 08 P2-15). Close by adding a tsconfig + tsc step.
-#
 # Flakiness caveat: a few Deno tests read live Gnosis RPC (docs 08 P2-11), so
 # a red `deno` job can be upstream RPC trouble rather than our code — re-run
 # once before digging.
@@ -38,7 +35,7 @@ jobs:
         with:
           # Pinned to the minor verified in docs 02 (2.7.5); the old floating
           # v2.x is the version-pinning gap flagged in docs 08. Bump deliberately.
-          deno-version: v2.7.x
+          deno-version: v2.7.5
       - name: Type check
         # All three Deno-side entrypoints (docs 02); worker/ needs CF ambient
         # types and is covered by the worker job instead. --frozen rejects a
@@ -61,4 +58,7 @@ jobs:
       # exercises the worker + queue path — a shared/*.ts change can't silently
       # break the CF runtime.
       - run: npm ci
+      # Full strict type-check with CF ambient types (esbuild in vitest does
+      # NOT type-check) — closes docs 08 P2-15.
+      - run: npm run typecheck
       - run: npm test

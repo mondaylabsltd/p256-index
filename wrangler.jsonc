@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "webauthnp256-queue",
-      "database_id": ""
+      "database_id": "13cd5b85-71d2-4214-9f2e-729eb575211a"
     }
   ],
   "durable_objects": {

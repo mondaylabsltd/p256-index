@@ -31,6 +31,7 @@ import {
 } from "./deploy/remote.ts";
 
 const SYSTEMD_UNIT = "webauthnp256-publickey-index.service";
+const ALERT_UNIT = "webauthnp256-alert.service";
 const HTTP_PORT = 11256;
 
 // ── Prompts ──
@@ -187,20 +188,33 @@ ENVEOF
     const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
     await uploadRelease(ssh, repoRoot, releaseDir);
 
-    // Install systemd unit
-    console.log("-> Installing systemd unit...");
-    const unitPath = `${repoRoot}/deploy/systemd/${SYSTEMD_UNIT}`;
-    const unitBytes = await Deno.readFile(unitPath);
-    const b64 = bytesToBase64(unitBytes);
-    const installCode = await ssh.runShell(`
+    // Install systemd units (service + its OnFailure Telegram pager)
+    console.log("-> Installing systemd units...");
+    for (const unit of [SYSTEMD_UNIT, ALERT_UNIT]) {
+      const unitBytes = await Deno.readFile(`${repoRoot}/deploy/systemd/${unit}`);
+      const b64 = bytesToBase64(unitBytes);
+      const installCode = await ssh.runShell(`
+        set -e
+        printf '%s' '${b64}' | base64 -d > /tmp/${unit}
+        sudo mv /tmp/${unit} /etc/systemd/system/${unit}
+        sudo chmod 644 /etc/systemd/system/${unit}
+      `);
+      if (installCode !== 0) throw new Error(`systemd unit install failed: ${unit}`);
+    }
+    const reloadCode = await ssh.runShell(`
       set -e
-      printf '%s' '${b64}' | base64 -d > /tmp/${SYSTEMD_UNIT}
-      mv /tmp/${SYSTEMD_UNIT} /etc/systemd/system/${SYSTEMD_UNIT}
-      chmod 644 /etc/systemd/system/${SYSTEMD_UNIT}
-      systemctl daemon-reload
-      systemctl enable ${SYSTEMD_UNIT}
+      sudo systemctl daemon-reload
+      sudo systemctl enable ${SYSTEMD_UNIT}
     `);
-    if (installCode !== 0) throw new Error("systemd unit install failed");
+    if (reloadCode !== 0) throw new Error("systemd enable failed");
+
+    const remotePort = await readRemotePort(ssh);
+
+    // Capture the LAST-KNOWN-GOOD release (what `current` points at now, before
+    // we swap) so an auto-rollback returns to a release that WAS serving, not
+    // merely "the newest other dir".
+    const lkgOut = await ssh.runCapture(["bash", "-lc", `readlink ${CURRENT_LINK} 2>/dev/null | xargs -r basename`]);
+    const lastKnownGood = lkgOut.stdout.trim();
 
     // Swap symlink
     console.log("-> Swapping symlink...");
@@ -210,36 +224,62 @@ ENVEOF
     console.log("-> Restarting service...");
     await ssh.runShell(`sudo systemctl restart ${SYSTEMD_UNIT}`);
 
-    // Health check
+    // Health gate (JSON status; degraded still counts as serving).
     console.log("-> Waiting for health...");
-    let healthy = false;
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const check = await ssh.runCapture([
-        "bash", "-lc",
-        `curl -sf http://127.0.0.1:${HTTP_PORT}/api/health 2>/dev/null || true`,
-      ]);
-      if (check.stdout.includes("ok")) {
-        healthy = true;
-        break;
+    const healthy = await pollHealth(ssh, remotePort, 30);
+    let liveRelease = tag;
+
+    if (!healthy) {
+      console.error("Health gate FAILED.");
+      if (lastKnownGood && lastKnownGood !== tag) {
+        console.error(`-> Rolling back to last-known-good release ${lastKnownGood}...`);
+        await swapSymlink(ssh, `${RELEASES_DIR}/${lastKnownGood}`);
+        await ssh.runShell(`sudo systemctl restart ${SYSTEMD_UNIT}`);
+        const rolledHealthy = await pollHealth(ssh, remotePort, 15);
+        liveRelease = lastKnownGood;
+        console.error(rolledHealthy
+          ? `Rolled back to ${lastKnownGood} (health OK). Failed release ${tag} kept for inspection.`
+          : `Rolled back to ${lastKnownGood} but its health is INCONCLUSIVE — investigate NOW.`);
+      } else {
+        console.error("No last-known-good release to roll back to — the failed release stays live. Investigate immediately.");
       }
     }
 
-    // Update config
+    // Record only what is actually live now (never the failed tag).
     target.lastDeployedAt = new Date().toISOString();
-    target.lastReleaseTag = tag;
+    target.lastReleaseTag = liveRelease;
     await saveDeployConfig(upsertTarget(updatedCfg, target));
 
     // Summary
     console.log("\n" + "=".repeat(50));
-    console.log(healthy ? "Deploy successful!" : "Service started but health check inconclusive");
-    console.log(`  Release: ${tag}`);
+    console.log(healthy ? "Deploy successful!" : "Deploy FAILED — rolled back (see above)");
+    console.log(`  Live release: ${liveRelease}${healthy ? "" : `  (attempted: ${tag})`}`);
     console.log(`  Service: ${SYSTEMD_UNIT}`);
-    console.log(`  HTTP:    http://${target.host}:${HTTP_PORT}/`);
+    console.log(`  HTTP:    http://${target.host}:${remotePort}/`);
     console.log("=".repeat(50) + "\n");
+    if (!healthy) Deno.exit(1); // machine-visible failure
   } finally {
     await ssh.close();
   }
+}
+
+/** Read the service PORT from the remote .env (falls back to the default). */
+async function readRemotePort(ssh: ReturnType<typeof createSshSession>): Promise<number> {
+  const out = await ssh.runCapture(["bash", "-lc", `grep -E '^PORT=' ${DATA_DIR}/.env 2>/dev/null | tail -1 | cut -d= -f2`]);
+  return parseInt(out.stdout.trim()) || HTTP_PORT;
+}
+
+/** Poll /api/health up to `tries` times (2s apart); JSON ok|degraded passes. */
+async function pollHealth(ssh: ReturnType<typeof createSshSession>, port: number, tries: number): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const check = await ssh.runCapture(["bash", "-lc", `curl -sf http://127.0.0.1:${port}/api/health 2>/dev/null || true`]);
+    try {
+      const body = JSON.parse(check.stdout);
+      if (body.status === "ok" || body.status === "degraded") return true;
+    } catch { /* not up yet */ }
+  }
+  return false;
 }
 
 async function runStatus(cfg: DeployConfig) {
@@ -257,8 +297,9 @@ async function runStatus(cfg: DeployConfig) {
     await ssh.run(["bash", "-lc", `readlink ${CURRENT_LINK} 2>/dev/null || echo 'No current release'`]);
     console.log("\n-> Recent releases:");
     await ssh.run(["bash", "-lc", `ls -lt ${RELEASES_DIR}/ 2>/dev/null | head -5`]);
-    console.log("\n-> Health:");
-    await ssh.run(["bash", "-lc", `curl -sf http://127.0.0.1:${HTTP_PORT}/api/health 2>/dev/null || echo 'Service not responding'`]);
+    const statusPort = await readRemotePort(ssh);
+    console.log(`\n-> Health (port ${statusPort}):`);
+    await ssh.run(["bash", "-lc", `curl -sf http://127.0.0.1:${statusPort}/api/health 2>/dev/null || echo 'Service not responding'`]);
   } finally {
     await ssh.close();
   }
@@ -281,11 +322,47 @@ async function runRollback(cfg: DeployConfig) {
     }
     const current = await ssh.runCapture(["bash", "-lc", `readlink ${CURRENT_LINK} | xargs basename`]);
     const currentTag = current.stdout.trim();
-    const prev = dirs.find((d) => d !== currentTag) ?? dirs[1];
-    console.log(`\nRolling back: ${currentTag} -> ${prev}`);
-    await swapSymlink(ssh, `${RELEASES_DIR}/${prev}`);
+
+    // Explicit target: `deno task deploy rollback <tag>` — the old "newest
+    // non-current" heuristic OSCILLATED between the two newest releases and
+    // could never reach older ones.
+    const requested = Deno.args[1];
+    let dest: string;
+    if (requested) {
+      if (!dirs.includes(requested)) {
+        console.error(`Release '${requested}' not found. Available:\n  ${dirs.join("\n  ")}`);
+        return;
+      }
+      dest = requested;
+    } else {
+      // Default: the release IMMEDIATELY OLDER than current (true rollback);
+      // running it twice keeps going further back instead of ping-ponging.
+      const idx = dirs.indexOf(currentTag);
+      const older = idx >= 0 ? dirs[idx + 1] : dirs.find((d) => d !== currentTag);
+      if (!older) {
+        console.log(`No release older than current (${currentTag}). Use: deno task deploy rollback <tag>`);
+        return;
+      }
+      dest = older;
+    }
+
+    console.log(`\nRolling back: ${currentTag} -> ${dest}`);
+    await swapSymlink(ssh, `${RELEASES_DIR}/${dest}`);
     await ssh.runShell(`sudo systemctl restart ${SYSTEMD_UNIT}`);
-    console.log("Rollback complete");
+
+    // Verify the rolled-back release actually serves.
+    const portOut = await ssh.runCapture(["bash", "-lc", `grep -E '^PORT=' ${DATA_DIR}/.env 2>/dev/null | tail -1 | cut -d= -f2`]);
+    const remotePort = parseInt(portOut.stdout.trim()) || HTTP_PORT;
+    let healthy = false;
+    for (let i = 0; i < 15; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const check = await ssh.runCapture(["bash", "-lc", `curl -sf http://127.0.0.1:${remotePort}/api/health 2>/dev/null || true`]);
+      try {
+        const body = JSON.parse(check.stdout);
+        if (body.status === "ok" || body.status === "degraded") { healthy = true; break; }
+      } catch { /* not up yet */ }
+    }
+    console.log(healthy ? "Rollback complete — health OK" : "Rollback done but health check INCONCLUSIVE — investigate");
   } finally {
     await ssh.close();
   }

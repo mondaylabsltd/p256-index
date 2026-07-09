@@ -2,6 +2,10 @@
 Description=WebAuthn P256 Public Key Index Service
 After=network-online.target
 Wants=network-online.target
+# Page the operator when the unit itself dies (crash loop / restart-limit hit):
+# the in-process Telegram alerting dies with the process, so this is the only
+# channel for "the service is down".
+OnFailure=webauthnp256-alert.service
 
 [Service]
 Type=simple
@@ -15,7 +19,7 @@ Environment=HOME=/opt/webauthnp256-publickey-index/data
 Environment=NO_COLOR=1
 EnvironmentFile=/opt/webauthnp256-publickey-index/data/.env
 
-Restart=on-failure
+Restart=always
 RestartSec=3s
 StartLimitInterval=60s
 StartLimitBurst=5

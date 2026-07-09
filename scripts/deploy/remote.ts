@@ -25,12 +25,16 @@ export async function probeRemote(ssh: SshSession) {
   };
 }
 
+// Pinned: an unpinned install meant servers deployed at different times ran
+// different Deno versions than CI verified. Bump together with ci.yml.
+export const DENO_VERSION = "v2.7.5";
+
 export async function installDeno(ssh: SshSession): Promise<void> {
   const code = await ssh.runShell(`
     set -e
     TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
     curl -fsSL https://deno.land/install.sh -o "$TMP"
-    sudo -n env DENO_INSTALL=/usr/local sh "$TMP" --yes || sudo env DENO_INSTALL=/usr/local sh "$TMP" --yes
+    sudo -n env DENO_INSTALL=/usr/local sh "$TMP" --yes ${DENO_VERSION} || sudo env DENO_INSTALL=/usr/local sh "$TMP" --yes ${DENO_VERSION}
     sudo chmod 0755 /usr/local/bin/deno
     /usr/local/bin/deno --version
   `);
