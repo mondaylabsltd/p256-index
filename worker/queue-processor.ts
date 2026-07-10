@@ -246,6 +246,13 @@ export class QueueProcessor implements DurableObject {
    * minute). Non-terminal failures use the batched counter as before.
    */
   private async onItemFailure(error: string, info: ItemFailureInfo): Promise<void> {
+    if (info.conflict) {
+      // USER-INPUT conflict (same passkey already registered under another
+      // credential). Terminal + DLQ/status-visible, but a page means "code bug
+      // or funding" — this is neither. Log only (mirrors the Deno runtime).
+      console.warn(`[queue-processor] user-conflict quarantine (no page): job ${info.jobId}: ${error}`);
+      return;
+    }
     if (info.terminal) {
       this.terminalSinceLastAlert++;
       this.lastTerminalError = `${info.poison ? "POISON" : "EXHAUSTED"} (job ${info.jobId}): ${error}`;
@@ -321,8 +328,10 @@ export class QueueProcessor implements DurableObject {
       alerts.push(`⚠️ Queue backlog: ${pending.count} items pending`);
     }
 
+    // CONFLICT: rows are user-input conflicts — terminal but NOT dev-actionable,
+    // so they are excluded from this page (still visible in DLQ/status).
     const failed = await this.db.prepare(
-      "SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'"
+      "SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed' AND error NOT LIKE 'CONFLICT:%'"
     ).first<{ count: number }>();
     if (failed && failed.count > 0 && failed.count !== this.lastFailedCount) {
       alerts.push(`🔴 ${failed.count} items permanently failed`);

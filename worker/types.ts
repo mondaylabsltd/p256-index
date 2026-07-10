@@ -11,5 +11,7 @@ export interface Env {
   GLOBAL_WRITE_LIMIT?: string;
   /** Optional minimum log level: debug|info|warn|error (default debug). */
   LOG_LEVEL?: string;
+  /** Optional override for the external-liveness watchdog's probe target. */
+  WATCHDOG_TARGET_URL?: string;
   QUEUE_PROCESSOR: DurableObjectNamespace;
 }

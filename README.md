@@ -85,8 +85,22 @@ Create a public key record. Returns 202 immediately; the on-chain commit-reveal 
 }
 ```
 
+**Response** (409 - walletRef conflict):
+```json
+{
+  "error": "this publicKey is already registered under a different credential (walletRef conflict)",
+  "walletRef": "0x000...abc"
+}
+```
+The walletRef is derived from the publicKey alone (independent of rpId), so the
+same P256 key can only ever be registered once. Registering the same passkey
+under a second credential/site is rejected up-front — the on-chain write would
+deterministically revert (`WalletRefAlreadyExists`). Resolve by creating a new
+passkey, or look up the existing record with `GET /api/query?walletRef=...`.
+
 **Error responses**:
 - `400` - Missing/invalid parameters (incl. a publicKey that is not a real point on the P-256 curve, or a walletRef that does not match the derived one)
+- `409` - The publicKey's walletRef is already registered (or actively being registered) under a different credential
 - `413` - Body larger than 32KB
 - `429` - Rate limit exceeded (5 creates per IP per minute)
 - `503` - Backpressure (queue too deep) or global create cap reached — retry with backoff (`Retry-After` provided)

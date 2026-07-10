@@ -44,4 +44,36 @@
 
 **当前测试:deno 189/0(15 门控忽略),vitest 28,tsc 严格,deno check —— 全绿。**
 
+## 2026-07-10(下午)— 上线部署 + 外部拨测/心跳/CONFLICT 整改
+
+**背景**:发现生产双运行时仍跑 6 月初旧版(VPS release 20260605、CF worker 2026-06-04 部署)——两轮整改的代码从未上线;CF worker 承接真实流量(getvela.app 等,D1 30 条 done),且 D1 DLQ 有 2 条 POISON(getvela.app 用户 2026-07-03 实际创建失败,根因 `WalletRefAlreadyExists`:同一把 passkey 曾以 rpId=localhost 注册)。
+
+**处置(全部完成)**:
+- 双运行时部署到 main(worker `wrangler deploy` + VPS 健康闸门部署,迁移 v1-v3 生效);**真实资金 e2e 双端上链 done**(worker `0x05a5…fa0b`、VPS `0x1033…c728`)→ CONDITIONAL GO 的 e2e 前置项关闭。
+- **双 key 隔离确认**:VPS create 钱包 `0xb8f1…06cE` ≠ worker `0xc870…46da`,nonce 冲突不存在 → 第二个前置项关闭。
+- **外部拨测内建**(第三个前置项关闭):CF worker 每分钟 cron 拨测 VPS `/api/health`(shared/watchdog.ts 纯决策 + worker/watchdog.ts 接线 + 迁移 v4 `watchdog_state`),3 连败页呼/30min 重呼/恢复✅/每日摘要。
+- **CONFLICT 用户冲突分类**:API 层 walletRef 双重预检(队列+链上,fail-open)→ 409;引擎 `WalletRefAlreadyExists` → `CONFLICT:` 隔离**不页呼**;`RecordAlreadyExists` revert → 视为已上链标 done。DLQ 处置:getvela 行改标 CONFLICT,diag.example 合成垃圾行删除。
+- **每日心跳**(Deno):余额+runway 估算+队列+DLQ+release,启动首轮即发(兼部署确认);告警通道静默变得可察觉。
+- 测试:引擎 49(+4 CONFLICT 语义)、watchdog 8、heartbeat 4、create 409 5、vitest 30(+2 watchdog 接线)。
+
 ## 剩余 P2(上线后短期整改;上线可带缓解延期)
+
+> 原 P2-1…P2-16 已全部在 2026-07-10 上午的 P2/P3 全量整改中关闭(见上节);外部拨测/真实 e2e/双 key 隔离三个人工前置项已于下午关闭。以下为当前仍真实存在的事项。
+
+| # | 问题 | 缓解/现状 | 验收标准 |
+|---|---|---|---|
+| R-1 | Cloudflare 平台宕机时 watchdog 与 worker 同时失联(拨测盲区) | 每日心跳/摘要缺席可在一天内察觉 | 可选:UptimeRobot 等三方同时拨 VPS 域名 + workers.dev 两个入口 |
+| R-2 | DLQ 无重放端点(仅手工 SQL) | runbook 有 SQL;CONFLICT 类已不需重放 | `scripts/dlq.ts` 列表/重放/删除子命令 |
+| R-3 | VPS queue.db 无定期备份 | 链上是权威源,丢库仅失未上链排队项;D1 有 Time Travel | cron 每小时 `sqlite3 .backup`(runbook 已给命令) |
+| R-4 | `isContractRevert` 裸子串匹配 `includes("revert")` | 触发概率低 | 改走结构化 classifyError |
+| R-5 | publicKey 长度上限 130 拒绝 `0x` 前缀形式(e2e 中实测) | 客户端不带前缀即可;错误信息明确 | 放宽到 132 并在入口归一化去前缀 |
+| R-6 | wrangler v3.114(v4 可用)、compatibility_date 2024-09-23 | 功能正常,仅陈旧 | 升级并回归 vitest |
+| R-7 | CONFLICT 行计入 health `queue.dlq` → 25 条即 degraded | 冲突极少;可见性优先 | 如成噪声,health 统计排除 CONFLICT 行 |
+| R-8 | request_id 未透传到队列/RPC 下层日志 | 顶层日志已可关联大多数问题 | logger 支持 per-request 上下文 |
+| R-9 | `/api/challenge` 装饰性(从不验证) | 开放 API 设计使然 | 文档标注或删除 |
+
+## 优先级建议(2026-07-10 修订)
+
+1. **已全部完成**:~~真实资金 e2e~~、~~双活 key 隔离确认~~、~~外部 liveness 拨测~~ —— CONDITIONAL GO 的三个人工前置项全部关闭,**服务处于 GO 状态**。
+2. **上线后 1-2 周**:R-3(备份 cron,5 分钟工作量)、R-2(DLQ 工具)、R-5(0x 前缀放宽)。
+3. **择机**:R-1(三方拨测)、R-4/6/7/8/9。

@@ -19,6 +19,8 @@ import {
   getCreateWallet,
   getCommitWallet,
   sendTelegram,
+  HEARTBEAT_INTERVAL,
+  buildHeartbeatMessage,
 } from "../shared/queue.ts";
 import { runQueueCycle, type QueueStore, type AlertReason, type ItemFailureInfo } from "../shared/queue-engine.ts";
 import { runMigrations, type SqlRunner } from "../shared/migrations.ts";
@@ -274,8 +276,10 @@ async function checkAlerts(): Promise<void> {
     alerts.push(`⚠️ Queue backlog: ${pending} items pending`);
   }
 
-  // 2. Failed items needing manual intervention (only alert on change)
-  const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed'").get() as unknown as { count: number }).count;
+  // 2. Failed items needing manual intervention (only alert on change).
+  // CONFLICT: rows are user-input conflicts — terminal but NOT dev-actionable,
+  // so they are excluded from this page (still visible in DLQ/status/heartbeat).
+  const failed = (db.prepare("SELECT COUNT(*) as count FROM create_queue WHERE status = 'failed' AND error NOT LIKE 'CONFLICT:%'").get() as unknown as { count: number }).count;
   if (failed > 0 && failed !== lastFailedCount) {
     alerts.push(`🔴 ${failed} items permanently failed, need manual intervention`);
   }
@@ -325,6 +329,14 @@ let terminalSinceLastAlert = 0;
 let lastTerminalError = "";
 
 function onItemFailure(error: string, info: ItemFailureInfo): void {
+  if (info.conflict) {
+    // USER-INPUT conflict (e.g. the same passkey already registered under a
+    // different credential). Terminal + DLQ-visible + surfaced to the client
+    // via the status endpoint, but per the operator's alerting contract a page
+    // means "code bug or funding" — this is neither. Log only.
+    console.warn(`[queue] user-conflict quarantine (no page): job ${info.jobId}: ${error}`);
+    return;
+  }
   if (info.terminal) {
     terminalSinceLastAlert++;
     lastTerminalError = `${info.poison ? "POISON" : "EXHAUSTED"} (job ${info.jobId}): ${error}`;
@@ -380,6 +392,50 @@ async function onCheckAlerts(gasPriceGwei: number | undefined, reason: AlertReas
   }
   void gasPriceGwei; // Deno's checkAlerts measures gas itself
   await checkAlerts();
+  await maybeHeartbeat();
+}
+
+// --- Daily heartbeat ---
+// A silent alert channel is indistinguishable from a broken one; the daily
+// heartbeat makes "no news is good news" verifiable and carries the PROACTIVE
+// funding signal (balance + runway) so top-ups happen before the 🪫 page.
+// First heartbeat fires on the first cycle after boot — which doubles as the
+// "deployed and alerting path works" confirmation.
+const processStartedAt = Date.now();
+let lastHeartbeatAt = 0;
+
+async function maybeHeartbeat(): Promise<void> {
+  const now = Date.now();
+  if (now - lastHeartbeatAt < HEARTBEAT_INTERVAL) return;
+  lastHeartbeatAt = now;
+  try {
+    const { wallet: createWallet, client } = getCreateWallet(cfg());
+    const { wallet: commitWallet } = getCommitWallet(cfg());
+    const [createBal, commitBal, gasPrice] = await Promise.all([
+      client.getBalance({ address: createWallet.account.address }),
+      client.getBalance({ address: commitWallet.account.address }),
+      client.getGasPrice(),
+    ]);
+    const stats = getQueueStats();
+    let release: string | undefined;
+    try { release = Deno.realPathSync(Deno.cwd()).split("/").pop(); } catch { /* optional */ }
+    await sendTelegram(cfg(), buildHeartbeatMessage({
+      runtime: "Deno",
+      queueDepth: stats.queueDepth,
+      dlqCount: stats.dlqCount,
+      createAddress: createWallet.account.address,
+      createBalanceXdai: Number(createBal) / 1e18,
+      commitAddress: commitWallet.account.address,
+      commitBalanceXdai: Number(commitBal) / 1e18,
+      gasPriceGwei: Number(gasPrice) / 1e9,
+      uptimeMs: now - processStartedAt,
+      release,
+    }));
+  } catch (err) {
+    // Never let the heartbeat break a cycle; a failed heartbeat is itself a
+    // signal (the daily message stops arriving).
+    console.warn(`[queue] heartbeat failed:`, shortMsg(err));
+  }
 }
 
 // --- Worker ---

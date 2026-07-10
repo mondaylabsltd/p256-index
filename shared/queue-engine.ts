@@ -37,6 +37,8 @@ import {
   splitByHasRecord,
   batchFailureAction,
   retryDelayMs,
+  isRecordExistsError,
+  isWalletRefConflictError,
 } from "./queue.ts";
 import type { NonceHandle, NonceRole } from "./nonce.ts";
 import { log, redactSecrets } from "./log.ts";
@@ -146,10 +148,17 @@ export type AlertReason = "cycle-end" | "gas-high" | "gas-fail" | "idle";
 
 export interface ItemFailureInfo {
   jobId: string;
-  /** true when the item was quarantined to the DLQ (POISON or EXHAUSTED). */
+  /** true when the item was quarantined to the DLQ (POISON, CONFLICT or EXHAUSTED). */
   terminal: boolean;
   /** true for deterministic POISON quarantines (code/data bug — dev must act). */
   poison: boolean;
+  /**
+   * true for USER-INPUT conflicts (e.g. the same P256 key already registered
+   * under another credential → WalletRefAlreadyExists). Terminal and visible
+   * in the DLQ/status endpoint, but NOT a developer page: there is no code or
+   * funding fix — the resolution is on the client side.
+   */
+  conflict: boolean;
 }
 
 export interface EngineHooks {
@@ -603,7 +612,15 @@ async function isolatePoisonCreate(deps: QueueEngineDeps, now: () => number, ite
     try {
       gasEstimate = await deps.chain.estimateBatchCreate([param]);
     } catch (err) {
-      if (batchFailureAction(err) === "isolate-poison") {
+      if (isRecordExistsError(err)) {
+        // The revert itself proves this exact (rpId, credentialId) is already
+        // on-chain (an endpoint-lag miss in the earlier hasRecord read). The
+        // user's create SUCCEEDED — mark done, never quarantine.
+        await deps.store.markManyDone([item.id], now());
+        log.info("item already on-chain (RecordAlreadyExists revert), marked done", { job_id: item.id, operation: "batchCreateRecord", outcome: "reconciled" });
+      } else if (isWalletRefConflictError(err)) {
+        await handleFailure(deps, now, item, `walletRef already registered under another credential: ${shortMsg(err)}`, "committed", { conflict: true });
+      } else if (batchFailureAction(err) === "isolate-poison") {
         await handleFailure(deps, now, item, `batchCreateRecord poison: ${shortMsg(err)}`, "committed", { poison: true });
       } else {
         await handleFailure(deps, now, item, `batchCreateRecord transient during isolation: ${shortMsg(err)}`, "committed");
@@ -623,7 +640,12 @@ async function isolatePoisonCreate(deps: QueueEngineDeps, now: () => number, ite
       log.info("isolated item created individually", { job_id: item.id, operation: "batchCreateRecord", outcome: "success" });
     } catch (err) {
       handle.release();
-      if (batchFailureAction(err) === "isolate-poison") {
+      if (isRecordExistsError(err)) {
+        await deps.store.markManyDone([item.id], now());
+        log.info("item already on-chain (RecordAlreadyExists revert on send), marked done", { job_id: item.id, operation: "batchCreateRecord", outcome: "reconciled" });
+      } else if (isWalletRefConflictError(err)) {
+        await handleFailure(deps, now, item, `walletRef already registered under another credential: ${shortMsg(err)}`, "committed", { conflict: true });
+      } else if (batchFailureAction(err) === "isolate-poison") {
         await handleFailure(deps, now, item, `batchCreateRecord poison (individual send): ${shortMsg(err)}`, "committed", { poison: true });
       } else {
         await handleFailure(deps, now, item, `batchCreateRecord transient (individual send): ${shortMsg(err)}`, "committed");
@@ -695,6 +717,8 @@ async function isolatePoisonCommit(deps: QueueEngineDeps, now: () => number, ite
  * Record a queue item failure.
  * - poison (deterministic): quarantine immediately to 'failed' (the DLQ) — no
  *   retry, prefixed "POISON:" so operators know it needs a code/data fix.
+ * - conflict (deterministic, user-input): quarantine prefixed "CONFLICT:" —
+ *   terminal and DLQ-visible, but hooks are told it needs NO developer page.
  * - transient: schedule a backed-off retry; after MAX_RETRIES give up with
  *   "EXHAUSTED:". Either way the item never blocks the rest of the queue.
  */
@@ -704,16 +728,17 @@ async function handleFailure(
   item: QueueItem,
   error: string,
   retryStatus: "pending" | "committed" = "pending",
-  opts?: { poison?: boolean },
+  opts?: { poison?: boolean; conflict?: boolean },
 ): Promise<void> {
   const retries = item.retries + 1;
-  const terminal = opts?.poison || retries >= MAX_RETRIES;
+  const terminal = opts?.poison || opts?.conflict || retries >= MAX_RETRIES;
   if (terminal) {
-    const prefix = opts?.poison ? "POISON" : "EXHAUSTED";
+    const prefix = opts?.conflict ? "CONFLICT" : opts?.poison ? "POISON" : "EXHAUSTED";
+    const outcome = opts?.conflict ? "conflict" : opts?.poison ? "poison" : "exhausted";
     await deps.store.applyFailure(item.id, { status: "failed", error: `${prefix}: ${error}`, retries, updatedAt: now() });
     log.error("queue item quarantined to DLQ", {
-      job_id: item.id, operation: "tx", outcome: opts?.poison ? "poison" : "exhausted",
-      error_category: opts?.poison ? "poison" : "transient", retries,
+      job_id: item.id, operation: "tx", outcome,
+      error_category: opts?.conflict ? "conflict" : opts?.poison ? "poison" : "transient", retries,
     });
   } else {
     const delay = retryDelayMs(retries);
@@ -728,6 +753,7 @@ async function handleFailure(
     jobId: item.id,
     terminal,
     poison: opts?.poison ?? false,
+    conflict: opts?.conflict ?? false,
   });
 }
 

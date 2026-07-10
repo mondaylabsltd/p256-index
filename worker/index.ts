@@ -16,6 +16,7 @@ import { configureCache } from "../shared/cache.ts";
 import { buildHealthBody } from "../shared/routes/health.ts";
 import { withCors } from "../shared/cors.ts";
 import { log, newRequestId, setLogLevel } from "../shared/log.ts";
+import { runWatchdog } from "./watchdog.ts";
 import type { Env } from "./types.ts";
 
 export { QueueProcessor } from "./queue-processor.ts";
@@ -148,5 +149,9 @@ export default {
         await doStub.fetch(new Request("https://do/start"));
       } catch { /* ignore */ }
     })());
+    // External-liveness watchdog: probe the VPS runtime's /api/health from CF's
+    // independent infrastructure and page Telegram when it is hard-down — the
+    // one failure class the VPS's own in-process alerting can never report.
+    ctx.waitUntil(runWatchdog(env));
   },
 };

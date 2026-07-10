@@ -257,6 +257,10 @@ function harness(rows: QueueItem[]) {
 // TRANSIENT vs POISON errors, classified by shared/reliability.ts on rpc-write:
 const transientErr = () => new Error("fetch failed");                       // network → transient
 const revertErr = () => new Error("execution reverted: RecordAlreadyExists"); // revert → poison on write
+// Generic deterministic poison for the per-item create path (RecordAlreadyExists
+// there now means "already on-chain → done", and WalletRefAlreadyExists means
+// "user conflict → CONFLICT quarantine" — see the dedicated tests below).
+const poisonCreateErr = () => new Error("execution reverted: InvalidPublicKeyPoint()");
 
 // ── Cycle gating ──────────────────────────────────────────────────────────────
 
@@ -339,7 +343,7 @@ Deno.test("engine: poison batchCommit → per-item isolation: innocent stays pen
   assertEquals(c.status, "failed");
   assert(c.error.startsWith("POISON: batchCommit poison: "), c.error);
   assertEquals(h.failures.length, 1, "only the culprit counted as a failure");
-  assertEquals(h.failures[0].info, { jobId: culprit.id, terminal: true, poison: true }, "POISON quarantine reports terminal+poison — runtimes page immediately");
+  assertEquals(h.failures[0].info, { jobId: culprit.id, terminal: true, poison: true, conflict: false }, "POISON quarantine reports terminal+poison — runtimes page immediately");
 });
 
 Deno.test("engine: transient failure at retries=9 → EXHAUSTED to the DLQ", async () => {
@@ -483,7 +487,7 @@ Deno.test("engine: poison batch create with mixed batch → culprit quarantined,
   h.chain.push("estimateBatchCreate", { ok: 100_000n });        // batch estimate (before send)
   // NOTE: order of estimate calls: batch first, then per-item. Script per-item:
   h.chain.push("estimateBatchCreate", { ok: 100_000n });        // innocent individual estimate
-  h.chain.push("estimateBatchCreate", { err: revertErr() });    // culprit individual estimate
+  h.chain.push("estimateBatchCreate", { err: poisonCreateErr() }); // culprit individual estimate
   await runQueueCycle(h.deps);
   assertEquals(h.store.row(innocent.id).status, "done");
   const c = h.store.row(culprit.id);
@@ -866,4 +870,60 @@ Deno.test("engine: a mined-but-REVERTED batch still clears its ledger row (nonce
   h.chain.push("waitReceipt", { ok: { status: "reverted" } }); // batch reverted → isolation converges it
   await runQueueCycle(h.deps);
   assertEquals(h.store.pendingTxs, [], "reverted = mined = nonce consumed → nothing to unstick");
+});
+
+// ── User-conflict classification (CONFLICT: — terminal, DLQ-visible, NO page) ─
+
+Deno.test("engine: WalletRefAlreadyExists on individual estimate → CONFLICT quarantine, hook says conflict (not poison)", async () => {
+  const item = mkItem({ status: "committed" });
+  const h = harness([item]);
+  // batch estimate reverts deterministically → poison isolation path
+  h.chain.push("estimateBatchCreate", { err: new Error("execution reverted: WalletRefAlreadyExists(bytes32)") });
+  // isolation: hasRecord false → individual estimate reverts with the conflict
+  h.chain.push("hasRecord", { ok: false });
+  h.chain.push("estimateBatchCreate", { err: new Error('The contract function "batchCreateRecord" reverted with the following signature:\n0xc9af4506') });
+  await runQueueCycle(h.deps);
+  const r = h.store.row(item.id);
+  assertEquals(r.status, "failed");
+  assert(r.error.startsWith("CONFLICT: "), r.error);
+  assertEquals(h.failures.length, 1);
+  assertEquals(h.failures[0].info.terminal, true);
+  assertEquals(h.failures[0].info.conflict, true);
+  assertEquals(h.failures[0].info.poison, false);
+});
+
+Deno.test("engine: WalletRefAlreadyExists on individual SEND → CONFLICT quarantine, nonce released", async () => {
+  const item = mkItem({ status: "committed" });
+  const h = harness([item]);
+  h.chain.push("estimateBatchCreate", { err: new Error("execution reverted: InvalidPublicKeyPoint()") }); // batch → isolate
+  h.chain.push("hasRecord", { ok: false });
+  h.chain.push("estimateBatchCreate", { ok: 100_000n }); // individual estimate passes
+  h.chain.push("sendBatchCreate", { err: new Error("execution reverted: WalletRefAlreadyExists(bytes32)") });
+  await runQueueCycle(h.deps);
+  const r = h.store.row(item.id);
+  assertEquals(r.status, "failed");
+  assert(r.error.startsWith("CONFLICT: "), r.error);
+  assertEquals(h.failures[0].info.conflict, true);
+  assertEquals(h.nonces.released.length, h.nonces.acquired.length, "every acquired nonce released (batch estimate + individual send both failed — none consumed)");
+});
+
+Deno.test("engine: RecordAlreadyExists on individual estimate → marked done (the revert proves it is on-chain), no failure hook", async () => {
+  const item = mkItem({ status: "committed" });
+  const h = harness([item]);
+  h.chain.push("estimateBatchCreate", { err: new Error("execution reverted: InvalidPublicKeyPoint()") }); // batch → isolate
+  h.chain.push("hasRecord", { ok: false }); // endpoint lag: probe says missing…
+  h.chain.push("estimateBatchCreate", { err: new Error("execution reverted: RecordAlreadyExists(string,string)") }); // …but the revert proves presence
+  await runQueueCycle(h.deps);
+  assertEquals(h.store.row(item.id).status, "done");
+  assertEquals(h.failures.length, 0, "no failure hook for a create that actually succeeded");
+});
+
+Deno.test("engine: RecordAlreadyExists by raw selector 0x46a08bc5 (undecodable ABI) → done", async () => {
+  const item = mkItem({ status: "committed" });
+  const h = harness([item]);
+  h.chain.push("estimateBatchCreate", { err: new Error("execution reverted: InvalidPublicKeyPoint()") });
+  h.chain.push("hasRecord", { ok: false });
+  h.chain.push("estimateBatchCreate", { err: new Error('reverted with the following signature:\n0x46a08bc5\n\nUnable to decode signature "0x46a08bc5"') });
+  await runQueueCycle(h.deps);
+  assertEquals(h.store.row(item.id).status, "done");
 });

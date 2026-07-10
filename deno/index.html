@@ -153,9 +153,21 @@ is not consumed anywhere server-side.</p>
   &quot;status&quot;: &quot;done&quot;
 }
 </code></pre>
+<p><strong>Response</strong> (409 - walletRef conflict):</p>
+<pre><code class="language-json">{
+  &quot;error&quot;: &quot;this publicKey is already registered under a different credential (walletRef conflict)&quot;,
+  &quot;walletRef&quot;: &quot;0x000...abc&quot;
+}
+</code></pre>
+<p>The walletRef is derived from the publicKey alone (independent of rpId), so the
+same P256 key can only ever be registered once. Registering the same passkey
+under a second credential/site is rejected up-front — the on-chain write would
+deterministically revert (<code>WalletRefAlreadyExists</code>). Resolve by creating a new
+passkey, or look up the existing record with <code>GET /api/query?walletRef=...</code>.</p>
 <p><strong>Error responses</strong>:</p>
 <ul>
 <li><code>400</code> - Missing/invalid parameters (incl. a publicKey that is not a real point on the P-256 curve, or a walletRef that does not match the derived one)</li>
+<li><code>409</code> - The publicKey&#39;s walletRef is already registered (or actively being registered) under a different credential</li>
 <li><code>413</code> - Body larger than 32KB</li>
 <li><code>429</code> - Rate limit exceeded (5 creates per IP per minute)</li>
 <li><code>503</code> - Backpressure (queue too deep) or global create cap reached — retry with backoff (<code>Retry-After</code> provided)</li>

@@ -100,6 +100,23 @@ export const MIGRATIONS: Migration[] = [
       await db.run("CREATE INDEX IF NOT EXISTS idx_queue_walletref ON create_queue(walletRef)");
     },
   },
+  {
+    version: 4,
+    name: "watchdog_state: cross-isolate state for the CF external-liveness watchdog",
+    async apply(db) {
+      // Tiny key/value store for the worker's every-minute VPS health probe
+      // (consecutive failures, page/summary timestamps, down/up state).
+      // Lives in D1 because scheduled() runs in ephemeral isolates. The Deno
+      // runtime shares the schema but never writes here (one schema everywhere
+      // beats runtime-conditional DDL — same rule as rate_limits).
+      await db.run(`
+        CREATE TABLE IF NOT EXISTS watchdog_state (
+          k TEXT PRIMARY KEY,
+          v TEXT NOT NULL
+        )
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

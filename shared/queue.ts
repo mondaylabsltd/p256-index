@@ -162,6 +162,86 @@ export function retryDelayMs(retries: number): number {
   return Math.min(5000 * Math.pow(3, retries - 1), 12 * 60 * 60_000);
 }
 
+// --- User-conflict classification (deterministic reverts that are NOT bugs) ---
+
+// Contract reverts caused by the USER's input conflicting with on-chain state.
+// These are deterministic (poison-class) but need NO developer: the fix is on
+// the client side (the passkey/credential is already registered). Matched both
+// by decoded error name (ABI knows the error) and by raw 4-byte selector (an
+// RPC/ABI that can't decode it — the exact failure shape seen in production).
+const RECORD_EXISTS_SIGNATURES = ["RecordAlreadyExists", "0x46a08bc5"];
+const WALLET_REF_EXISTS_SIGNATURES = ["WalletRefAlreadyExists", "0xc9af4506"];
+
+/**
+ * RecordAlreadyExists: the EXACT (rpId, credentialId) is already on-chain —
+ * the revert itself proves the user's create succeeded. Treat as done.
+ */
+export function isRecordExistsError(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return RECORD_EXISTS_SIGNATURES.some((s) => text.includes(s));
+}
+
+/**
+ * WalletRefAlreadyExists: the same P256 public key is already registered under
+ * a DIFFERENT credential. Deterministic, but a client-side conflict — not a
+ * code bug, not a funding problem. Quarantined as "CONFLICT:" (visible in the
+ * DLQ + status endpoint) WITHOUT paging the developer.
+ */
+export function isWalletRefConflictError(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return WALLET_REF_EXISTS_SIGNATURES.some((s) => text.includes(s));
+}
+
+// --- Daily heartbeat (alert-channel observability) ---
+
+// A silent Telegram channel is indistinguishable from a broken one. A daily
+// heartbeat makes "no news" verifiable: if the daily message stops arriving,
+// something is wrong (process, chain reads, or the Telegram path itself) —
+// discovered within a day instead of at the next incident. It also carries the
+// PROACTIVE funding signal (runway) so top-ups happen before the 🪫 threshold.
+export const HEARTBEAT_INTERVAL = 24 * 60 * 60_000;
+
+// Rough all-in gas per create (commit share + createRecord share). Only used
+// for the runway ESTIMATE in the heartbeat — never for real gas decisions.
+export const EST_GAS_PER_CREATE = 300_000n;
+
+export interface HeartbeatInput {
+  runtime: string;              // "Deno" | "CF Worker"
+  queueDepth: number;
+  dlqCount: number;
+  createAddress: string;
+  createBalanceXdai: number;
+  commitAddress: string;
+  commitBalanceXdai: number;
+  gasPriceGwei: number;
+  uptimeMs: number;
+  release?: string;
+}
+
+/** Estimated number of creates the balance can still pay for at a gas price. */
+export function estimateCreateRunway(balanceXdai: number, gasPriceGwei: number): number {
+  if (gasPriceGwei <= 0) return Infinity;
+  // Multiply before dividing: balance(gwei) / per-create(gwei) keeps clean
+  // ratios exact (0.3 xDAI @ 1 gwei → 1000, not 999 via float 3e-4).
+  return Math.floor((balanceXdai * 1e9) / (Number(EST_GAS_PER_CREATE) * gasPriceGwei));
+}
+
+export function buildHeartbeatMessage(h: HeartbeatInput): string {
+  const runway = estimateCreateRunway(h.createBalanceXdai, h.gasPriceGwei);
+  const runwayText = runway === Infinity ? "∞" : `~${runway}`;
+  const upHours = Math.floor(h.uptimeMs / 3_600_000);
+  const upText = upHours >= 48 ? `${Math.floor(upHours / 24)}d` : `${upHours}h`;
+  const attention = h.dlqCount > 0 ? `⚠️ DLQ has ${h.dlqCount} item(s) — inspect when convenient\n` : "";
+  return (
+    `💓 [webauthnp256-publickey-index] [${h.runtime}] [Gnosis] daily heartbeat\n` +
+    attention +
+    `queue: ${h.queueDepth} active, ${h.dlqCount} DLQ\n` +
+    `create wallet ${h.createAddress}: ${h.createBalanceXdai.toFixed(6)} xDAI (${runwayText} creates @ ${h.gasPriceGwei.toFixed(3)} gwei)\n` +
+    `commit wallet ${h.commitAddress}: ${h.commitBalanceXdai.toFixed(6)} xDAI\n` +
+    `up ${upText}${h.release ? `, release ${h.release}` : ""}`
+  );
+}
+
 // --- Pure helpers ---
 
 // IP hashes are stored for rate-limiting. SHA-256(ip) truncated to 64 bits is

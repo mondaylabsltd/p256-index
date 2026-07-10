@@ -22,7 +22,7 @@
 | `queue.dlq > 0` | — | 有 POISON/EXHAUSTED 项,需人工分诊(见 DLQ) |
 | queue stats 读取失败 | — | 返回 degraded + `queue:{error}`:数据库有问题 |
 
-**当前没有指标系统(Prometheus 等)**。最小监控建议:外部拨测 /api/health 每分钟,`status!="ok"` 连续 3 次告警;Telegram 告警作为兜底通道。
+**当前没有指标系统(Prometheus 等)**。外部拨测已内建(2026-07-10):**CF Worker 的每分钟 cron 从 Cloudflare 独立基础设施拨测 VPS 的 `/api/health`**(`worker/watchdog.ts`,决策逻辑 `shared/watchdog.ts`),连续 3 次失败 → Telegram 页呼,持续宕机每 30 分钟重呼,恢复时发 ✅;每日一条 watchdog 摘要(VPS 状态 + worker 队列 + `telegramConfigured` 哨兵)。拨测目标可用 `WATCHDOG_TARGET_URL` 变量覆盖。状态存 D1 `watchdog_state`(迁移 v4),D1 故障时退化为 isolate 内存节流。
 
 ## Telegram 告警覆盖矩阵(2026-07 整改后)
 
@@ -42,7 +42,12 @@
 | 🛑 队列 cycle 卡死 >3min | worker 停摆 | 专用告警 | 3min |
 | 🛑 systemd 单元 FAILED(进程死/重启限流) | 服务下线 | **OnFailure 单元直连 curl**(进程外!) | — |
 | 每累计 10 次非终态 tx 失败 | 抖动异常多 | 批量告警 | 按次数 |
-| Telegram 自身投递失败 | 告警通道坏 | `log.warn`(journald 可见) | — |
+| Telegram 自身投递失败 | 告警通道坏 | `log.warn`(journald 可见)+ 每日心跳缺席可察觉 | — |
+| 🔴 VPS `/api/health` 连续 3 次拨测失败 | **主机/进程/网络级宕机**(进程内告警发不出的类别) | **CF watchdog**(进程外!) | 30min 重呼 + 恢复✅ |
+| 💓 每日心跳(Deno) | 余额+runway+队列+DLQ+release;**心跳停发 = 有问题** | 每日一条(启动后首轮即发,兼作部署确认) | 24h |
+| 💓 每日 watchdog 摘要(CF) | watchdog/worker 存活证明 + VPS 状态 + `telegramConfigured` 哨兵 | 每日一条 | 24h |
+
+**CONFLICT 例外(2026-07-10 起)**:`WalletRefAlreadyExists`(同一把 passkey 公钥已在别的凭据下注册,如 2026-07-03 getvela.app 实际故障——该 key 曾以 rpId=localhost 注册)是**用户输入冲突,不是代码 bug 也不是没钱**——终态进 DLQ、状态端点可见(`CONFLICT:` 前缀),但**不页呼开发者**,也不计入"永久失败需人工干预"计数。API 层同时有前置拦截:双运行时 create 路由对 walletRef 做队列+链上双重预检,冲突直接 409(fail-open,引擎隔离兜底)。`RecordAlreadyExists` revert 则直接视为"已上链"标 done(revert 本身就是存在证明)。
 
 CF 侧:同矩阵(OnFailure 除外——平台自管进程;DO alarm 停摆由每分钟 cron 重新武装兜底)。
 
@@ -100,7 +105,8 @@ Deno 侧 systemd `MemoryMax=256M`,进程内缓存上限 100MB(近似 LRU)。OOM 
 
 ## 剩余人工项(代码侧无法替代)
 
-- **外部拨测**:所有进程内告警在进程死后依赖 OnFailure 单元;再加一层独立拨测 `/api/health`(如 UptimeRobot/cron 异机)才是完整闭环。`status:"degraded"` 带 `reasons[]`(queue-depth/dlq/oldest-job/stats-unavailable)可路由。
+- ~~**外部拨测**~~ **已闭环(2026-07-10)**:CF Worker cron 每分钟从独立基础设施拨测 VPS(见"健康与监控")。残余盲区:Cloudflare 平台自身宕机时 watchdog 与 worker 同时失联——由每日心跳/摘要缺席兜底(一天内可察觉);如需分钟级三方独立层,可另加 UptimeRobot 同时拨 VPS 域名与 `webauthnp256-publickey-index.atshelchin.workers.dev/api/health`。
+- **双运行时口径(2026-07-10 确认)**:VPS(域名入口)与 CF Worker(workers.dev 入口,getvela.app 等接入方在用)**各持独立 PRIVATE_KEY**(create 钱包分别为 `0xb8f1…06cE` / `0xc870…46da`),不存在 nonce 冲突;两边钱包都要保有余额(心跳/🪫 告警分别覆盖)。
 
 ## 密钥轮换流程
 

@@ -294,3 +294,76 @@ describe("QueueProcessor Alchemy wiring", () => {
     expect(getWriteRpc()).toMatch(/^https:\/\/(rpc\.gnosischain\.com|gnosis-rpc\.publicnode\.com|gnosis\.drpc\.org)/);
   });
 });
+
+// --- External-liveness watchdog (worker/watchdog.ts wiring) ---
+// Decision logic is pinned in deno/tests/watchdog.test.ts; this covers the CF
+// wiring end-to-end: probe → decide → Telegram → state persisted in D1.
+import { fetchMock } from "cloudflare:test";
+import { runWatchdog } from "../watchdog.ts";
+
+describe("watchdog wiring", () => {
+  const TARGET_ORIGIN = "https://vps.watchdog-test.example";
+  const wdEnv: Env = {
+    ...env,
+    TELEGRAM_BOT_TOKEN: "TESTTOKEN",
+    TELEGRAM_CHAT_ID: "42",
+    WATCHDOG_TARGET_URL: `${TARGET_ORIGIN}/api/health`,
+  };
+
+  it("full sequence: summary on first tick, page after 3 fails, recovery — exactly 3 telegram messages", async () => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    const tg = fetchMock.get("https://api.telegram.org");
+    const vps = fetchMock.get(TARGET_ORIGIN);
+
+    // Tick 1: healthy probe; first tick → daily summary (lastSummaryAt=0).
+    vps.intercept({ method: "GET", path: "/api/health" })
+      .reply(200, JSON.stringify({ status: "ok", telegramConfigured: true }), { headers: { "content-type": "application/json" } });
+    tg.intercept({ method: "POST", path: "/botTESTTOKEN/sendMessage" }).reply(200, JSON.stringify({ ok: true }));
+    await runWatchdog(wdEnv);
+
+    let row = await wdEnv.DB.prepare("SELECT v FROM watchdog_state WHERE k = 'state'").first<{ v: string }>();
+    expect(row).toBeTruthy();
+    let state = JSON.parse(row!.v);
+    expect(state.consecutiveFails).toBe(0);
+    expect(state.paged).toBe(false);
+    expect(state.lastSummaryAt).toBeGreaterThan(0);
+
+    // Ticks 2-4: probe fails 3× → exactly ONE down page (on the 3rd).
+    for (let i = 0; i < 3; i++) {
+      vps.intercept({ method: "GET", path: "/api/health" }).reply(503, "unavailable");
+    }
+    tg.intercept({ method: "POST", path: "/botTESTTOKEN/sendMessage" }).reply(200, JSON.stringify({ ok: true }));
+    await runWatchdog(wdEnv);
+    await runWatchdog(wdEnv);
+    await runWatchdog(wdEnv);
+
+    row = await wdEnv.DB.prepare("SELECT v FROM watchdog_state WHERE k = 'state'").first<{ v: string }>();
+    state = JSON.parse(row!.v);
+    expect(state.consecutiveFails).toBe(3);
+    expect(state.paged).toBe(true);
+
+    // Tick 5: probe healthy again → recovery message.
+    vps.intercept({ method: "GET", path: "/api/health" })
+      .reply(200, JSON.stringify({ status: "ok", telegramConfigured: true }), { headers: { "content-type": "application/json" } });
+    tg.intercept({ method: "POST", path: "/botTESTTOKEN/sendMessage" }).reply(200, JSON.stringify({ ok: true }));
+    await runWatchdog(wdEnv);
+
+    row = await wdEnv.DB.prepare("SELECT v FROM watchdog_state WHERE k = 'state'").first<{ v: string }>();
+    state = JSON.parse(row!.v);
+    expect(state.paged).toBe(false);
+    expect(state.consecutiveFails).toBe(0);
+
+    // Every scripted intercept consumed = exactly 5 probes + 3 telegram sends.
+    fetchMock.assertNoPendingInterceptors();
+    fetchMock.deactivate();
+  });
+
+  it("watchdog never throws — even with an unreachable probe target and no telegram config", async () => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect(); // no intercepts at all → fetch rejects
+    const bare: Env = { ...env, WATCHDOG_TARGET_URL: `${TARGET_ORIGIN}/api/health` };
+    await expect(runWatchdog(bare)).resolves.toBeUndefined();
+    fetchMock.deactivate();
+  });
+});

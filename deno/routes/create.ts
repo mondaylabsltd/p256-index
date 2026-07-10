@@ -1,5 +1,5 @@
-import { getPublicKey } from "../../shared/contract-read.ts";
-import { enqueue, findDuplicate, getQueueItem, checkRateLimit, getActiveQueueDepth, globalWriteLimitExceeded } from "../queue.ts";
+import { getPublicKey, getPublicKeyByWalletRef } from "../../shared/contract-read.ts";
+import { enqueue, findDuplicate, findDuplicateByWalletRef, getQueueItem, checkRateLimit, getActiveQueueDepth, globalWriteLimitExceeded } from "../queue.ts";
 import { encodeAbiParameters } from "viem";
 import { buildWalletRef } from "../../shared/wallet-ref.ts";
 import { cacheGet, cacheSet, cacheKey as cacheKey_, NOT_FOUND } from "../../shared/cache.ts";
@@ -125,6 +125,50 @@ export async function handleCreate(req: Request, requestId?: string): Promise<Re
   const queued = findDuplicate(rpId, credentialId);
   if (queued && queued.status !== "failed") {
     return Response.json({ id: queued.id, status: queued.status }, { status: 202 });
+  }
+
+  // walletRef conflict precheck: the SAME P256 key registered under a DIFFERENT
+  // credential deterministically reverts on-chain (WalletRefAlreadyExists) —
+  // after burning commit gas and quarantining to the DLQ. Reject it up-front
+  // with an actionable 409 instead. Two layers, both fail-open (a check hiccup
+  // must never block a legitimate create — the engine's CONFLICT quarantine is
+  // the backstop):
+  // 1. an ACTIVE queue item already claims this walletRef;
+  try {
+    const refQueued = findDuplicateByWalletRef(walletRef);
+    if (refQueued && refQueued.status !== "failed" && !(refQueued.rpId === rpId && refQueued.credentialId === credentialId)) {
+      return Response.json(
+        { error: "this publicKey is already being registered under a different credential (walletRef conflict)", walletRef },
+        { status: 409 },
+      );
+    }
+  } catch { /* fail-open */ }
+  // 2. the walletRef is already on-chain (cache-first; shared with query-by-walletRef).
+  try {
+    const refCacheKey = cacheKey_("query", "walletRef", walletRef);
+    const refCached = cacheGet<{ rpId?: string; credentialId?: string }>(refCacheKey);
+    let refHolder = refCached && refCached !== NOT_FOUND ? refCached : null;
+    if (!refHolder && refCached !== NOT_FOUND) {
+      refHolder = await getPublicKeyByWalletRef(walletRef);
+      if (refHolder) cacheSet(refCacheKey, refHolder);
+    }
+    if (refHolder) {
+      if (refHolder.rpId === rpId && refHolder.credentialId === credentialId) {
+        // Same record — it IS on-chain (the earlier getRecord precheck was
+        // skipped or lagging). Idempotent success, like the fast path above.
+        cacheSet(cacheKey, refHolder);
+        return Response.json({ ...refHolder, status: "done" }, { status: 201 });
+      }
+      return Response.json(
+        { error: "this publicKey is already registered under a different credential (walletRef conflict)", walletRef },
+        { status: 409 },
+      );
+    }
+  } catch (err) {
+    if (!isDependencyError(err)) throw err;
+    log.warn("walletRef conflict precheck skipped: chain unreachable", {
+      request_id: requestId, dependency: "rpc", operation: "getRecordByWalletRef", rpId, error_category: err.classified.category,
+    });
   }
 
   // Backpressure + global write cap: shed genuinely-new work when the active
