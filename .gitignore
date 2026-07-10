@@ -54,3 +54,4 @@ wrangler.json
 contracts/out
 contracts/cache
 contracts/broadcast
+wrangler.json.bak
