@@ -49,3 +49,8 @@ src/index.html
 .wrangler
 .dev.vars
 wrangler.json
+
+# Foundry build artifacts (contracts/)
+contracts/out
+contracts/cache
+contracts/broadcast

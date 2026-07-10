@@ -2,7 +2,7 @@
 
 WebAuthn P256 公钥索引服务。数据存储在 Gnosis 链上的智能合约 (V2) 中，本服务作为读写代理，提供 REST API。
 
-合约源码: [webauthnp256-publickey-index-contracts](https://github.com/atshelchin/webauthnp256-publickey-index-contracts)
+合约源码:[`contracts/`](contracts/)(Foundry,已并入本 monorepo)
 
 | 合约 | 地址 (Gnosis Chain) |
 |------|---------------------|
