@@ -2,7 +2,7 @@
 
 A public key index service for WebAuthn P256 credentials. Data is stored on-chain via a smart contract (V2) on Gnosis Chain. This service acts as a read/write proxy, providing a REST API.
 
-Contract source: [webauthnp256-publickey-index-contracts](https://github.com/atshelchin/webauthnp256-publickey-index-contracts)
+Contract source: [`contracts/`](contracts/) (Foundry; merged into this monorepo)
 
 | Contract | Address (Gnosis Chain) |
 |----------|----------------------|
