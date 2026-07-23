@@ -1,6 +1,0 @@
-# Cloudflare Worker local dev secrets
-# Copy to .dev.vars and fill in values
-PRIVATE_KEY=0x...
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-ALCHEMY_API_KEY=

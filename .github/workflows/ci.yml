@@ -1,22 +1,3 @@
-# Minimal CI gate — mirrors the local checks documented in
-# docs/project-takeover/02-local-development.md.
-#
-# Deployment coupling: NONE. Merging to main deploys nothing — both deploy
-# paths are manual (docs/project-takeover/05-deployment-runbook.md):
-#   - Deno self-host: `deno task deploy` (SSH + systemd symlink switch)
-#   - CF Worker:      `npm run deploy` (wrangler)
-# CI green ≠ deployed; these two jobs are only the merge gate — branch
-# protection should require BOTH green before merge.
-#
-# Deliberately NOT included:
-#   - On-chain E2E (deno/tests/e2e.test.ts, stress.test.ts): sends real txs and
-#     spends xDAI gas. PRIVATE_KEY-gated (`ignore:`), so `deno task test`
-#     auto-skips them here; run locally per the docs 05 pre-deploy checklist.
-#   - `deno lint`: 3 known require-await hits in test files would fail the
-#     gate (docs 02). Enable once cleaned up.
-# Flakiness caveat: a few Deno tests read live Gnosis RPC (docs 08 P2-11), so
-# a red `deno` job can be upstream RPC trouble rather than our code — re-run
-# once before digging.
 name: CI
 
 on:
@@ -25,40 +6,38 @@ on:
   pull_request:
     branches: [main]
 
-jobs:
-  deno:
-    name: Deno (type-check + test)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: denoland/setup-deno@v2
-        with:
-          # Pinned to the minor verified in docs 02 (2.7.5); the old floating
-          # v2.x is the version-pinning gap flagged in docs 08. Bump deliberately.
-          deno-version: v2.7.5
-      - name: Type check
-        # All three Deno-side entrypoints (docs 02); worker/ needs CF ambient
-        # types and is covered by the worker job instead. --frozen rejects a
-        # stale deno.lock, matching the production systemd start flag.
-        run: deno check --frozen deno/index.ts build.ts scripts/deploy.ts
-      - name: Tests
-        run: deno task test
+permissions:
+  contents: read
 
-  worker:
-    name: CF Worker (test)
-    runs-on: ubuntu-latest
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: p256-index-server
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 20
-          cache: npm
-      # The CF Worker moves real funds via the QueueProcessor Durable Object but
-      # `deno check` can't resolve CF ambient types, so vitest (miniflare + D1)
-      # exercises the worker + queue path — a shared/*.ts change can't silently
-      # break the CF runtime.
-      - run: npm ci
-      # Full strict type-check with CF ambient types (esbuild in vitest does
-      # NOT type-check) — closes docs 08 P2-15.
-      - run: npm run typecheck
-      - run: npm test
+          components: rustfmt, clippy
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            p256-index-server/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('p256-index-server/Cargo.lock') }}
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked

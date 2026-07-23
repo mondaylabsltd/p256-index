@@ -1,10 +1,5 @@
-# dependencies (bun install)
-node_modules
-
-# output
-out
-dist
-*.tgz
+# Rust build output
+p256-index-server/target
 
 # code coverage
 coverage
@@ -33,25 +28,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-# database
-*.db
-*.db-shm
-*.db-wal
-
 # backups
 backups/
-
-# build generated
-src/index.html
-.VSCodeCounter
-
-# Cloudflare Workers
-.wrangler
-.dev.vars
-wrangler.json
 
 # Foundry build artifacts (contracts/)
 contracts/out
 contracts/cache
 contracts/broadcast
-wrangler.json.bak
