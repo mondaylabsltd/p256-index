@@ -1,12 +1,16 @@
-//! Reliability primitives ported from the retired Deno/CF-Worker service so the Rust rewrite is a
-//! true operational replacement for an unattended, fund-spending queue:
+//! The ops sentinel: reliability policy for an unattended, fund-spending
+//! queue. Everything here is pure and deterministically unit-tested; the
+//! side-effecting wiring (Telegram delivery, chain reads, the periodic
+//! loops) lives in the server's `telegram`, `maintenance` and `worker`.
 //!
-//! - exponential backoff schedule for transient chain failures ([`backoff_delay`]),
-//! - the daily heartbeat message + funding runway estimate ([`build_heartbeat_message`]).
-//!
-//! Everything here is pure and deterministically unit-tested; the side-effecting wiring (Telegram
-//! delivery, chain reads, the periodic loops) lives in [`crate::telegram`], [`crate::worker`], and
-//! `main.rs`.
+//! Owns:
+//! - the exponential backoff schedule for transient chain failures
+//!   ([`backoff_delay`], the legacy `5000 * 3^(retries-1)` curve);
+//! - service health assessment ([`health_reasons`] over [`QueueHealth`], the
+//!   thresholds previously inlined in the HTTP health handler);
+//! - operator-alert policy: thresholds, the 6h per-kind throttle window
+//!   ([`alert_due`]) and the exact message texts;
+//! - the daily heartbeat message and funding-runway estimate.
 
 use std::time::Duration;
 
@@ -25,6 +29,72 @@ pub fn backoff_delay(retries: u32) -> Duration {
         .as_secs()
         .saturating_mul(3u64.saturating_pow(exponent));
     Duration::from_secs(scaled.min(BACKOFF_MAX.as_secs()))
+}
+
+// ── Service health ─────────────────────────────────────────────────────────
+
+/// Queue projections the health verdict is judged on.
+#[derive(Clone, Copy, Debug)]
+pub struct QueueHealth {
+    pub depth: u64,
+    pub dlq_count: u64,
+    pub oldest_active_age_ms: u64,
+}
+
+/// Health thresholds, previously inlined in the HTTP handler.
+pub const HEALTH_QUEUE_DEPTH: u64 = 2_000;
+pub const HEALTH_DLQ_COUNT: u64 = 25;
+pub const HEALTH_OLDEST_JOB_MS: u64 = 30 * 60_000;
+
+/// Degradation reasons in report order; empty means healthy.
+pub fn health_reasons(queue: &QueueHealth) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if queue.depth >= HEALTH_QUEUE_DEPTH {
+        reasons.push("queue-depth");
+    }
+    if queue.dlq_count >= HEALTH_DLQ_COUNT {
+        reasons.push("dlq");
+    }
+    if queue.oldest_active_age_ms >= HEALTH_OLDEST_JOB_MS {
+        reasons.push("oldest-job");
+    }
+    reasons
+}
+
+// ── Operator alerts ────────────────────────────────────────────────────────
+
+/// Minimum spacing between repeats of the same alert kind.
+pub const ALERT_THROTTLE: Duration = Duration::from_secs(6 * 60 * 60);
+/// Alert when the estimated create runway drops below this many creates.
+pub const LOW_RUNWAY_CREATES: f64 = 200.0;
+/// Alert when the DLQ reaches this depth.
+pub const DLQ_ALERT_THRESHOLD: u64 = 10;
+
+/// Whether an alert may fire again, given when this kind last fired.
+pub fn alert_due(last_fired_ms: Option<u64>, now_ms: u64) -> bool {
+    match last_fired_ms {
+        Some(at) => now_ms.saturating_sub(at) >= ALERT_THROTTLE.as_millis() as u64,
+        None => true,
+    }
+}
+
+pub fn rpc_circuit_alert() -> &'static str {
+    "⚠️ [webauthnp256-publickey-index] all chain RPC read endpoints are in cooldown \
+     (circuit open) — queries may be served stale."
+}
+
+pub fn dlq_alert(dlq_count: u64) -> String {
+    format!(
+        "⚠️ [webauthnp256-publickey-index] DLQ has {dlq_count} quarantined create(s) — inspect."
+    )
+}
+
+pub fn low_runway_alert(runway: f64, balance_xdai: f64, gas_price_gwei: f64) -> String {
+    format!(
+        "🪫 [webauthnp256-publickey-index] create wallet funding low: ~{} creates left \
+         ({balance_xdai:.6} xDAI @ {gas_price_gwei:.3} gwei). Top up soon.",
+        runway as i64,
+    )
 }
 
 // ── Daily heartbeat ────────────────────────────────────────────────────────
@@ -98,6 +168,16 @@ pub fn build_heartbeat_message(input: &HeartbeatInput) -> String {
     )
 }
 
+/// wei → xDAI for display and runway math.
+pub fn wei_to_xdai(wei: u128) -> f64 {
+    wei as f64 / 1e18
+}
+
+/// wei → gwei for display and runway math.
+pub fn wei_to_gwei(wei: u128) -> f64 {
+    wei as f64 / 1e9
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +246,47 @@ mod tests {
         assert!(message.contains("⚠️ DLQ has 3 item(s)"));
         assert!(message.contains("up 3d"));
         assert!(!message.contains("release"), "release omitted when unknown");
+    }
+
+    #[test]
+    fn health_reasons_fire_at_their_inclusive_thresholds() {
+        let healthy = QueueHealth {
+            depth: HEALTH_QUEUE_DEPTH - 1,
+            dlq_count: HEALTH_DLQ_COUNT - 1,
+            oldest_active_age_ms: HEALTH_OLDEST_JOB_MS - 1,
+        };
+        assert!(health_reasons(&healthy).is_empty());
+
+        let degraded = QueueHealth {
+            depth: HEALTH_QUEUE_DEPTH,
+            dlq_count: HEALTH_DLQ_COUNT,
+            oldest_active_age_ms: HEALTH_OLDEST_JOB_MS,
+        };
+        assert_eq!(
+            health_reasons(&degraded),
+            vec!["queue-depth", "dlq", "oldest-job"]
+        );
+    }
+
+    #[test]
+    fn alert_throttle_is_a_six_hour_window() {
+        let six_hours_ms = 6 * 60 * 60 * 1_000;
+        assert!(alert_due(None, 0));
+        assert!(!alert_due(Some(0), six_hours_ms - 1));
+        assert!(alert_due(Some(0), six_hours_ms));
+    }
+
+    #[test]
+    fn alert_messages_are_pinned_literally() {
+        assert_eq!(
+            dlq_alert(7),
+            "⚠️ [webauthnp256-publickey-index] DLQ has 7 quarantined create(s) — inspect."
+        );
+        assert_eq!(
+            low_runway_alert(123.9, 0.0123456, 1.5),
+            "🪫 [webauthnp256-publickey-index] create wallet funding low: ~123 creates left \
+             (0.012346 xDAI @ 1.500 gwei). Top up soon."
+        );
+        assert!(rpc_circuit_alert().contains("circuit open"));
     }
 }

@@ -10,6 +10,11 @@ for the Gnosis-chain V2 contract.
 
 ## Architecture
 
+- The Cargo workspace has two crates: `p256-registrar` owns the business
+  vocabulary and decision rules (task lifecycle, admission types, on-chain
+  protocol encoding, chain-error classification, Safe wallet derivation) and
+  is deliberately I/O-free; `p256-index-server` is the shell that wires those
+  rules to Axum, Redis, Iggy, Gnosis RPC and Telegram.
 - Rust/Axum provides the public API on port 11256 by default.
 - Redis holds the shared response cache, rate limits, task status, duplicate
   indexes, queue-depth projection, and DLQ projection.
@@ -60,11 +65,11 @@ P256_INDEX_IGGY_PROVISIONER_URL.
 ## Run and verify
 
 ~~~sh
-cd p256-index-server
+# From the repository root, so the p256-registrar crate is checked too.
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-cargo run --release
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo run --release -p p256-index-server
 ~~~
 
 The Rust binary loads a local .env for development and uses regular process

@@ -6,7 +6,7 @@ use iggy::prelude::{
     MaxTopicSize, MessageClient, Partitioning, StreamClient, TopicClient,
 };
 
-use crate::types::CreateTask;
+use p256_registrar::task::CreateTask;
 
 pub const STREAM_NAME: &str = "p256-index";
 pub const TOPIC_NAME: &str = "create";

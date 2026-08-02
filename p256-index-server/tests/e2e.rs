@@ -38,11 +38,14 @@ use tower::ServiceExt;
 use p256_index_server::{
     chain::{ChainError, ReadChain},
     config::Config,
-    contract::build_wallet_ref,
     http::{AppState, router},
     queue::{CreateQueue, CreateTaskQueue, STREAM_NAME, TOPIC_NAME},
     store::{RedisStore, derive_ip_salt, hash_ip},
-    types::{CreateTask, Page, Record, SiteItem, TaskStatus},
+};
+use p256_registrar::{
+    lookup::{Page, Record, SiteItem},
+    task::{CreateTask, TaskStatus},
+    wallet::build_wallet_ref,
 };
 
 // ── Infrastructure gating ──────────────────────────────────────────────────

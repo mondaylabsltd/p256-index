@@ -11,8 +11,11 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Build context is the repository root (see docker-compose.yaml): the server
+# is a workspace member and needs the sibling p256-registrar crate.
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY p256-registrar ./p256-registrar
+COPY p256-index-server ./p256-index-server
 
 RUN cargo build --release --locked --bin p256-index-server
 

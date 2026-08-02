@@ -9,6 +9,10 @@
 
 ## 架构
 
+- Cargo workspace 含两个 crate：`p256-registrar` 拥有业务词汇与决策规则
+  （任务生命周期、准入类型、链上协议编解码、链错误分类、Safe 钱包推导），
+  刻意不含任何 I/O；`p256-index-server` 是 Shell，把这些规则接到
+  Axum、Redis、Iggy、Gnosis RPC 与 Telegram。
 - Rust/Axum 提供公开 API，默认端口 11256。
 - Redis 保存共享响应缓存、限流、任务状态、去重索引、队列深度投影与 DLQ 投影。
 - Iggy 提供持久化的 p256-index / create 流；共享消费组提供有序、至少一次处理。
@@ -51,11 +55,11 @@ PRIVATE_KEY 仅在只读运行时可省略。缺失时 HTTP API 仍启动，但 
 ## 本地检查
 
 ~~~sh
-cd p256-index-server
+# 在仓库根执行,p256-registrar crate 才会一并被检查。
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-cargo run --release
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo run --release -p p256-index-server
 ~~~
 
 Rust 二进制在开发时加载本地 .env，在 systemd/容器部署中使用常规进程环境变量。

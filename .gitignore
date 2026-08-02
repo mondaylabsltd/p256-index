@@ -1,5 +1,5 @@
-# Rust build output
-p256-index-server/target
+# Rust build output (workspace target lives at the repository root)
+/target
 
 # code coverage
 coverage

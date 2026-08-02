@@ -1,10 +1,6 @@
 use std::{
-    collections::HashMap,
     str::FromStr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -21,17 +17,26 @@ use k256::SecretKey;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use crate::{
-    config::Config,
-    contract::{
-        batch_commit_calldata, batch_create_calldata, decode_commit_block, decode_has_record,
+use p256_registrar::{
+    lookup::{Page, Record, SiteItem},
+    protocol::{
+        BATCH_HELPER_ADDRESS, CHAIN_ID, CONTRACT_ADDRESS, batch_commit_calldata,
+        batch_create_calldata, build_commitment, decode_commit_block, decode_has_record,
         decode_keys, decode_record, decode_record_by_wallet_ref, decode_sites, decode_total,
         index_get_commit_block_calldata, index_get_record_by_wallet_ref_calldata,
         index_get_record_calldata, index_has_record_calldata, index_keys_calldata,
-        index_sites_calldata, index_total_calldata,
+        index_sites_calldata, index_total_calldata, is_revert,
     },
-    types::{BATCH_HELPER_ADDRESS, CHAIN_ID, CONTRACT_ADDRESS, CreateTask, Page, Record, SiteItem},
+    roster::{Lane, Roster},
+    task::CreateTask,
 };
+
+// Chain's error vocabulary and its classification rules live in the registrar
+// (`p256_registrar::protocol`); re-export the error type so `chain::ChainError`
+// stays a valid path for the rest of the shell.
+pub use p256_registrar::protocol::ChainError;
+
+use crate::config::Config;
 
 const FALLBACK_RPCS: &[&str] = &[
     "https://rpc.gnosischain.com",
@@ -44,7 +49,6 @@ const WRITE_RPCS: &[&str] = &[
     "https://gnosis-rpc.publicnode.com",
     "https://gnosis.drpc.org",
 ];
-const RPC_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Chain {
@@ -55,38 +59,14 @@ pub struct Chain {
     commit_key: Option<SecretKey>,
 }
 
+/// Transport wrapper around the registrar's [`Roster`]: selection, cooldown
+/// and the circuit verdict are decisions and live there; HTTP, error
+/// translation and the retry loop stay here.
 #[derive(Clone)]
 struct RpcPool {
     http: Client,
-    reads: Arc<Vec<String>>,
-    writes: Arc<Vec<String>>,
-    read_index: Arc<AtomicUsize>,
-    write_index: Arc<AtomicUsize>,
-    failed: Arc<Mutex<HashMap<String, Instant>>>,
+    roster: Arc<Mutex<Roster>>,
 }
-
-#[derive(Debug)]
-pub enum ChainError {
-    Unavailable,
-    Reverted(String),
-    InvalidResponse,
-    MissingSigner,
-    Rejected(String),
-}
-
-impl std::fmt::Display for ChainError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unavailable => formatter.write_str("chain RPC temporarily unavailable"),
-            Self::Reverted(_) => formatter.write_str("EVM execution reverted"),
-            Self::InvalidResponse => formatter.write_str("chain RPC returned an invalid response"),
-            Self::MissingSigner => formatter.write_str("PRIVATE_KEY is required for chain writes"),
-            Self::Rejected(_) => formatter.write_str("chain RPC rejected the request"),
-        }
-    }
-}
-
-impl std::error::Error for ChainError {}
 
 #[derive(Clone, Copy)]
 pub enum WalletRole {
@@ -342,7 +322,7 @@ impl Chain {
     pub async fn commit(&self, tasks: &[CreateTask], nonce: u64) -> Result<String, ChainError> {
         let commitments = tasks
             .iter()
-            .map(crate::contract::build_commitment)
+            .map(build_commitment)
             .collect::<Result<Vec<_>>>()
             .map_err(|_| ChainError::Rejected("could not encode a commit".into()))?;
         let data = batch_commit_calldata(self.index_address, commitments);
@@ -570,32 +550,32 @@ impl RpcPool {
             .build()?;
         Ok(Self {
             http,
-            reads: Arc::new(reads),
-            writes: Arc::new(writes),
-            read_index: Arc::new(AtomicUsize::new(0)),
-            write_index: Arc::new(AtomicUsize::new(0)),
-            failed: Arc::new(Mutex::new(HashMap::new())),
+            roster: Arc::new(Mutex::new(Roster::new(reads, writes))),
         })
     }
 
     fn read_available(&self) -> bool {
-        self.reads.iter().any(|url| self.available(url))
+        self.roster().circuit_state(monotonic_ms()) == "closed"
     }
 
     fn select_write(&self) -> Option<String> {
-        self.select(&self.writes, &self.write_index)
+        self.roster().select(Lane::Write, monotonic_ms())
+    }
+
+    fn roster(&self) -> std::sync::MutexGuard<'_, Roster> {
+        self.roster.lock().expect("rpc roster lock")
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, ChainError> {
-        let attempts = self.reads.len().min(3);
+        let attempts = self.roster().read_attempts();
         for _ in 0..attempts {
-            let Some(url) = self.select(&self.reads, &self.read_index) else {
+            let Some(url) = self.roster().select(Lane::Read, monotonic_ms()) else {
                 break;
             };
             match self.call_on(&url, method, params.clone()).await {
                 Ok(value) => return Ok(value),
                 Err(ChainError::Reverted(error)) => return Err(ChainError::Reverted(error)),
-                Err(_) => self.mark_failed(&url),
+                Err(_) => self.roster().mark_failed(&url, monotonic_ms()),
             }
         }
         Err(ChainError::Unavailable)
@@ -636,47 +616,16 @@ impl RpcPool {
             .get("result")
             .cloned()
             .ok_or(ChainError::InvalidResponse)?;
-        self.mark_healthy(url);
+        self.roster().mark_healthy(url);
         Ok(result)
     }
+}
 
-    fn select(&self, urls: &[String], index: &AtomicUsize) -> Option<String> {
-        for _ in 0..urls.len() {
-            let current = index.fetch_add(1, Ordering::Relaxed) % urls.len();
-            let url = &urls[current];
-            if self.available(url) {
-                return Some(url.clone());
-            }
-        }
-        urls.get(index.fetch_add(1, Ordering::Relaxed) % urls.len())
-            .cloned()
-    }
-
-    fn available(&self, url: &str) -> bool {
-        let mut failed = self.failed.lock().expect("rpc failure state lock");
-        match failed.get(url).copied() {
-            Some(at) if at.elapsed() < RPC_COOLDOWN => false,
-            Some(_) => {
-                failed.remove(url);
-                true
-            }
-            None => true,
-        }
-    }
-
-    fn mark_failed(&self, url: &str) {
-        self.failed
-            .lock()
-            .expect("rpc failure state lock")
-            .insert(url.to_owned(), Instant::now());
-    }
-
-    fn mark_healthy(&self, url: &str) {
-        self.failed
-            .lock()
-            .expect("rpc failure state lock")
-            .remove(url);
-    }
+/// Process-monotonic milliseconds for the roster's cooldown arithmetic; the
+/// roster only ever compares these to each other.
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 fn parse_secret_key(value: &str) -> Result<SecretKey> {
@@ -733,31 +682,6 @@ fn parse_u256_value(value: &Value) -> Result<U256, ChainError> {
 fn decode_rpc_bytes(value: &str) -> Result<Vec<u8>, ChainError> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     hex::decode(value).map_err(|_| ChainError::InvalidResponse)
-}
-
-fn is_revert(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    value.contains("execution reverted")
-        || value.contains("revert")
-        || value.contains("0x46a08bc5")
-        || value.contains("0xc9af4506")
-}
-
-pub fn is_record_exists_error(error: &ChainError) -> bool {
-    matches!(error, ChainError::Reverted(value) | ChainError::Rejected(value)
-        if value.contains("RecordAlreadyExists") || value.contains("0x46a08bc5"))
-}
-
-pub fn is_wallet_conflict_error(error: &ChainError) -> bool {
-    matches!(error, ChainError::Reverted(value) | ChainError::Rejected(value)
-        if value.contains("WalletRefAlreadyExists") || value.contains("0xc9af4506"))
-}
-
-pub fn is_transient(error: &ChainError) -> bool {
-    matches!(error, ChainError::Unavailable | ChainError::InvalidResponse)
-        || matches!(error, ChainError::Rejected(value)
-            if !value.contains("RecordAlreadyExists") && !value.contains("WalletRefAlreadyExists")
-                && !value.contains("execution reverted") && !value.contains("revert"))
 }
 
 #[cfg(test)]

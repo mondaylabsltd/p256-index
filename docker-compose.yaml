@@ -11,8 +11,9 @@ services:
   index:
     image: ${P256_INDEX_IMAGE:-p256-index-server:local}
     build:
-      context: ./p256-index-server
-      dockerfile: Dockerfile
+      # Repository root: the server build needs the sibling p256-registrar crate.
+      context: .
+      dockerfile: p256-index-server/Dockerfile
     env_file:
       - ./p256-index-server/.env
     environment:

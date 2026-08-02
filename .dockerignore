@@ -1,0 +1,12 @@
+# Applies to builds whose context is the repository root (docker-compose and
+# the release workflow's Dockerfile.release). `dist` must NOT be ignored:
+# Dockerfile.release copies the prebuilt binary from dist/p256-index-server.
+.git
+.github
+.cursor
+**/target
+contracts
+agent-rules
+backups
+coverage
+**/.env

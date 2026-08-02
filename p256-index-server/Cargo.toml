@@ -9,11 +9,12 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8.9"
 base64 = "0.22"
+crux_core = "0.19"
 dotenvy = "0.15"
 hex = "0.4"
 iggy = "0.10.3-edge.1"
 k256 = "0.13"
-p256 = "0.14"
+p256-registrar = { path = "../p256-registrar" }
 rand = "0.9"
 redis = { version = "0.32", features = ["tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -27,4 +28,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+p256 = "0.14"
 tower = { version = "0.5", features = ["util"] }

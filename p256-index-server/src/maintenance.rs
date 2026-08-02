@@ -1,5 +1,7 @@
 //! Background maintenance loop — the operational safety net for an unattended, fund-spending
-//! queue. Ported from the retired Deno/CF-Worker reliability cycle and adapted to Redis + Iggy:
+//! queue. The judgement lives in the registrar (`rescue` for the unstick sweep, `sentinel` for
+//! alert policy and the heartbeat); this loop supplies the inputs (ledger rows, nonces, gas
+//! price, clock) and executes the resulting plan against the chain, Redis and Telegram:
 //!
 //! - **stuck-nonce unstick sweep**: a broadcast whose receipt never arrived jams the wallet's
 //!   nonce sequence and stalls every later send. The sweep replaces it with a same-nonce,
@@ -14,29 +16,18 @@ use alloy::primitives::U256;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use p256_registrar::{
+    rescue::{self, LedgerRow, RescueAction},
+    sentinel,
+};
+
 use crate::{
     chain::{Chain, WalletRole},
-    reliability::{HEARTBEAT_INTERVAL, HeartbeatInput, build_heartbeat_message},
     store::RedisStore,
     telegram::Telegram,
 };
 
 const TICK: Duration = Duration::from_secs(60);
-/// A broadcast older than this whose nonce is still un-mined is treated as stuck.
-const STUCK_TX_AGE: Duration = Duration::from_secs(2 * 60);
-const MAX_UNSTICK_PER_CYCLE: usize = 5;
-/// Page after this many failed replacements of one nonce, or once it has been stuck this long.
-const UNSTICK_ALERT_ATTEMPTS: u32 = 5;
-const UNSTICK_ALERT_AGE: Duration = Duration::from_secs(10 * 60);
-/// Replacement gas price = 150% of the current network gas price.
-const CANCEL_GAS_NUM: u64 = 150;
-const CANCEL_GAS_DEN: u64 = 100;
-/// Alert when the estimated create runway drops below this many creates.
-const LOW_RUNWAY_CREATES: f64 = 200.0;
-/// Alert when the DLQ reaches this depth.
-const DLQ_ALERT_THRESHOLD: u64 = 10;
-/// Minimum spacing between repeats of the same alert.
-const ALERT_THROTTLE: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub struct MaintenanceHandle {
     shutdown: CancellationToken,
@@ -111,9 +102,18 @@ impl Maintenance {
 
     async fn unstick_sweep(&mut self) {
         let now = now_ms();
-        let sent_before = now.saturating_sub(STUCK_TX_AGE.as_millis() as u64);
-        let ledger = match self.store.list_pending_txs(sent_before).await {
-            Ok(rows) => rows,
+        let sent_before = now.saturating_sub(rescue::STUCK_TX_AGE_MS);
+        let ledger: Vec<LedgerRow> = match self.store.list_pending_txs(sent_before).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| LedgerRow {
+                    role: row.role,
+                    nonce: row.nonce,
+                    hash: row.hash,
+                    sent_at_ms: row.sent_at_ms,
+                    attempts: row.attempts,
+                })
+                .collect(),
             Err(_) => {
                 tracing::warn!(operation = "unstick", "ledger read failed");
                 return;
@@ -124,7 +124,7 @@ impl Maintenance {
         }
 
         let gas_price = match self.chain.gas_price().await {
-            Ok(price) => bump_gas(price),
+            Ok(price) => rescue::bump_gas(price),
             Err(_) => {
                 tracing::warn!(operation = "unstick", "gas price read failed");
                 return;
@@ -143,71 +143,52 @@ impl Maintenance {
                     continue;
                 }
             };
-            let mut stuck: Vec<_> = ledger
-                .iter()
-                .filter(|row| row.role == role_name(role))
-                .collect();
-            stuck.sort_by_key(|row| row.nonce);
-
-            let mut replaced = 0usize;
-            for row in stuck {
-                if row.nonce < confirmed {
-                    // The nonce was consumed (this or a replacement mined): drop the ledger row.
-                    let _ = self.store.delete_pending_tx(&row.role, row.nonce).await;
-                    continue;
-                }
-                let age_ms = now.saturating_sub(row.sent_at_ms);
-                if row.attempts >= UNSTICK_ALERT_ATTEMPTS
-                    || age_ms >= UNSTICK_ALERT_AGE.as_millis() as u64
-                {
-                    let message = format!(
-                        "🛑 [webauthnp256-publickey-index] stuck {} nonce {} not clearing \
-                         (attempts {}, stuck ~{} min). Manual intervention may be required.",
-                        row.role,
-                        row.nonce,
-                        row.attempts,
-                        age_ms / 60_000
-                    );
-                    self.alert_throttled(AlertKind::Stuck, &message).await;
-                }
-                if replaced >= MAX_UNSTICK_PER_CYCLE {
-                    continue;
-                }
-                replaced += 1;
-                match self
-                    .chain
-                    .cancel_stuck_nonce(role, row.nonce, gas_price)
-                    .await
-                {
-                    Ok(cancel_hash) => {
-                        tracing::warn!(
-                            operation = "unstick",
-                            outcome = "cancelled",
-                            role = %row.role,
-                            nonce = row.nonce,
-                            attempts = row.attempts + 1,
-                            "stuck tx replaced with same-nonce cancel"
-                        );
-                        // Reset sentAt and bump attempts so the next attempt waits a full window.
-                        let _ = self
-                            .store
-                            .record_pending_tx(
-                                &row.role,
-                                row.nonce,
-                                &cancel_hash,
-                                now,
-                                row.attempts + 1,
-                            )
-                            .await;
+            // The judgement is a pure plan; this loop just executes it.
+            for action in rescue::plan_role_sweep(role_name(role), confirmed, &ledger, now) {
+                match action {
+                    RescueAction::DropConsumedRow { nonce } => {
+                        let _ = self.store.delete_pending_tx(role_name(role), nonce).await;
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            operation = "unstick",
-                            role = %row.role,
-                            nonce = row.nonce,
-                            %error,
-                            "unstick attempt failed, will retry next cycle"
-                        );
+                    RescueAction::Escalate { message } => {
+                        self.alert_throttled(AlertKind::Stuck, &message).await;
+                    }
+                    RescueAction::Replace {
+                        nonce,
+                        attempts_after,
+                    } => {
+                        match self.chain.cancel_stuck_nonce(role, nonce, gas_price).await {
+                            Ok(cancel_hash) => {
+                                tracing::warn!(
+                                    operation = "unstick",
+                                    outcome = "cancelled",
+                                    role = role_name(role),
+                                    nonce,
+                                    attempts = attempts_after,
+                                    "stuck tx replaced with same-nonce cancel"
+                                );
+                                // Reset sentAt and bump attempts so the next
+                                // attempt waits a full window.
+                                let _ = self
+                                    .store
+                                    .record_pending_tx(
+                                        role_name(role),
+                                        nonce,
+                                        &cancel_hash,
+                                        now,
+                                        attempts_after,
+                                    )
+                                    .await;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    operation = "unstick",
+                                    role = role_name(role),
+                                    nonce,
+                                    %error,
+                                    "unstick attempt failed, will retry next cycle"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -219,22 +200,15 @@ impl Maintenance {
     async fn check_alerts(&mut self) {
         // Open RPC read circuit: reads are failing over, chain data may be stale.
         if self.chain.rpc_circuit_state() == "open" {
-            self.alert_throttled(
-                AlertKind::Rpc,
-                "⚠️ [webauthnp256-publickey-index] all chain RPC read endpoints are in cooldown \
-                 (circuit open) — queries may be served stale.",
-            )
-            .await;
+            self.alert_throttled(AlertKind::Rpc, sentinel::rpc_circuit_alert())
+                .await;
         }
 
         // DLQ growth: creates are being quarantined and need inspection.
         if let Ok(stats) = self.store.queue_stats().await
-            && stats.dlq_count >= DLQ_ALERT_THRESHOLD
+            && stats.dlq_count >= sentinel::DLQ_ALERT_THRESHOLD
         {
-            let message = format!(
-                "⚠️ [webauthnp256-publickey-index] DLQ has {} quarantined create(s) — inspect.",
-                stats.dlq_count
-            );
+            let message = sentinel::dlq_alert(stats.dlq_count);
             self.alert_throttled(AlertKind::Dlq, &message).await;
         }
 
@@ -243,18 +217,10 @@ impl Maintenance {
             self.chain.balance(WalletRole::Create).await,
             self.chain.gas_price().await,
         ) {
-            let runway = crate::reliability::estimate_create_runway(
-                wei_to_xdai(balance),
-                wei_to_gwei(price),
-            );
-            if runway.is_finite() && runway < LOW_RUNWAY_CREATES {
-                let message = format!(
-                    "🪫 [webauthnp256-publickey-index] create wallet funding low: ~{} creates left \
-                     ({:.6} xDAI @ {:.3} gwei). Top up soon.",
-                    runway as i64,
-                    wei_to_xdai(balance),
-                    wei_to_gwei(price),
-                );
+            let runway = sentinel::estimate_create_runway(wei_to_xdai(balance), wei_to_gwei(price));
+            if runway.is_finite() && runway < sentinel::LOW_RUNWAY_CREATES {
+                let message =
+                    sentinel::low_runway_alert(runway, wei_to_xdai(balance), wei_to_gwei(price));
                 self.alert_throttled(AlertKind::LowRunway, &message).await;
             }
         }
@@ -267,7 +233,7 @@ impl Maintenance {
             AlertKind::Dlq => &mut self.last_dlq_alert,
             AlertKind::LowRunway => &mut self.last_low_runway_alert,
         };
-        if slot.is_some_and(|at| at.elapsed() < ALERT_THROTTLE) {
+        if slot.is_some_and(|at| at.elapsed() < sentinel::ALERT_THROTTLE) {
             return;
         }
         *slot = Some(Instant::now());
@@ -283,7 +249,7 @@ impl Maintenance {
     async fn maybe_heartbeat(&mut self) {
         let due = self
             .last_heartbeat
-            .map(|at| at.elapsed() >= HEARTBEAT_INTERVAL)
+            .map(|at| at.elapsed() >= sentinel::HEARTBEAT_INTERVAL)
             .unwrap_or(true);
         if !due {
             return;
@@ -305,7 +271,7 @@ impl Maintenance {
         let create_balance = self.chain.balance(WalletRole::Create).await.ok();
         let commit_balance = self.chain.balance(WalletRole::Commit).await.ok();
 
-        let message = build_heartbeat_message(&HeartbeatInput {
+        let message = sentinel::build_heartbeat_message(&sentinel::HeartbeatInput {
             runtime: "Rust",
             queue_depth: stats.as_ref().map(|s| s.depth).unwrap_or(0),
             dlq_count: stats.as_ref().map(|s| s.dlq_count).unwrap_or(0),
@@ -342,16 +308,12 @@ fn role_name(role: WalletRole) -> &'static str {
     }
 }
 
-fn bump_gas(price: U256) -> U256 {
-    price.saturating_mul(U256::from(CANCEL_GAS_NUM)) / U256::from(CANCEL_GAS_DEN)
-}
-
 fn wei_to_xdai(wei: U256) -> f64 {
-    u128::try_from(wei).unwrap_or(u128::MAX) as f64 / 1e18
+    sentinel::wei_to_xdai(u128::try_from(wei).unwrap_or(u128::MAX))
 }
 
 fn wei_to_gwei(wei: U256) -> f64 {
-    u128::try_from(wei).unwrap_or(u128::MAX) as f64 / 1e9
+    sentinel::wei_to_gwei(u128::try_from(wei).unwrap_or(u128::MAX))
 }
 
 fn now_ms() -> u64 {

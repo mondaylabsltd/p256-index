@@ -59,8 +59,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            p256-index-server/target
-          key: release-${{ matrix.target }}-${{ hashFiles('p256-index-server/Cargo.lock') }}
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Build release executable
         run: cargo build --release --locked --manifest-path p256-index-server/Cargo.toml --target ${{ matrix.target }}
@@ -79,7 +79,7 @@ jobs:
           fi
 
           mkdir -p dist/package
-          cp "p256-index-server/target/${TARGET}/release/p256-index-server${suffix}" "dist/package/p256-index-server${suffix}"
+          cp "target/${TARGET}/release/p256-index-server${suffix}" "dist/package/p256-index-server${suffix}"
           asset="p256-index-server-${GITHUB_REF_NAME}-${TARGET}"
 
           if [[ "$ARCHIVE" == "zip" ]]; then

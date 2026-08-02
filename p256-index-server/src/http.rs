@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -15,17 +15,28 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use p256_registrar::{
+    admission::{
+        AdmissionApp, AdmissionEffect, AdmissionEvent, AdmissionOperation, AdmissionOutcome,
+        AdmissionResult, AdmitOutcome, CacheScope, CreateRequest,
+    },
+    lookup::{
+        LookupApp, LookupCacheKey, LookupEffect, LookupEndpoint, LookupEvent, LookupOperation,
+        LookupOutcome, LookupParams, LookupResult, Record, TtlClass, task_status_body,
+    },
+    protocol::CHAIN_ID,
+    sentinel,
+    task::TaskStatus,
+};
+
 use crate::{
     chain::{Chain, ReadChain},
     config::Config,
-    contract::{build_wallet_ref, default_metadata, parse_b256},
     queue::{CreateQueue, CreateTaskQueue},
     store::{Admission, CacheRead, RedisStore, derive_ip_salt, hash_ip},
-    types::{CHAIN_ID, CreateRequest, CreateTask, Record, TaskStatus},
 };
 
 const MAX_BODY_SIZE: usize = 32 * 1024;
-const MAX_ACTIVE_QUEUE_DEPTH: u64 = 10_000;
 const RECORD_STALE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 const STATS_STALE_LIMIT: Duration = Duration::from_secs(60 * 60);
 
@@ -134,22 +145,18 @@ async fn home() -> Response {
 async fn health(State(state): State<AppState>) -> Response {
     match state.store.queue_stats().await {
         Ok(stats) => {
-            let mut reasons = Vec::new();
-            if stats.depth >= 2_000 {
-                reasons.push("queue-depth");
-            }
-            if stats.dlq_count >= 25 {
-                reasons.push("dlq");
-            }
-            if stats.oldest_active_age_ms >= 30 * 60_000 {
-                reasons.push("oldest-job");
-            }
+            // The thresholds are sentinel policy; this handler only renders.
+            let reasons = sentinel::health_reasons(&sentinel::QueueHealth {
+                depth: stats.depth,
+                dlq_count: stats.dlq_count,
+                oldest_active_age_ms: stats.oldest_active_age_ms,
+            });
             let status = if reasons.is_empty() { "ok" } else { "degraded" };
             let mut body = json!({
                 "service": "webauthn-p256-publickey-index",
                 "version": "1.0.0",
                 "chainId": CHAIN_ID,
-                "contract": crate::types::CONTRACT_ADDRESS,
+                "contract": p256_registrar::protocol::CONTRACT_ADDRESS,
                 "rpcCircuit": state.chain.rpc_circuit_state(),
                 "telegramConfigured": state.telegram_configured,
                 "status": status,
@@ -170,7 +177,7 @@ async fn health(State(state): State<AppState>) -> Response {
                 "service": "webauthn-p256-publickey-index",
                 "version": "1.0.0",
                 "chainId": CHAIN_ID,
-                "contract": crate::types::CONTRACT_ADDRESS,
+                "contract": p256_registrar::protocol::CONTRACT_ADDRESS,
                 "rpcCircuit": state.chain.rpc_circuit_state(),
                 "telegramConfigured": state.telegram_configured,
                 "status": "degraded",
@@ -213,185 +220,192 @@ async fn create(State(state): State<AppState>, request: Request) -> Response {
         Ok(request) => request,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
     };
-    let input = match validate_create(request) {
-        Ok(input) => input,
-        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
-    };
 
     let ip_hash = hash_ip(&state.ip_hash_salt, &ip);
-    match state.store.allow_ip_create(&ip_hash).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded, max 5 requests per minute",
-            );
-        }
-        Err(_) => return dependency_error("redis"),
-    }
+    render_admission(run_admission(&state, &ip_hash, request).await)
+}
 
-    let cache_key = record_cache_key(&input.rp_id, &input.credential_id);
-    match state.store.cache_get(&cache_key, RECORD_STALE_LIMIT).await {
-        Ok(CacheRead::Fresh(value)) => return done_response(value),
-        Ok(_) => {}
-        Err(_) => return dependency_error("redis"),
-    }
-    match state
-        .chain
-        .get_record(&input.rp_id, &input.credential_id)
-        .await
-    {
-        Ok(Some(record)) => {
-            let value = record_value(&record);
-            if state
-                .store
-                .cache_set(&cache_key, value.clone(), false)
-                .await
-                .is_err()
-            {
-                return dependency_error("redis");
+/// Drive one create request through the admission Core. The shell supplies
+/// task identity and time, executes each operation against Redis / the chain
+/// / Iggy, and renders the outcome; every admission decision lives in
+/// `p256_registrar::admission`.
+async fn run_admission(
+    state: &AppState,
+    ip_hash: &str,
+    request: CreateRequest,
+) -> AdmissionOutcome {
+    let core: crux_core::Core<AdmissionApp> = crux_core::Core::new();
+    let mut effects: VecDeque<AdmissionEffect> = core
+        .process_event(AdmissionEvent::Submit {
+            request,
+            new_task_id: Uuid::new_v4().to_string(),
+            now_ms: now_ms(),
+        })
+        .into_iter()
+        .collect();
+    while let Some(effect) = effects.pop_front() {
+        let AdmissionEffect::Work(mut request) = effect;
+        let output = execute_admission(state, ip_hash, &request.operation).await;
+        match core.resolve(&mut request, output) {
+            Ok(next) => effects.extend(next),
+            Err(_) => {
+                return AdmissionOutcome::DependencyUnavailable {
+                    dependency: "redis".to_owned(),
+                };
             }
-            return done_response(value);
         }
-        Ok(None) => {}
-        Err(_) => {} // Existing Deno behavior is fail-open for chain prechecks.
     }
+    core.view()
+        .outcome
+        .unwrap_or(AdmissionOutcome::DependencyUnavailable {
+            dependency: "redis".to_owned(),
+        })
+}
 
-    match state
-        .store
-        .find_by_record(&input.rp_id, &input.credential_id)
-        .await
-    {
-        Ok(Some(task)) if task.status != TaskStatus::Failed => {
-            return queued_response(&task);
-        }
-        Ok(_) => {}
-        Err(_) => return dependency_error("redis"),
-    }
-    match state.store.find_by_wallet_ref(&input.wallet_ref).await {
-        Ok(Some(task))
-            if task.status != TaskStatus::Failed
-                && (task.rp_id != input.rp_id || task.credential_id != input.credential_id) =>
-        {
-            return wallet_conflict(
-                &input.wallet_ref,
-                "this publicKey is already being registered under a different credential (walletRef conflict)",
-            );
-        }
-        Ok(_) => {}
-        Err(_) => return dependency_error("redis"),
-    }
-    let wallet_cache_key = wallet_cache_key(&input.wallet_ref);
-    match state
-        .store
-        .cache_get(&wallet_cache_key, RECORD_STALE_LIMIT)
-        .await
-    {
-        Ok(CacheRead::Fresh(value)) => {
-            if same_record(&value, &input.rp_id, &input.credential_id) {
-                return done_response(value);
-            }
-            return wallet_conflict(
-                &input.wallet_ref,
-                "this publicKey is already registered under a different credential (walletRef conflict)",
-            );
-        }
-        Ok(_) => {}
-        Err(_) => return dependency_error("redis"),
-    }
-    match state
-        .chain
-        .get_record_by_wallet_ref(input.wallet_ref.parse().expect("validated bytes32"))
-        .await
-    {
-        Ok(Some(record)) => {
-            let value = record_value(&record);
-            if state
-                .store
-                .cache_set(&wallet_cache_key, value.clone(), false)
-                .await
-                .is_err()
-            {
-                return dependency_error("redis");
-            }
-            if same_record(&value, &input.rp_id, &input.credential_id) {
-                let _ = state
-                    .store
-                    .cache_set(&cache_key, value.clone(), false)
-                    .await;
-                return done_response(value);
-            }
-            return wallet_conflict(
-                &input.wallet_ref,
-                "this publicKey is already registered under a different credential (walletRef conflict)",
-            );
-        }
-        Ok(None) => {}
-        Err(_) => {}
-    }
-
-    match state.store.queue_stats().await {
-        Ok(stats) if stats.depth >= MAX_ACTIVE_QUEUE_DEPTH => return busy_response(),
-        Ok(_) => {}
-        Err(_) => return dependency_error("redis"),
-    }
-    match state
-        .store
-        .allow_global_create(state.global_write_limit)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return busy_response(),
-        Err(_) => return dependency_error("redis"),
-    }
-
-    let task = CreateTask {
-        id: Uuid::new_v4().to_string(),
-        status: TaskStatus::Pending,
-        rp_id: input.rp_id,
-        credential_id: input.credential_id,
-        wallet_ref: input.wallet_ref,
-        public_key: input.public_key,
-        name: input.name,
-        initial_credential_id: input.initial_credential_id,
-        metadata: input.metadata,
-        tx_hash: None,
-        error: None,
-        retries: 0,
-        created_at: now_ms() as i64,
-        admitted: false,
-    };
-    match state.store.admit(&task).await {
-        Ok(Admission::WalletConflict(_)) => wallet_conflict(
-            &task.wallet_ref,
-            "this publicKey is already being registered under a different credential (walletRef conflict)",
-        ),
-        Ok(Admission::Existing(id)) => match state.store.get_task(&id).await {
-            Ok(Some(existing)) if existing.admitted => queued_response(&existing),
-            Ok(Some(existing)) => enqueue_task(&state, &existing).await,
-            Ok(None) => dependency_error("redis"),
-            Err(_) => dependency_error("redis"),
+async fn execute_admission(
+    state: &AppState,
+    ip_hash: &str,
+    operation: &AdmissionOperation,
+) -> AdmissionResult {
+    match operation {
+        AdmissionOperation::AllowIpCreate => match state.store.allow_ip_create(ip_hash).await {
+            Ok(allowed) => AdmissionResult::Allowed { allowed },
+            Err(_) => AdmissionResult::StoreUnavailable,
         },
-        Ok(Admission::New(_)) => enqueue_task(&state, &task).await,
-        Err(_) => dependency_error("redis"),
+        AdmissionOperation::ReadCache { scope } => {
+            match state
+                .store
+                .cache_get(&cache_scope_key(scope), RECORD_STALE_LIMIT)
+                .await
+            {
+                Ok(CacheRead::Fresh(value)) => AdmissionResult::CacheHit { value },
+                Ok(_) => AdmissionResult::CacheMiss,
+                Err(_) => AdmissionResult::StoreUnavailable,
+            }
+        }
+        AdmissionOperation::FetchChainRecord {
+            rp_id,
+            credential_id,
+        } => match state.chain.get_record(rp_id, credential_id).await {
+            Ok(record) => AdmissionResult::ChainRecord {
+                value: record.as_ref().map(record_value),
+            },
+            Err(_) => AdmissionResult::ChainReadFailed,
+        },
+        AdmissionOperation::FetchChainRecordByWalletRef { wallet_ref } => {
+            let Ok(wallet_ref) = wallet_ref.parse() else {
+                return AdmissionResult::ChainReadFailed;
+            };
+            match state.chain.get_record_by_wallet_ref(wallet_ref).await {
+                Ok(record) => AdmissionResult::ChainRecord {
+                    value: record.as_ref().map(record_value),
+                },
+                Err(_) => AdmissionResult::ChainReadFailed,
+            }
+        }
+        AdmissionOperation::StoreCache {
+            scope,
+            value,
+            best_effort,
+        } => {
+            let write = state
+                .store
+                .cache_set(&cache_scope_key(scope), value.clone(), false)
+                .await;
+            if *best_effort || write.is_ok() {
+                AdmissionResult::Persisted
+            } else {
+                AdmissionResult::StoreUnavailable
+            }
+        }
+        AdmissionOperation::FindTaskByRecord {
+            rp_id,
+            credential_id,
+        } => match state.store.find_by_record(rp_id, credential_id).await {
+            Ok(task) => AdmissionResult::TaskFound { task },
+            Err(_) => AdmissionResult::StoreUnavailable,
+        },
+        AdmissionOperation::FindTaskByWalletRef { wallet_ref } => {
+            match state.store.find_by_wallet_ref(wallet_ref).await {
+                Ok(task) => AdmissionResult::TaskFound { task },
+                Err(_) => AdmissionResult::StoreUnavailable,
+            }
+        }
+        AdmissionOperation::QueueDepth => match state.store.queue_stats().await {
+            Ok(stats) => AdmissionResult::Depth { depth: stats.depth },
+            Err(_) => AdmissionResult::StoreUnavailable,
+        },
+        AdmissionOperation::AllowGlobalCreate => {
+            match state
+                .store
+                .allow_global_create(state.global_write_limit)
+                .await
+            {
+                Ok(allowed) => AdmissionResult::Allowed { allowed },
+                Err(_) => AdmissionResult::StoreUnavailable,
+            }
+        }
+        AdmissionOperation::Admit { task } => match state.store.admit(task).await {
+            Ok(Admission::New(_)) => AdmissionResult::Admitted(AdmitOutcome::New),
+            Ok(Admission::Existing(id)) => AdmissionResult::Admitted(AdmitOutcome::Existing { id }),
+            Ok(Admission::WalletConflict(_)) => {
+                AdmissionResult::Admitted(AdmitOutcome::WalletConflict)
+            }
+            Err(_) => AdmissionResult::StoreUnavailable,
+        },
+        AdmissionOperation::LoadTask { id } => match state.store.get_task(id).await {
+            Ok(task) => AdmissionResult::TaskFound { task },
+            Err(_) => AdmissionResult::StoreUnavailable,
+        },
+        AdmissionOperation::Enqueue { task } => match state.queue.enqueue(task).await {
+            Ok(()) => AdmissionResult::Enqueued,
+            // Do not delete the Redis admission: Iggy could have appended
+            // before its acknowledgement was lost. Retrying the same request
+            // reuses the task ID and is safe for the consumer.
+            Err(_) => AdmissionResult::QueueUnavailable,
+        },
+        AdmissionOperation::MarkAdmitted { id } => match state.store.mark_admitted(id).await {
+            Ok(task) => AdmissionResult::TaskFound { task },
+            Err(_) => AdmissionResult::StoreUnavailable,
+        },
     }
 }
 
-async fn enqueue_task(state: &AppState, task: &CreateTask) -> Response {
-    match state.queue.enqueue(task).await {
-        Ok(()) => match state.store.mark_admitted(&task.id).await {
-            Ok(Some(task)) => queued_response(&task),
-            _ => dependency_error("redis"),
-        },
-        // Do not delete Redis admission: Iggy could have appended before its acknowledgement was
-        // lost. Retrying the same request reuses the task ID and is safe for the consumer.
-        Err(_) => retryable_service_unavailable("queue"),
+fn cache_scope_key(scope: &CacheScope) -> String {
+    match scope {
+        CacheScope::Record {
+            rp_id,
+            credential_id,
+        } => record_cache_key(rp_id, credential_id),
+        CacheScope::Wallet { wallet_ref } => wallet_cache_key(wallet_ref),
+    }
+}
+
+fn render_admission(outcome: AdmissionOutcome) -> Response {
+    match outcome {
+        AdmissionOutcome::Invalid { message } => error_response(StatusCode::BAD_REQUEST, &message),
+        AdmissionOutcome::RateLimited => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded, max 5 requests per minute",
+        ),
+        AdmissionOutcome::AlreadyDone { record } => done_response(record),
+        AdmissionOutcome::Queued { id, status } => queued_response(&id, &status),
+        AdmissionOutcome::WalletConflict {
+            wallet_ref,
+            message,
+        } => wallet_conflict(&wallet_ref, &message),
+        AdmissionOutcome::Busy => busy_response(),
+        AdmissionOutcome::DependencyUnavailable { dependency } => {
+            retryable_service_unavailable(&dependency)
+        }
     }
 }
 
 async fn create_status(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.store.get_task(&id).await {
-        Ok(Some(task)) => task_status_response(&task),
+        // Disclosure (which fields may be shown before Done) is commit-reveal
+        // policy and lives in the registrar.
+        Ok(Some(task)) => json_response(StatusCode::OK, task_status_body(&task)),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "not found"),
         Err(_) => dependency_error("redis"),
     }
@@ -406,165 +420,23 @@ async fn query_record(
     Query(params): Query<QueryParams>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(wallet_ref) = params.wallet_ref {
-        return query_by_wallet_ref(state, wallet_ref, headers).await;
-    }
-    let (Some(rp_id), Some(credential_id)) = (params.rp_id, params.credential_id) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "rpId and credentialId are required (or walletRef)",
-        );
-    };
-    if let Err(message) = validate_strings(&[
-        ("rpId", &rp_id, 253),
-        ("credentialId", &credential_id, 1024),
-    ]) {
-        return error_response(StatusCode::BAD_REQUEST, &message);
-    }
-    let cache_key = record_cache_key(&rp_id, &credential_id);
-    let cached = match state.store.cache_get(&cache_key, RECORD_STALE_LIMIT).await {
-        Ok(cached) => cached,
-        Err(_) => return dependency_error("redis"),
-    };
-    if let CacheRead::Fresh(value) = cached {
-        return cached_response(value);
-    }
-    if matches!(cached, CacheRead::Negative) {
-        return match state.store.find_by_record(&rp_id, &credential_id).await {
-            Ok(Some(task)) if task.status != TaskStatus::Failed => queue_fallback(&task),
-            Ok(_) => error_response(StatusCode::NOT_FOUND, "not found"),
-            Err(_) => dependency_error("redis"),
-        };
-    }
-    let stale = match cached {
-        CacheRead::Stale { value, age_ms } => Some((value, age_ms)),
-        _ => None,
-    };
-    if !allow_read(&state, &headers).await {
-        return read_limited();
-    }
-    match state.chain.get_record(&rp_id, &credential_id).await {
-        Ok(Some(record)) => {
-            let value = record_value(&record);
-            if state
-                .store
-                .cache_set(&cache_key, value.clone(), false)
-                .await
-                .is_err()
-            {
-                return dependency_error("redis");
-            }
-            cached_response(value)
-        }
-        Ok(None) => {
-            if state.store.cache_set_negative(&cache_key).await.is_err() {
-                return dependency_error("redis");
-            }
-            match state.store.find_by_record(&rp_id, &credential_id).await {
-                Ok(Some(task)) if task.status != TaskStatus::Failed => queue_fallback(&task),
-                Ok(_) => error_response(StatusCode::NOT_FOUND, "not found"),
-                Err(_) => dependency_error("redis"),
-            }
-        }
-        Err(_) => stale_or_dependency(stale, "rpc"),
-    }
-}
-
-async fn query_by_wallet_ref(state: AppState, wallet_ref: String, headers: HeaderMap) -> Response {
-    if !wallet_ref.starts_with("0x") || wallet_ref.len() != 66 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "walletRef must be a 0x-prefixed 32-byte hex string",
-        );
-    }
-    if let Err(message) = validate_wallet_ref(&wallet_ref) {
-        return error_response(StatusCode::BAD_REQUEST, &message);
-    }
-    let wallet_ref = wallet_ref.to_ascii_lowercase();
-    let cache_key = wallet_cache_key(&wallet_ref);
-    let cached = match state.store.cache_get(&cache_key, RECORD_STALE_LIMIT).await {
-        Ok(cached) => cached,
-        Err(_) => return dependency_error("redis"),
-    };
-    if let CacheRead::Fresh(value) = cached {
-        return cached_response(value);
-    }
-    if matches!(cached, CacheRead::Negative) {
-        return match state.store.find_by_wallet_ref(&wallet_ref).await {
-            Ok(Some(task)) if task.status != TaskStatus::Failed => queue_fallback(&task),
-            Ok(_) => error_response(StatusCode::NOT_FOUND, "not found"),
-            Err(_) => dependency_error("redis"),
-        };
-    }
-    let stale = match cached {
-        CacheRead::Stale { value, age_ms } => Some((value, age_ms)),
-        _ => None,
-    };
-    if !allow_read(&state, &headers).await {
-        return read_limited();
-    }
-    match state
-        .chain
-        .get_record_by_wallet_ref(wallet_ref.parse().expect("validated bytes32"))
-        .await
-    {
-        Ok(Some(record)) => {
-            let value = record_value(&record);
-            if state
-                .store
-                .cache_set(&cache_key, value.clone(), false)
-                .await
-                .is_err()
-            {
-                return dependency_error("redis");
-            }
-            cached_response(value)
-        }
-        Ok(None) => {
-            if state.store.cache_set_negative(&cache_key).await.is_err() {
-                return dependency_error("redis");
-            }
-            match state.store.find_by_wallet_ref(&wallet_ref).await {
-                Ok(Some(task)) if task.status != TaskStatus::Failed => queue_fallback(&task),
-                Ok(_) => error_response(StatusCode::NOT_FOUND, "not found"),
-                Err(_) => dependency_error("redis"),
-            }
-        }
-        Err(_) => stale_or_dependency(stale, "rpc"),
-    }
+    run_lookup(
+        &state,
+        &headers,
+        LookupEndpoint::Query,
+        lookup_params(params),
+    )
+    .await
 }
 
 async fn total_credentials(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    const KEY: &str = "stats:totalCredentials";
-    let cached = match state.store.cache_get(KEY, STATS_STALE_LIMIT).await {
-        Ok(cached) => cached,
-        Err(_) => return dependency_error("redis"),
-    };
-    if let CacheRead::Fresh(value) = cached {
-        return cached_response(value);
-    }
-    let stale = match cached {
-        CacheRead::Stale { value, age_ms } => Some((value, age_ms)),
-        _ => None,
-    };
-    if !allow_read(&state, &headers).await {
-        return read_limited();
-    }
-    match state.chain.total_credentials().await {
-        Ok(total) => {
-            let value = json!({ "totalCredentials": total });
-            if state
-                .store
-                .cache_set(KEY, value.clone(), true)
-                .await
-                .is_err()
-            {
-                return dependency_error("redis");
-            }
-            cached_response(value)
-        }
-        Err(_) => stale_or_dependency(stale, "rpc"),
-    }
+    run_lookup(
+        &state,
+        &headers,
+        LookupEndpoint::Total,
+        LookupParams::default(),
+    )
+    .await
 }
 
 async fn list_sites(
@@ -572,43 +444,13 @@ async fn list_sites(
     Query(params): Query<QueryParams>,
     headers: HeaderMap,
 ) -> Response {
-    let (page, page_size, descending) = pagination(&params);
-    if page > 10_000 {
-        return json_response(
-            StatusCode::OK,
-            json!({ "total": 0, "page": page, "pageSize": page_size, "items": [] }),
-        );
-    }
-    let key = format!("stats:rpIds:{page}:{page_size}:{descending}");
-    let cached = match state.store.cache_get(&key, STATS_STALE_LIMIT).await {
-        Ok(value) => value,
-        Err(_) => return dependency_error("redis"),
-    };
-    if let CacheRead::Fresh(value) = cached {
-        return cached_response(value);
-    }
-    let stale = match cached {
-        CacheRead::Stale { value, age_ms } => Some((value, age_ms)),
-        _ => None,
-    };
-    if !allow_read(&state, &headers).await {
-        return read_limited();
-    }
-    match state.chain.list_sites(page, page_size, descending).await {
-        Ok(page) => {
-            let value = serde_json::to_value(page).expect("serializable sites page");
-            if state
-                .store
-                .cache_set(&key, value.clone(), true)
-                .await
-                .is_err()
-            {
-                return dependency_error("redis");
-            }
-            cached_response(value)
-        }
-        Err(_) => stale_or_dependency(stale, "rpc"),
-    }
+    run_lookup(
+        &state,
+        &headers,
+        LookupEndpoint::Sites,
+        lookup_params(params),
+    )
+    .await
 }
 
 async fn list_keys(
@@ -616,182 +458,206 @@ async fn list_keys(
     Query(params): Query<QueryParams>,
     headers: HeaderMap,
 ) -> Response {
-    let (page, page_size, descending) = pagination(&params);
-    let Some(rp_id) = params.rp_id else {
-        return error_response(StatusCode::BAD_REQUEST, "rpId is required");
-    };
-    if let Err(message) = validate_strings(&[("rpId", &rp_id, 253)]) {
-        return error_response(StatusCode::BAD_REQUEST, &message);
+    run_lookup(
+        &state,
+        &headers,
+        LookupEndpoint::Keys,
+        lookup_params(params),
+    )
+    .await
+}
+
+fn lookup_params(params: QueryParams) -> LookupParams {
+    LookupParams {
+        rp_id: params.rp_id,
+        credential_id: params.credential_id,
+        wallet_ref: params.wallet_ref,
+        page: params.page,
+        page_size: params.page_size,
+        order: params.order,
     }
-    if page > 10_000 {
-        return json_response(
+}
+
+/// Drive one query through the lookup Core and render its outcome; every
+/// read-through decision lives in `p256_registrar::lookup`.
+async fn run_lookup(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: LookupEndpoint,
+    params: LookupParams,
+) -> Response {
+    let ip_hash = hash_ip(&state.ip_hash_salt, &client_ip(headers));
+    let core: crux_core::Core<LookupApp> = crux_core::Core::new();
+    let mut effects: VecDeque<LookupEffect> = core
+        .process_event(LookupEvent::Query { endpoint, params })
+        .into_iter()
+        .collect();
+    while let Some(effect) = effects.pop_front() {
+        let LookupEffect::Work(mut request) = effect;
+        let output = execute_lookup(state, &ip_hash, &request.operation).await;
+        match core.resolve(&mut request, output) {
+            Ok(next) => effects.extend(next),
+            Err(_) => return dependency_error("redis"),
+        }
+    }
+    match core.view().outcome {
+        Some(outcome) => render_lookup(outcome),
+        None => dependency_error("redis"),
+    }
+}
+
+async fn execute_lookup(
+    state: &AppState,
+    ip_hash: &str,
+    operation: &LookupOperation,
+) -> LookupResult {
+    match operation {
+        LookupOperation::ReadCache { key, ttl } => {
+            let limit = match ttl {
+                TtlClass::Record => RECORD_STALE_LIMIT,
+                TtlClass::Stats => STATS_STALE_LIMIT,
+            };
+            match state.store.cache_get(&lookup_cache_key(key), limit).await {
+                Ok(CacheRead::Fresh(value)) => LookupResult::CacheFresh { value },
+                Ok(CacheRead::Negative) => LookupResult::CacheNegative,
+                Ok(CacheRead::Stale { value, age_ms }) => {
+                    LookupResult::CacheStale { value, age_ms }
+                }
+                Ok(CacheRead::Miss) => LookupResult::CacheMiss,
+                Err(_) => LookupResult::StoreUnavailable,
+            }
+        }
+        LookupOperation::AllowRead => match state.store.allow_read(ip_hash).await {
+            Ok(allowed) => LookupResult::Allowed { allowed },
+            Err(_) => LookupResult::StoreUnavailable,
+        },
+        LookupOperation::FetchRecord {
+            rp_id,
+            credential_id,
+        } => match state.chain.get_record(rp_id, credential_id).await {
+            Ok(record) => LookupResult::Fetched {
+                value: record.as_ref().map(record_value),
+            },
+            Err(_) => LookupResult::ChainReadFailed,
+        },
+        LookupOperation::FetchRecordByWalletRef { wallet_ref } => {
+            let Ok(wallet_ref) = wallet_ref.parse() else {
+                return LookupResult::ChainReadFailed;
+            };
+            match state.chain.get_record_by_wallet_ref(wallet_ref).await {
+                Ok(record) => LookupResult::Fetched {
+                    value: record.as_ref().map(record_value),
+                },
+                Err(_) => LookupResult::ChainReadFailed,
+            }
+        }
+        LookupOperation::FetchTotal => match state.chain.total_credentials().await {
+            Ok(total) => LookupResult::Total { total },
+            Err(_) => LookupResult::ChainReadFailed,
+        },
+        LookupOperation::FetchSites {
+            page,
+            page_size,
+            descending,
+        } => match state.chain.list_sites(*page, *page_size, *descending).await {
+            Ok(page) => LookupResult::Data {
+                value: serde_json::to_value(page).expect("serializable sites page"),
+            },
+            Err(_) => LookupResult::ChainReadFailed,
+        },
+        LookupOperation::FetchKeys {
+            rp_id,
+            page,
+            page_size,
+            descending,
+        } => match state
+            .chain
+            .list_keys(rp_id, *page, *page_size, *descending)
+            .await
+        {
+            Ok(page) => LookupResult::Data {
+                value: serde_json::to_value(page).expect("serializable keys page"),
+            },
+            Err(_) => LookupResult::ChainReadFailed,
+        },
+        LookupOperation::StoreCache {
+            key,
+            value,
+            allow_stale,
+        } => {
+            match state
+                .store
+                .cache_set(&lookup_cache_key(key), value.clone(), *allow_stale)
+                .await
+            {
+                Ok(()) => LookupResult::Persisted,
+                Err(_) => LookupResult::StoreUnavailable,
+            }
+        }
+        LookupOperation::StoreNegative { key } => {
+            match state.store.cache_set_negative(&lookup_cache_key(key)).await {
+                Ok(()) => LookupResult::Persisted,
+                Err(_) => LookupResult::StoreUnavailable,
+            }
+        }
+        LookupOperation::FindTaskByRecord {
+            rp_id,
+            credential_id,
+        } => match state.store.find_by_record(rp_id, credential_id).await {
+            Ok(task) => LookupResult::TaskFound { task },
+            Err(_) => LookupResult::StoreUnavailable,
+        },
+        LookupOperation::FindTaskByWalletRef { wallet_ref } => {
+            match state.store.find_by_wallet_ref(wallet_ref).await {
+                Ok(task) => LookupResult::TaskFound { task },
+                Err(_) => LookupResult::StoreUnavailable,
+            }
+        }
+    }
+}
+
+fn lookup_cache_key(key: &LookupCacheKey) -> String {
+    match key {
+        LookupCacheKey::Record {
+            rp_id,
+            credential_id,
+        } => record_cache_key(rp_id, credential_id),
+        LookupCacheKey::Wallet { wallet_ref } => wallet_cache_key(wallet_ref),
+        LookupCacheKey::StatsTotal => "stats:totalCredentials".to_owned(),
+        LookupCacheKey::StatsSites {
+            page,
+            page_size,
+            descending,
+        } => format!("stats:rpIds:{page}:{page_size}:{descending}"),
+        LookupCacheKey::StatsKeys {
+            rp_id,
+            page,
+            page_size,
+            descending,
+        } => format!("stats:keys:{rp_id}:{page}:{page_size}:{descending}"),
+    }
+}
+
+fn render_lookup(outcome: LookupOutcome) -> Response {
+    match outcome {
+        LookupOutcome::Invalid { message } => error_response(StatusCode::BAD_REQUEST, &message),
+        LookupOutcome::CachedOk { value } => cached_response(value),
+        LookupOutcome::EmptyPage { page, page_size } => json_response(
             StatusCode::OK,
             json!({ "total": 0, "page": page, "pageSize": page_size, "items": [] }),
-        );
-    }
-    let key = format!("stats:keys:{rp_id}:{page}:{page_size}:{descending}");
-    let cached = match state.store.cache_get(&key, STATS_STALE_LIMIT).await {
-        Ok(value) => value,
-        Err(_) => return dependency_error("redis"),
-    };
-    if let CacheRead::Fresh(value) = cached {
-        return cached_response(value);
-    }
-    let stale = match cached {
-        CacheRead::Stale { value, age_ms } => Some((value, age_ms)),
-        _ => None,
-    };
-    if !allow_read(&state, &headers).await {
-        return read_limited();
-    }
-    match state
-        .chain
-        .list_keys(&rp_id, page, page_size, descending)
-        .await
-    {
-        Ok(page) => {
-            let value = serde_json::to_value(page).expect("serializable keys page");
-            if state
-                .store
-                .cache_set(&key, value.clone(), true)
-                .await
-                .is_err()
-            {
-                return dependency_error("redis");
-            }
-            cached_response(value)
+        ),
+        LookupOutcome::ReadLimited => read_limited(),
+        LookupOutcome::ServedStale { value } => served_stale_response(value),
+        LookupOutcome::QueueFallback { body } => json_response(StatusCode::OK, body),
+        LookupOutcome::NotFound => error_response(StatusCode::NOT_FOUND, "not found"),
+        LookupOutcome::DependencyUnavailable { dependency } => {
+            retryable_service_unavailable(&dependency)
         }
-        Err(_) => stale_or_dependency(stale, "rpc"),
     }
 }
 
 async fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not found")
-}
-
-struct ValidCreate {
-    rp_id: String,
-    credential_id: String,
-    wallet_ref: String,
-    public_key: String,
-    name: String,
-    initial_credential_id: String,
-    metadata: String,
-}
-
-fn validate_create(request: CreateRequest) -> Result<ValidCreate, String> {
-    let (Some(rp_id), Some(credential_id), Some(public_key), Some(name)) = (
-        request.rp_id,
-        request.credential_id,
-        request.public_key,
-        request.name,
-    ) else {
-        return Err("rpId, credentialId, publicKey, and name are required".into());
-    };
-    if rp_id.is_empty() || credential_id.is_empty() || public_key.is_empty() || name.is_empty() {
-        return Err("rpId, credentialId, publicKey, and name are required".into());
-    }
-    validate_strings(&[
-        ("rpId", &rp_id, 253),
-        ("credentialId", &credential_id, 1024),
-        ("publicKey", &public_key, 130),
-        ("name", &name, 256),
-    ])?;
-    validate_public_key(&public_key)?;
-    if let Some(wallet_ref) = request.wallet_ref.as_deref() {
-        validate_wallet_ref(wallet_ref)?;
-    }
-    if let Some(initial) = request.initial_credential_id.as_deref() {
-        validate_strings(&[("initialCredentialId", initial, 1024)])?;
-    }
-    if let Some(metadata) = request.metadata.as_deref() {
-        validate_metadata(metadata)?;
-    }
-    let wallet_ref = build_wallet_ref(&public_key).map_err(|error| error.to_string())?;
-    if let Some(supplied) = request.wallet_ref
-        && supplied.to_ascii_lowercase() != wallet_ref
-    {
-        return Err("walletRef does not match publicKey".into());
-    }
-    let initial_credential_id = request
-        .initial_credential_id
-        .unwrap_or_else(|| credential_id.clone());
-    let metadata = match request.metadata {
-        Some(metadata) => metadata,
-        None => default_metadata(&public_key).map_err(|error| error.to_string())?,
-    };
-    Ok(ValidCreate {
-        rp_id,
-        credential_id,
-        wallet_ref,
-        public_key,
-        name,
-        initial_credential_id,
-        metadata,
-    })
-}
-
-fn validate_public_key(value: &str) -> Result<(), String> {
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("publicKey must be a valid hex string".into());
-    }
-    if raw.len() != 130 || !raw.starts_with("04") {
-        return Err("publicKey must be an uncompressed P-256 point (04 + 64-byte X/Y)".into());
-    }
-    Ok(())
-}
-
-fn validate_strings(values: &[(&str, &str, usize)]) -> Result<(), String> {
-    for (name, value, maximum) in values {
-        if value.len() > *maximum {
-            return Err(format!("{name} exceeds max length ({maximum})"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_wallet_ref(value: &str) -> Result<(), String> {
-    if value.len() > 66 {
-        return Err("walletRef exceeds max length (66)".into());
-    }
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if raw.len() != 64 {
-        return Err("walletRef must be a 32-byte hex string (64 hex chars)".into());
-    }
-    let normalized = if value.starts_with("0x") {
-        value.to_owned()
-    } else {
-        format!("0x{value}")
-    };
-    parse_b256(&normalized).map_err(|_| "walletRef must be a valid hex string".to_owned())?;
-    Ok(())
-}
-
-fn validate_metadata(value: &str) -> Result<(), String> {
-    if value.len() > 4096 {
-        return Err("metadata exceeds max length (4096)".into());
-    }
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if !raw.len().is_multiple_of(2) {
-        return Err("metadata must be byte-aligned hex (even number of hex chars)".into());
-    }
-    if !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("metadata must be a valid hex string".into());
-    }
-    Ok(())
-}
-
-fn pagination(params: &QueryParams) -> (u64, u64, bool) {
-    let page = params.page.unwrap_or(1).max(1);
-    let page_size = params.page_size.unwrap_or(20).clamp(1, 100);
-    let descending = params.order.as_deref() != Some("asc");
-    (page, page_size, descending)
-}
-
-async fn allow_read(state: &AppState, headers: &HeaderMap) -> bool {
-    let hash = hash_ip(&state.ip_hash_salt, &client_ip(headers));
-    state.store.allow_read(&hash).await.unwrap_or(true)
 }
 
 fn client_ip(headers: &HeaderMap) -> String {
@@ -833,16 +699,8 @@ fn record_value(record: &Record) -> Value {
     serde_json::to_value(record).expect("record is serializable")
 }
 
-fn same_record(value: &Value, rp_id: &str, credential_id: &str) -> bool {
-    value.get("rpId").and_then(Value::as_str) == Some(rp_id)
-        && value.get("credentialId").and_then(Value::as_str) == Some(credential_id)
-}
-
-fn queued_response(task: &CreateTask) -> Response {
-    json_response(
-        StatusCode::ACCEPTED,
-        json!({ "id": task.id, "status": task.status }),
-    )
+fn queued_response(id: &str, status: &TaskStatus) -> Response {
+    json_response(StatusCode::ACCEPTED, json!({ "id": id, "status": status }))
 }
 
 fn done_response(value: Value) -> Response {
@@ -860,51 +718,6 @@ fn wallet_conflict(wallet_ref: &str, error: &str) -> Response {
     )
 }
 
-fn task_status_response(task: &CreateTask) -> Response {
-    if task.status == TaskStatus::Done {
-        return json_response(
-            StatusCode::OK,
-            json!({
-                "id": task.id,
-                "status": task.status,
-                "rpId": task.rp_id,
-                "credentialId": task.credential_id,
-                "walletRef": task.wallet_ref,
-                "publicKey": task.public_key,
-                "name": task.name,
-                "txHash": task.tx_hash,
-                "createdAt": task.created_at,
-            }),
-        );
-    }
-    json_response(
-        StatusCode::OK,
-        json!({
-            "id": task.id,
-            "status": task.status,
-            "rpId": task.rp_id,
-            "publicKey": task.public_key,
-            "name": task.name,
-            "error": task.error,
-            "createdAt": task.created_at,
-        }),
-    )
-}
-
-fn queue_fallback(task: &CreateTask) -> Response {
-    json_response(
-        StatusCode::OK,
-        json!({
-            "rpId": task.rp_id,
-            "publicKey": task.public_key,
-            "name": task.name,
-            "metadata": task.metadata,
-            "createdAt": task.created_at,
-            "_queue": { "id": task.id, "status": task.status },
-        }),
-    )
-}
-
 fn cached_response(value: Value) -> Response {
     let mut response = json_response(StatusCode::OK, value);
     response.headers_mut().insert(
@@ -914,24 +727,16 @@ fn cached_response(value: Value) -> Response {
     response
 }
 
-fn stale_or_dependency(stale: Option<(Value, u64)>, dependency: &str) -> Response {
-    match stale {
-        Some((mut value, age_ms)) => {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("_stale".into(), Value::Bool(true));
-                object.insert("_staleAgeMs".into(), json!(age_ms));
-            }
-            let mut response = json_response(StatusCode::OK, value);
-            response
-                .headers_mut()
-                .insert("x-served-stale", HeaderValue::from_static("true"));
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-            response
-        }
-        None => dependency_error(dependency),
-    }
+fn served_stale_response(value: Value) -> Response {
+    // The `_stale`/`_staleAgeMs` markers are already in the value (Core).
+    let mut response = json_response(StatusCode::OK, value);
+    response
+        .headers_mut()
+        .insert("x-served-stale", HeaderValue::from_static("true"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn read_limited() -> Response {
@@ -1006,50 +811,17 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    use super::{
-        AppState, pagination, record_cache_key, router, validate_create, wallet_cache_key,
-    };
+    use super::{AppState, record_cache_key, router, wallet_cache_key};
     use crate::{
         chain::{ChainError, ReadChain},
         config::Config,
         queue::{CreateTaskQueue, QueueError},
         store::RedisStore,
-        types::{CreateRequest, CreateTask, Page, Record, SiteItem},
     };
-
-    const KEY: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
-
-    #[test]
-    fn create_validation_derives_wallet_ref_and_metadata() {
-        let input = validate_create(CreateRequest {
-            rp_id: Some("example.com".into()),
-            credential_id: Some("credential".into()),
-            wallet_ref: None,
-            public_key: Some(KEY.into()),
-            name: Some("My passkey".into()),
-            initial_credential_id: None,
-            metadata: None,
-        })
-        .unwrap();
-        assert_eq!(
-            input.wallet_ref,
-            "0x000000000000000000000000d602f36e97fa37801565e3dc02f78ee0769d8fd6"
-        );
-        assert!(input.metadata.starts_with("0x"));
-    }
-
-    #[test]
-    fn pagination_clamps_to_the_published_contract() {
-        let params = super::QueryParams {
-            rp_id: None,
-            credential_id: None,
-            wallet_ref: None,
-            page: Some(0),
-            page_size: Some(101),
-            order: Some("asc".into()),
-        };
-        assert_eq!(pagination(&params), (1, 100, false));
-    }
+    use p256_registrar::{
+        lookup::{Page, Record, SiteItem},
+        task::CreateTask,
+    };
 
     #[derive(Default)]
     struct FakeQueue {
@@ -1174,7 +946,8 @@ mod tests {
         let suffix = uuid::Uuid::new_v4();
         let signing_key = p256::SecretKey::generate();
         let public_key = hex::encode(signing_key.public_key().to_sec1_point(false).as_bytes());
-        let wallet_ref = crate::contract::build_wallet_ref(&public_key).expect("valid P-256 key");
+        let wallet_ref =
+            p256_registrar::wallet::build_wallet_ref(&public_key).expect("valid P-256 key");
         let rp_id = format!("http-contract-{suffix}.invalid");
         let credential_id = format!("credential-{suffix}");
         let create_body = json!({

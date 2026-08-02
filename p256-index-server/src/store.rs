@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::types::{CreateTask, TaskStatus};
+use p256_registrar::task::{CreateTask, TaskStatus};
 
 const TASK_DONE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const TASK_FAILED_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);

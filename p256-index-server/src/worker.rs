@@ -1,4 +1,17 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+//! Shell for the commit-reveal task lifecycle.
+//!
+//! All decisions live in `p256_registrar::commit_reveal`; this worker owns
+//! the machinery: the Iggy consumer loop (offset advance, backoff, malformed
+//! message discard), nonce management for the two signing wallets, the
+//! pending-tx ledger for the unstick sweep, and the execution of Core
+//! operations against Redis and the chain. One Core instance drives one
+//! polled batch to a `BatchVerdict`.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use iggy::prelude::{
     Client, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient,
@@ -7,22 +20,24 @@ use iggy::prelude::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    chain::{
-        Chain, ChainError, ReceiptStatus, WalletRole, is_record_exists_error, is_transient,
-        is_wallet_conflict_error,
+use p256_registrar::{
+    commit_reveal::{
+        BatchVerdict, CommitRevealApp, CommitRevealEffect, CommitRevealEvent,
+        CommitRevealOperation, CommitRevealResult, TxOutcome,
     },
-    contract::build_commitment,
+    protocol::parse_b256,
+    task::CreateTask,
+};
+
+use crate::{
+    chain::{Chain, ReceiptStatus, WalletRole},
     queue::{STREAM_NAME, TOPIC_NAME},
     store::RedisStore,
-    types::{CreateTask, TaskStatus},
 };
 
 const POLL_BATCH_SIZE: u32 = 50;
-const CREATE_SUB_BATCH_SIZE: usize = 10;
 const IGGY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
-const REVEAL_TIMEOUT: Duration = Duration::from_secs(75);
 
 pub struct WorkerHandle {
     shutdown: CancellationToken,
@@ -85,28 +100,28 @@ impl CreateWorker {
 
     async fn run(self, shutdown: CancellationToken) -> Result<(), WorkerError> {
         let client = IggyClient::from_connection_string(&self.consumer_url)
-            .map_err(|_| WorkerError("invalid Iggy consumer connection configuration"))?;
+            .map_err(|_| WorkerError::new("invalid Iggy consumer connection configuration"))?;
         tokio::time::timeout(IGGY_CONNECT_TIMEOUT, client.connect())
             .await
-            .map_err(|_| WorkerError("Iggy consumer connection timed out"))?
-            .map_err(|_| WorkerError("could not connect Iggy consumer"))?;
+            .map_err(|_| WorkerError::new("Iggy consumer connection timed out"))?
+            .map_err(|_| WorkerError::new("could not connect Iggy consumer"))?;
 
         let stream: Identifier = STREAM_NAME
             .try_into()
-            .map_err(|_| WorkerError("invalid Iggy stream name"))?;
+            .map_err(|_| WorkerError::new("invalid Iggy stream name"))?;
         let topic: Identifier = TOPIC_NAME
             .try_into()
-            .map_err(|_| WorkerError("invalid Iggy topic name"))?;
+            .map_err(|_| WorkerError::new("invalid Iggy topic name"))?;
         let group: Identifier = self
             .consumer_group
             .as_str()
             .try_into()
-            .map_err(|_| WorkerError("invalid Iggy consumer group name"))?;
+            .map_err(|_| WorkerError::new("invalid Iggy consumer group name"))?;
         ensure_consumer_group(&client, &stream, &topic, &group, &self.consumer_group).await?;
         client
             .join_consumer_group(&stream, &topic, &group)
             .await
-            .map_err(|_| WorkerError("could not join Iggy consumer group"))?;
+            .map_err(|_| WorkerError::new("could not join Iggy consumer group"))?;
 
         let consumer = Consumer::group(group.clone());
         let polling = PollingStrategy::next();
@@ -121,7 +136,7 @@ impl CreateWorker {
             let polled = tokio::select! {
                 _ = shutdown.cancelled() => break,
                 result = client.poll_messages(&stream, &topic, None, &consumer, &polling, POLL_BATCH_SIZE, false) =>
-                    result.map_err(|_| WorkerError("could not poll Iggy create tasks"))?,
+                    result.map_err(|_| WorkerError::new("could not poll Iggy create tasks"))?,
             };
             if polled.messages.is_empty() {
                 tokio::select! {
@@ -135,7 +150,7 @@ impl CreateWorker {
                 .messages
                 .last()
                 .map(|message| message.header.offset)
-                .ok_or(WorkerError("Iggy poll returned no highest offset"))?;
+                .ok_or(WorkerError::new("Iggy poll returned no highest offset"))?;
             let tasks = polled
                 .messages
                 .into_iter()
@@ -168,11 +183,11 @@ impl CreateWorker {
                             highest_offset,
                         )
                         .await
-                        .map_err(|_| WorkerError("could not store Iggy consumer offset"))?;
+                        .map_err(|_| WorkerError::new("could not store Iggy consumer offset"))?;
                 }
                 Err(error) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff = crate::reliability::backoff_delay(consecutive_failures)
+                    let backoff = p256_registrar::sentinel::backoff_delay(consecutive_failures)
                         .min(Duration::from_secs(60));
                     tracing::warn!(%error, retry_in_s = backoff.as_secs(), "Iggy create batch will be retried without advancing offset");
                     tokio::select! {
@@ -193,388 +208,151 @@ impl CreateWorker {
         Ok(())
     }
 
+    /// Drive one polled batch through the commit-reveal Core. The queue
+    /// messages are only envelopes: the Core loads the authoritative records
+    /// itself, so only the ids cross into it.
     async fn process_batch(&self, queue_tasks: Vec<CreateTask>) -> Result<(), WorkerError> {
         if queue_tasks.is_empty() {
             return Ok(());
         }
-        let mut canonical = Vec::new();
-        for envelope in queue_tasks {
-            match self.store.get_task(&envelope.id).await {
-                Ok(Some(task)) if !task.status.is_terminal() => canonical.push(task),
-                Ok(_) => {}
-                Err(_) => return Err(WorkerError("could not load Redis create task")),
-            }
-        }
-        deduplicate_by_id(&mut canonical);
-        if canonical.is_empty() {
-            return Ok(());
+        let envelope_ids = queue_tasks.into_iter().map(|task| task.id).collect();
+
+        let core: crux_core::Core<CommitRevealApp> = crux_core::Core::new();
+        let mut effects: VecDeque<CommitRevealEffect> = core
+            .process_event(CommitRevealEvent::Start { envelope_ids })
+            .into_iter()
+            .collect();
+        while let Some(effect) = effects.pop_front() {
+            let CommitRevealEffect::Work(mut request) = effect;
+            let output = self.execute(&request.operation).await;
+            let next = core
+                .resolve(&mut request, output)
+                .map_err(|_| WorkerError::new("could not resolve commit-reveal effect"))?;
+            effects.extend(next);
         }
 
-        // Reconciliation comes first. It covers receipt-timeout and producer duplicate cases
-        // without ever replaying a successful on-chain create.
-        let mut pending = Vec::new();
-        let mut committed = Vec::new();
-        for task in canonical {
-            match self
-                .chain
-                .has_record(&task.rp_id, &task.credential_id)
-                .await
-            {
-                Ok(true) => {
-                    self.store
-                        .mark_done(&task.id, task.tx_hash.clone())
-                        .await
-                        .map_err(|_| WorkerError("could not persist reconciled task"))?;
-                }
-                Ok(false) if task.status == TaskStatus::Pending => pending.push(task),
-                Ok(false) if task.status == TaskStatus::Committed => committed.push(task),
-                Ok(false) => {}
-                Err(_) => {
-                    self.retry_task(&task, "hasRecord RPC temporarily unavailable")
-                        .await?;
-                    return Err(WorkerError("chain reconciliation failed"));
-                }
-            }
-        }
-
-        if !pending.is_empty() {
-            self.commit_pending(&pending).await?;
-            for task in pending {
-                if let Some(task) = self
-                    .store
-                    .get_task(&task.id)
-                    .await
-                    .map_err(|_| WorkerError("could not reload committed task"))?
-                    && task.status == TaskStatus::Committed
-                {
-                    committed.push(task);
-                }
-            }
-        }
-        if committed.is_empty() {
-            return Ok(());
-        }
-
-        self.wait_for_reveal(&committed).await?;
-        let mut missing = Vec::new();
-        for task in committed {
-            match self
-                .chain
-                .has_record(&task.rp_id, &task.credential_id)
-                .await
-            {
-                Ok(true) => {
-                    self.store
-                        .mark_done(&task.id, task.tx_hash.clone())
-                        .await
-                        .map_err(|_| WorkerError("could not persist completed task"))?;
-                }
-                Ok(false) => missing.push(task),
-                Err(_) => {
-                    self.retry_task(&task, "hasRecord RPC temporarily unavailable")
-                        .await?;
-                    return Err(WorkerError("chain reconciliation failed"));
-                }
-            }
-        }
-        for chunk in missing.chunks(CREATE_SUB_BATCH_SIZE) {
-            self.create_chunk(chunk).await?;
-        }
-        Ok(())
-    }
-
-    async fn commit_pending(&self, tasks: &[CreateTask]) -> Result<(), WorkerError> {
-        let nonce = self.acquire(NonceRole::Commit).await?;
-        match self.chain.commit(tasks, nonce).await {
-            Ok(hash) => {
-                self.record_pending(NonceRole::Commit, nonce, &hash).await;
-                match self.chain.wait_for_receipt(&hash, RECEIPT_TIMEOUT).await {
-                    Ok(ReceiptStatus::Success) => {
-                        self.clear_pending(NonceRole::Commit, nonce).await;
-                        for task in tasks {
-                            self.store
-                                .mark_committed(&task.id)
-                                .await
-                                .map_err(|_| WorkerError("could not persist committed task"))?;
-                        }
-                        Ok(())
-                    }
-                    Ok(ReceiptStatus::Reverted) => {
-                        self.clear_pending(NonceRole::Commit, nonce).await;
-                        self.release(NonceRole::Commit).await;
-                        // Isolate the single culprit commitment instead of poisoning the whole
-                        // batch, so innocent items still make forward progress.
-                        self.isolate_commit(tasks).await
-                    }
-                    // Receipt timeout: the tx may be stuck. Keep the ledger row for the unstick
-                    // sweep and let the batch retry.
-                    Err(error) => {
-                        self.release(NonceRole::Commit).await;
-                        self.handle_batch_error(tasks, &error, "batchCommit").await
-                    }
-                }
-            }
-            Err(error) => {
-                self.release(NonceRole::Commit).await;
-                self.handle_batch_error(tasks, &error, "batchCommit").await
-            }
+        match core.view().outcome {
+            Some(BatchVerdict::Advance) => Ok(()),
+            Some(BatchVerdict::Retry { reason }) => Err(WorkerError(reason)),
+            None => Err(WorkerError::new("commit-reveal batch never settled")),
         }
     }
 
-    /// Poison isolation for batchCommit (mirror of [`Self::isolate_create`]): re-commit each task
-    /// individually so a single deterministically-reverting commitment is quarantined while the
-    /// rest advance. An already-recorded commitment is reconciled to `committed`.
-    async fn isolate_commit(&self, tasks: &[CreateTask]) -> Result<(), WorkerError> {
-        for task in tasks {
-            if let Ok(commitment) = build_commitment(task)
-                && let Ok(block) = self.chain.get_commit_block(commitment).await
-                && block > 0
-            {
-                self.store
-                    .mark_committed(&task.id)
-                    .await
-                    .map_err(|_| WorkerError("could not persist committed task"))?;
-                continue;
-            }
-            let nonce = self.acquire(NonceRole::Commit).await?;
-            match self.chain.commit(std::slice::from_ref(task), nonce).await {
-                Ok(hash) => {
-                    self.record_pending(NonceRole::Commit, nonce, &hash).await;
-                    match self.chain.wait_for_receipt(&hash, RECEIPT_TIMEOUT).await {
-                        Ok(ReceiptStatus::Success) => {
-                            self.clear_pending(NonceRole::Commit, nonce).await;
-                            self.store
-                                .mark_committed(&task.id)
-                                .await
-                                .map_err(|_| WorkerError("could not persist committed task"))?;
-                        }
-                        Ok(ReceiptStatus::Reverted) => {
-                            self.clear_pending(NonceRole::Commit, nonce).await;
-                            self.release(NonceRole::Commit).await;
-                            self.store
-                                .mark_failed(&task.id, "POISON", "batchCommit transaction reverted")
-                                .await
-                                .map_err(|_| WorkerError("could not persist failed task"))?;
-                        }
-                        Err(error) => {
-                            self.release(NonceRole::Commit).await;
-                            self.handle_task_error(task, &error, "batchCommit").await?;
-                            return Err(WorkerError("isolated commit receipt wait failed"));
-                        }
+    /// Execute one Core operation against real infrastructure. Failures are
+    /// mapped into result variants — the Core decides what they mean.
+    async fn execute(&self, operation: &CommitRevealOperation) -> CommitRevealResult {
+        match operation {
+            CommitRevealOperation::LoadTasks { ids } => {
+                let mut tasks = Vec::with_capacity(ids.len());
+                for id in ids {
+                    match self.store.get_task(id).await {
+                        Ok(task) => tasks.push(task),
+                        Err(_) => return CommitRevealResult::StoreUnavailable,
                     }
                 }
-                Err(error) => {
-                    self.release(NonceRole::Commit).await;
-                    self.handle_task_error(task, &error, "batchCommit").await?;
-                    if is_transient(&error) {
-                        return Err(WorkerError("isolated commit temporarily failed"));
-                    }
-                }
+                CommitRevealResult::TasksLoaded { tasks }
             }
-        }
-        Ok(())
-    }
-
-    async fn wait_for_reveal(&self, tasks: &[CreateTask]) -> Result<(), WorkerError> {
-        let started = tokio::time::Instant::now();
-        loop {
-            let block = self
-                .chain
-                .current_block()
-                .await
-                .map_err(|_| WorkerError("could not read current block"))?;
-            let mut all_ready = true;
-            for task in tasks {
-                let commitment = build_commitment(task)
-                    .map_err(|_| WorkerError("stored create task cannot be encoded"))?;
+            CommitRevealOperation::CheckRecord {
+                rp_id,
+                credential_id,
+            } => match self.chain.has_record(rp_id, credential_id).await {
+                Ok(exists) => CommitRevealResult::RecordChecked { exists },
+                Err(_) => CommitRevealResult::ChainReadFailed,
+            },
+            CommitRevealOperation::GetCommitBlock { commitment } => {
+                let Ok(commitment) = parse_b256(commitment) else {
+                    return CommitRevealResult::ChainReadFailed;
+                };
                 match self.chain.get_commit_block(commitment).await {
-                    Ok(0) => match self
-                        .chain
-                        .has_record(&task.rp_id, &task.credential_id)
-                        .await
-                    {
-                        Ok(true) => {
-                            self.store
-                                .mark_done(&task.id, task.tx_hash.clone())
-                                .await
-                                .map_err(|_| WorkerError("could not persist reconciled task"))?;
-                        }
-                        Ok(false) => {
-                            self.store
-                                .mark_pending(&task.id, Some("commitment missing; re-committing"))
-                                .await
-                                .map_err(|_| WorkerError("could not reschedule task"))?;
-                            return Err(WorkerError("commitment was not found"));
-                        }
-                        Err(_) => {
-                            return Err(WorkerError("could not reconcile missing commitment"));
-                        }
+                    Ok(block) => CommitRevealResult::CommitBlock {
+                        block,
+                        now_ms: monotonic_ms(),
                     },
-                    Ok(commit_block) if block >= commit_block.saturating_add(1) => {}
-                    Ok(_) => all_ready = false,
-                    Err(_) => return Err(WorkerError("could not read commit block")),
+                    Err(_) => CommitRevealResult::ChainReadFailed,
                 }
             }
-            if all_ready {
-                return Ok(());
+            CommitRevealOperation::GetCurrentBlock => match self.chain.current_block().await {
+                Ok(block) => CommitRevealResult::CurrentBlock {
+                    block,
+                    now_ms: monotonic_ms(),
+                },
+                Err(_) => CommitRevealResult::ChainReadFailed,
+            },
+            CommitRevealOperation::Sleep { ms } => {
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+                CommitRevealResult::Slept {
+                    now_ms: monotonic_ms(),
+                }
             }
-            if started.elapsed() >= REVEAL_TIMEOUT {
-                return Err(WorkerError("commit reveal delay exceeded timeout"));
+            CommitRevealOperation::SubmitCommit { tasks } => {
+                CommitRevealResult::Tx(self.submit(NonceRole::Commit, tasks).await)
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            CommitRevealOperation::SubmitCreate { tasks } => {
+                CommitRevealResult::Tx(self.submit(NonceRole::Create, tasks).await)
+            }
+            CommitRevealOperation::MarkCommitted { task_id } => {
+                store_ack(self.store.mark_committed(task_id).await)
+            }
+            CommitRevealOperation::MarkDone { task_id, tx_hash } => {
+                store_ack(self.store.mark_done(task_id, tx_hash.clone()).await)
+            }
+            CommitRevealOperation::MarkPendingAgain { task_id, reason } => {
+                store_ack(self.store.mark_pending(task_id, Some(reason)).await)
+            }
+            CommitRevealOperation::MarkFailed {
+                task_id,
+                kind,
+                message,
+            } => store_ack(
+                self.store
+                    .mark_failed(task_id, kind.as_store_class(), message)
+                    .await,
+            ),
+            CommitRevealOperation::RecordTransientFailure { task_id, message } => {
+                store_ack(self.store.record_transient_failure(task_id, message).await)
+            }
         }
     }
 
-    async fn create_chunk(&self, tasks: &[CreateTask]) -> Result<(), WorkerError> {
-        let nonce = self.acquire(NonceRole::Create).await?;
-        match self.chain.create(tasks, nonce).await {
+    /// Send one chain write and wait for its receipt, with the nonce and
+    /// pending-tx-ledger rules unchanged from the original worker: the ledger
+    /// row is recorded on broadcast, cleared only on a definite receipt
+    /// (success or reverted), and deliberately kept on a receipt timeout so
+    /// the unstick sweep still sees a possibly-stuck tx; the cached nonce is
+    /// released on every failure path so the next send re-syncs with the
+    /// chain.
+    async fn submit(&self, role: NonceRole, tasks: &[CreateTask]) -> TxOutcome {
+        let Ok(nonce) = self.acquire(role).await else {
+            return TxOutcome::NoncePoolUnavailable;
+        };
+        let sent = match role {
+            NonceRole::Commit => self.chain.commit(tasks, nonce).await,
+            NonceRole::Create => self.chain.create(tasks, nonce).await,
+        };
+        match sent {
             Ok(hash) => {
-                self.record_pending(NonceRole::Create, nonce, &hash).await;
+                self.record_pending(role, nonce, &hash).await;
                 match self.chain.wait_for_receipt(&hash, RECEIPT_TIMEOUT).await {
                     Ok(ReceiptStatus::Success) => {
-                        self.clear_pending(NonceRole::Create, nonce).await;
-                        for task in tasks {
-                            self.store
-                                .mark_done(&task.id, Some(hash.clone()))
-                                .await
-                                .map_err(|_| WorkerError("could not persist done task"))?;
-                        }
-                        Ok(())
+                        self.clear_pending(role, nonce).await;
+                        TxOutcome::Confirmed { tx_hash: hash }
                     }
                     Ok(ReceiptStatus::Reverted) => {
-                        self.clear_pending(NonceRole::Create, nonce).await;
-                        self.release(NonceRole::Create).await;
-                        self.isolate_create(tasks).await
+                        self.clear_pending(role, nonce).await;
+                        self.release(role).await;
+                        TxOutcome::Reverted { tx_hash: hash }
                     }
                     Err(error) => {
-                        self.release(NonceRole::Create).await;
-                        self.handle_batch_error(tasks, &error, "batchCreateRecord")
-                            .await
+                        self.release(role).await;
+                        TxOutcome::ReceiptUncertain { error }
                     }
                 }
             }
             Err(error) => {
-                self.release(NonceRole::Create).await;
-                if is_transient(&error) {
-                    self.handle_batch_error(tasks, &error, "batchCreateRecord")
-                        .await
-                } else {
-                    self.isolate_create(tasks).await
-                }
+                self.release(role).await;
+                TxOutcome::SendFailed { error }
             }
         }
-    }
-
-    async fn isolate_create(&self, tasks: &[CreateTask]) -> Result<(), WorkerError> {
-        for task in tasks {
-            match self
-                .chain
-                .has_record(&task.rp_id, &task.credential_id)
-                .await
-            {
-                Ok(true) => {
-                    self.store
-                        .mark_done(&task.id, task.tx_hash.clone())
-                        .await
-                        .map_err(|_| WorkerError("could not persist reconciled task"))?;
-                    continue;
-                }
-                Ok(false) => {}
-                Err(_) => return Err(WorkerError("could not reconcile isolated task")),
-            }
-            let nonce = self.acquire(NonceRole::Create).await?;
-            match self.chain.create(std::slice::from_ref(task), nonce).await {
-                Ok(hash) => {
-                    self.record_pending(NonceRole::Create, nonce, &hash).await;
-                    match self.chain.wait_for_receipt(&hash, RECEIPT_TIMEOUT).await {
-                        Ok(ReceiptStatus::Success) => {
-                            self.clear_pending(NonceRole::Create, nonce).await;
-                            self.store
-                                .mark_done(&task.id, Some(hash))
-                                .await
-                                .map_err(|_| WorkerError("could not persist isolated task"))?;
-                        }
-                        Ok(ReceiptStatus::Reverted) => {
-                            self.clear_pending(NonceRole::Create, nonce).await;
-                            self.release(NonceRole::Create).await;
-                            self.store
-                                .mark_failed(
-                                    &task.id,
-                                    "POISON",
-                                    "createRecord transaction reverted",
-                                )
-                                .await
-                                .map_err(|_| WorkerError("could not persist failed task"))?;
-                        }
-                        Err(error) => {
-                            self.release(NonceRole::Create).await;
-                            self.handle_task_error(task, &error, "createRecord").await?;
-                            return Err(WorkerError("isolated create receipt wait failed"));
-                        }
-                    }
-                }
-                Err(error) => {
-                    self.release(NonceRole::Create).await;
-                    self.handle_task_error(task, &error, "createRecord").await?;
-                    if is_transient(&error) {
-                        return Err(WorkerError("isolated create temporarily failed"));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_batch_error(
-        &self,
-        tasks: &[CreateTask],
-        error: &ChainError,
-        operation: &str,
-    ) -> Result<(), WorkerError> {
-        for task in tasks {
-            self.handle_task_error(task, error, operation).await?;
-        }
-        if is_transient(error) {
-            Err(WorkerError("chain write temporarily failed"))
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn handle_task_error(
-        &self,
-        task: &CreateTask,
-        error: &ChainError,
-        operation: &str,
-    ) -> Result<(), WorkerError> {
-        let message = format!("{operation}: {error}");
-        if is_record_exists_error(error) {
-            self.store
-                .mark_done(&task.id, task.tx_hash.clone())
-                .await
-                .map_err(|_| WorkerError("could not persist reconciled task"))?;
-        } else if is_wallet_conflict_error(error) {
-            self.store
-                .mark_failed(&task.id, "CONFLICT", &message)
-                .await
-                .map_err(|_| WorkerError("could not persist conflict task"))?;
-        } else if is_transient(error) {
-            self.retry_task(task, &message).await?;
-        } else {
-            self.store
-                .mark_failed(&task.id, "POISON", &message)
-                .await
-                .map_err(|_| WorkerError("could not persist poison task"))?;
-        }
-        Ok(())
-    }
-
-    async fn retry_task(&self, task: &CreateTask, message: &str) -> Result<(), WorkerError> {
-        self.store
-            .record_transient_failure(&task.id, message)
-            .await
-            .map_err(|_| WorkerError("could not persist task retry"))?;
-        Ok(())
     }
 
     async fn acquire(&self, role: NonceRole) -> Result<u64, WorkerError> {
@@ -589,7 +367,7 @@ impl CreateWorker {
                 self.chain
                     .pending_nonce(wallet_role)
                     .await
-                    .map_err(|_| WorkerError("could not acquire pending chain nonce"))?,
+                    .map_err(|_| WorkerError::new("could not acquire pending chain nonce"))?,
             );
         }
         let nonce = value.expect("nonce was initialized");
@@ -617,6 +395,13 @@ impl CreateWorker {
     }
 }
 
+fn store_ack<T>(result: Result<T, crate::store::StoreError>) -> CommitRevealResult {
+    match result {
+        Ok(_) => CommitRevealResult::Persisted,
+        Err(_) => CommitRevealResult::StoreUnavailable,
+    }
+}
+
 async fn ensure_consumer_group(
     client: &IggyClient,
     stream: &Identifier,
@@ -627,7 +412,7 @@ async fn ensure_consumer_group(
     if client
         .get_consumer_group(stream, topic, group)
         .await
-        .map_err(|_| WorkerError("could not inspect Iggy consumer group"))?
+        .map_err(|_| WorkerError::new("could not inspect Iggy consumer group"))?
         .is_some()
     {
         return Ok(());
@@ -642,17 +427,12 @@ async fn ensure_consumer_group(
     if client
         .get_consumer_group(stream, topic, group)
         .await
-        .map_err(|_| WorkerError("could not inspect Iggy consumer group"))?
+        .map_err(|_| WorkerError::new("could not inspect Iggy consumer group"))?
         .is_some()
     {
         return Ok(());
     }
-    Err(WorkerError("could not create Iggy consumer group"))
-}
-
-fn deduplicate_by_id(tasks: &mut Vec<CreateTask>) {
-    let mut seen = std::collections::HashSet::new();
-    tasks.retain(|task| seen.insert(task.id.clone()));
+    Err(WorkerError::new("could not create Iggy consumer group"))
 }
 
 fn role_name(role: NonceRole) -> &'static str {
@@ -662,6 +442,8 @@ fn role_name(role: NonceRole) -> &'static str {
     }
 }
 
+/// Wall-clock milliseconds, used for the pending-tx ledger whose ages are
+/// compared across processes by the unstick sweep.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -669,12 +451,30 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Monotonic milliseconds for the Core's reveal-deadline arithmetic. The Core
+/// only ever compares these timestamps to each other, so a process-local
+/// monotonic clock is correct and immune to wall-clock steps — matching the
+/// original worker's `Instant`-based elapsed check.
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
 #[derive(Debug)]
-struct WorkerError(&'static str);
+struct WorkerError(String);
+
+impl WorkerError {
+    fn new(message: &str) -> Self {
+        Self(message.to_owned())
+    }
+}
 
 impl std::fmt::Display for WorkerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.0)
+        formatter.write_str(&self.0)
     }
 }
 
@@ -693,12 +493,10 @@ mod e2e_chain_tests {
     use tokio::sync::Mutex;
 
     use super::{CreateWorker, NonceManager};
-    use crate::{
-        chain::Chain,
-        config::Config,
-        contract::{build_wallet_ref, default_metadata},
-        store::RedisStore,
-        types::{CreateTask, TaskStatus},
+    use crate::{chain::Chain, config::Config, store::RedisStore};
+    use p256_registrar::{
+        task::{CreateTask, TaskStatus},
+        wallet::{build_wallet_ref, default_metadata},
     };
 
     fn now_ms() -> u64 {
