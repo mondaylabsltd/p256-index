@@ -35,3 +35,5 @@ backups/
 contracts/out
 contracts/cache
 contracts/broadcast
+
+.VSCodeCounter
