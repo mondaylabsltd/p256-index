@@ -1,66 +1,143 @@
-# WebAuthn P256 Public Key Index Service
+# WebAuthn P256 Public Key Registry Service
 
-The WebAuthn P256 Public Key Index is a single Rust service exposing a REST API
-for the Gnosis-chain V2 contract.
+A neutral, permissionless registry of P-256 passkey public keys: anyone may
+store data about keys they hold, on Gnosis chain and in this service's
+database. What a key is for — deriving a wallet, assembling an identity,
+anything else — is entirely the storer's business, carried in an opaque
+per-unit `metadata` payload. Built by Vela Wallet; Vela is the registry's
+first client, not its owner.
 
-| Contract | Gnosis address |
-| --- | --- |
-| WebAuthnP256PublicKeyIndex | 0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3 |
-| WebAuthnP256BatchHelper | 0xc7B0db5d4974abA3EA25780f40Bf369CC013a16E |
+## The trust model
+
+- **The public key is the primary key, and possession is the only thing
+  verified — on-chain.** Every stored entry requires a WebAuthn-formatted
+  P-256 assertion by its own key over a storage-authorization challenge
+  (`keccak256(abi.encode(chainid, registry, rpId, publicKey, unitNonce))`),
+  verified by the contract via the EIP-7951/RIP-7212 precompile. Nobody can
+  attach data to a key they do not hold.
+- **Nothing else is exclusive or interpreted.** A key may appear in any
+  number of registration units; queries return lists and readers filter by
+  their own metadata schema. Credential ids, display names, wallet
+  derivation preimages all live inside `metadata` (≤1024 bytes, opaque).
+- **A registration unit** is 1..7 members sharing one rpId, one metadata
+  payload and one single-use `unitNonce`, appended atomically in one
+  `register` transaction. The nonce is consumed on-chain: every proof dies
+  with its registration, and identical content registers only once.
+- **Reads are list-shaped and id-stable.** Entry ids are sequential and
+  immutable — clients that remember their entry ids read in O(1) forever.
+  Discovery without local state: recover the two candidate keys from any
+  live assertion signature and query both — only a held key can have
+  entries, so at most one bucket is non-empty.
+
+## Client flow
+
+1. At flow start, pick a random 32-byte `unitNonce`
+   (`POST /api/challenge` with an empty body suggests one).
+2. For each passkey: `navigator.credentials.create()` (collect the public
+   key), then one `navigator.credentials.get()` whose challenge is the
+   member's storage-authorization challenge (`POST /api/challenge` with
+   `{rpId, publicKey, unitNonce}` computes it, or compute it locally).
+   Two prompts per key, any order, any device, independently.
+3. `POST /api/register` with the unit. The service verifies every proof
+   (pure Rust mirror of the contract check — invalid proofs never reach the
+   chain), durably queues the unit (Redis + Iggy, two-phase), and the worker
+   lands it in one `register` transaction. Poll `GET /api/task/{id}`.
+4. Before the transaction lands, `GET /api/query?publicKey=` already answers
+   with a `_queue` marker: data handed to this service is never invisible.
 
 ## Architecture
 
 - The Cargo workspace has two crates: `p256-registrar` owns the business
-  vocabulary and decision rules (task lifecycle, admission types, on-chain
-  protocol encoding, chain-error classification, Safe wallet derivation) and
-  is deliberately I/O-free; `p256-index-server` is the shell that wires those
-  rules to Axum, Redis, Iggy, Gnosis RPC and Telegram.
-- Rust/Axum provides the public API on port 11256 by default.
-- Redis holds the shared response cache, rate limits, task status, duplicate
-  indexes, queue-depth projection, and DLQ projection.
-- Iggy provides the durable p256-index / create stream. A shared consumer
-  group supplies ordered, at-least-once processing.
-- The consumer first persists the task in Redis, then processes batch
-  commit-reveal calls through WebAuthnP256BatchHelper.
-- Redis admission and Iggy append are intentionally two-phase: if an Iggy
-  acknowledgement is lost, the same task ID can safely be re-enqueued and the
-  consumer remains idempotent.
-- Contract reads use a bounded Gnosis RPC failover pool; fresh Redis cache hits
-  do not contact RPC providers.
+  vocabulary and decision rules (task lifecycle, proof verification,
+  admission, lookup/cache policy, submission state machine, gas policy,
+  chain-error classification) and is deliberately I/O-free;
+  `p256-index-server` is the shell that wires those rules to Axum, Redis,
+  Iggy, Gnosis RPC and Telegram.
+- Redis holds the response cache, rate limits, task status, the
+  nonce-idempotency and per-key placeholders, queue-depth and DLQ
+  projections, and the broadcast ledger.
+- Iggy provides the durable registration stream (at-least-once, ordered);
+  Redis admission and Iggy append are two-phase so a lost acknowledgement
+  is safely re-enqueued and the consumer stays idempotent.
+- The worker submits ONE unit per transaction (no batching, no
+  commit-reveal, a single funded wallet): failures attribute to exactly one
+  task; a reverted receipt reconciles by content hash and resends once to
+  surface the revert reason for classification.
+- Contract reads use a bounded Gnosis RPC failover pool; fresh cache hits
+  never touch RPC; stale responses are served marked `_stale` during RPC
+  outages.
 
-POST /api/create retains the public contract: it returns 202 with
-{ id, status: "pending" }, status reads redact pre-reveal sensitive fields,
-and an existing on-chain record returns 201 with status "done".
+## API
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| POST | /api/register | Verify proofs and durably enqueue one unit (1..7 members) |
+| GET | /api/task/{id} | Task status (full disclosure; no proofs echoed) |
+| POST | /api/challenge | Compute a member's storage challenge; empty body suggests a unitNonce |
+| GET | /api/query?publicKey= | Paginated entries for a key (`_queue` marker pre-chain) |
+| GET | /api/query?entryId= | One entry by its immutable id |
+| GET | /api/stats/total | {totalEntries, totalUnits, totalRpIds} |
+| GET | /api/stats/sites | Paginated rpId list |
+| GET | /api/stats/keys?rpId= | Paginated entries under an rpId |
+| GET | /api/health | Health, RPC circuit, queue/DLQ metrics, registry address |
+
+Register body shape:
+
+~~~json
+{
+  "rpId": "example.com",
+  "metadata": "0x…",
+  "unitNonce": "0x…32 bytes…",
+  "members": [{
+    "publicKey": "04…65 bytes…",
+    "attestation": "0x…20 bytes, optional…",
+    "proof": {
+      "authenticatorData": "…", "clientDataJSON": "…",
+      "challengeIndex": 23, "typeIndex": 1, "r": "0x…", "s": "0x…"
+    }
+  }]
+}
+~~~
+
+`attestation` is 20 versioned bytes of registration-time WebAuthn signals
+(version, AAGUID, authData flags, attachment, transports) — shape-checked,
+truthfulness is the storer's claim; display mapping is a client concern.
+
+Conflicts: 409 only for unitNonce problems (a different unit on an in-flight
+nonce, or a nonce already consumed on-chain — the proofs are void, re-enroll
+with a fresh nonce). Identical content already on-chain answers 200 "done".
 
 ## Configuration
 
-Copy .env.example to .env. Redis and Iggy are mandatory; the service fails fast
-if it cannot reach either one.
+Copy .env.example to .env. Redis and Iggy are mandatory; the service fails
+fast if it cannot reach either one. `P256_INDEX_CONTRACT_ADDRESS` (the
+deployed registry) is always required.
 
 ~~~dotenv
 P256_INDEX_IGGY_URL=iggy+tcp://user:password@iggy.example:5100?reconnection_retries=5&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=3s&nodelay=true
 P256_INDEX_REDIS_URL=redis://redis.example:6379/0
-PRIVATE_KEY=0x...
+P256_INDEX_CONTRACT_ADDRESS=0x…
+PRIVATE_KEY=0x…
 ~~~
 
-PRIVATE_KEY is optional only for read-only operation. When it is absent, the
-HTTP API starts but the Iggy consumer is disabled, so newly created tasks remain
-pending. The commit wallet is deterministically derived as
-SHA-256(PRIVATE_KEY bytes) to keep the established on-chain behavior.
+PRIVATE_KEY is optional only for read-only operation: without it the HTTP
+API serves reads but the Iggy consumer is disabled and new tasks stay
+pending. The service pays gas for all registrations; the per-IP (5/min) and
+global create budgets are the cost gate.
 
-Iggy creates this topology on first startup (the provisioner identity needs
-permission to create it):
+## Contract
 
-| Resource | Name |
-| --- | --- |
-| stream | p256-index |
-| topic | create |
-| partitions | 1 |
-| consumer group | p256-index-server-v1 |
+`contracts/src/WebAuthnP256PublicKeyRegistry.sol` — deployment requires a
+chain with the P256VERIFY precompile (EIP-7951/RIP-7212) at 0x100 (live on
+Gnosis; verify with the cast one-liner in
+`contracts/script/DeployRegistry.s.sol` before deploying).
 
-Use a separate, least-privilege consumer/provisioner Iggy identity in
-production through P256_INDEX_IGGY_CONSUMER_URL and
-P256_INDEX_IGGY_PROVISIONER_URL.
+~~~sh
+cd contracts && forge test
+forge script script/DeployRegistry.s.sol --rpc-url $RPC --broadcast
+~~~
+
+Gas: a 1-member unit is ~0.7M gas, 7 members ~3.1M (linear per member).
 
 ## Run and verify
 
@@ -72,95 +149,36 @@ cargo test --workspace --locked
 cargo run --release -p p256-index-server
 ~~~
 
-The Rust binary loads a local .env for development and uses regular process
-environment variables in systemd/container deployments.
-
-## API compatibility
-
-The following routes and JSON field names are retained:
-
-| Method | Route | Purpose |
-| --- | --- | --- |
-| GET | /api/challenge | Base64url random challenge |
-| POST | /api/create | Validate and durably enqueue a public-key registration |
-| GET | /api/create/:id | Registration status; redacts unrevealed fields |
-| GET | /api/query?rpId=&credentialId= | Query a record by credential |
-| GET | /api/query?walletRef= | Query a record by deterministic wallet reference |
-| GET | /api/stats/total | Total credential count |
-| GET | /api/stats/sites | Paginated site list |
-| GET | /api/stats/keys?rpId= | Paginated key list for a site |
-| GET | /api/health | Health, RPC circuit, and queue/DLQ metrics |
-
-The service preserves CORS support (GET, POST, OPTIONS), request-body and
-P-256 validation, walletRef binding, 5/minute per-IP creates, global create
-budgeting, read limiting for cache misses, stale cache responses during RPC
-outages, and the pending → committed → done | failed status machine.
-
-## Reliability and alerting
-
-The queue worker runs alongside a maintenance loop that provides the operational
-safety net for an unattended, fund-spending queue:
-
-- Daily heartbeat to Telegram (queue depth, DLQ, create/commit wallet balances,
-  funding runway, uptime): a silent channel becomes a signal.
-- Operator alerts for the failure modes that otherwise fail silently — low
-  create-wallet funding runway, an open RPC read circuit, DLQ growth, and a
-  nonce the unstick sweep cannot clear.
-- Stuck-nonce unstick sweep: a broadcast whose receipt never arrives jams the
-  wallet nonce and stalls every later send. The sweep records each in-flight tx
-  in a Redis broadcast ledger and replaces a genuinely stuck one with a
-  same-nonce, zero-value self-transfer at 150% gas.
-- Exponential backoff on transient chain/RPC failures (5s → 15s → 45s …, clamped
-  to 60s) instead of hammering a failing dependency.
-- Commit-batch poison isolation: a deterministically-reverting commitment is
-  quarantined individually so innocent items still make progress.
-
-Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable delivery; without them the
-alerts are logged instead. Set RELEASE to include a build tag in the heartbeat.
-The daily heartbeat doubles as a liveness signal: if it stops arriving, the
-process, its chain reads, or the Telegram path is broken.
-
-## End-to-end tests
-
-Contract- and chain-level behavior is covered by gated integration tests (kept
-out of CI, which has no infrastructure):
+Gated integration tests (kept out of CI, which has no infrastructure):
 
 ~~~sh
-# HTTP + queue contract against real Redis and Iggy:
+# HTTP contract over real Redis:
+P256_INDEX_TEST_REDIS_URL='redis://127.0.0.1:6379/0' \
+  cargo test -p p256-index-server --lib -- --ignored http_contract
+
+# HTTP + queue contract over real Redis and Iggy:
 P256_INDEX_TEST_REDIS_URL='redis://127.0.0.1:6379/0' \
 P256_INDEX_TEST_IGGY_URL='iggy+tcp://user:pass@127.0.0.1:5100' \
   cargo test --test e2e -- --ignored
 
-# Full create -> chain -> confirmed path (real Gnosis write, spends gas):
+# Full register -> chain -> confirmed (real Gnosis write, spends gas):
 P256_INDEX_E2E_CHAIN=1 cargo test --lib -- --ignored \
-  e2e_chain_tests::create_persists_on_chain_end_to_end
+  e2e_chain_tests::register_persists_on_chain_end_to_end
 ~~~
 
-## Operational notes
+## Reliability and alerting
 
-Only one writer may use a given PRIVATE_KEY at a time: a second concurrent
-writer with the same key causes nonce contention. Start the service with Redis
-and Iggy, then confirm /api/health and a read-only query before enabling writes.
+- Daily Telegram heartbeat (queue depth, DLQ, wallet balance, funding
+  runway, uptime): a silent channel becomes a signal.
+- Operator alerts for low funding runway, an open RPC read circuit, DLQ
+  growth, and a nonce the unstick sweep cannot clear.
+- Stuck-nonce unstick sweep with a Redis broadcast ledger and monotonic
+  same-nonce replacement pricing.
+- Exponential backoff on transient chain/RPC failures (5s → 15s → 45s …,
+  clamped to 60s).
+- Per-task poison quarantine: one unit per transaction means a
+  deterministic revert isolates exactly one task into the DLQ.
 
-## Deployment
-
-Build a release binary for the target architecture and install it as
-/opt/webauthnp256-publickey-index/current/p256-index-server. The supplied
-systemd unit reads /opt/webauthnp256-publickey-index/data/.env.
-
-Tagged releases (push a v* tag) also publish per-platform binary archives and a
-multi-arch Docker image via .github/workflows/release.yml. The Docker jobs need
-the repository variable DOCKERHUB_USERNAME and secret DOCKERHUB_TOKEN.
-
-## Docker / Compose
-
-The service alone runs in a container (Redis and Iggy stay external).
-docker-compose.yaml builds p256-index-server/Dockerfile and reads
-p256-index-server/.env:
-
-~~~sh
-docker compose up --build
-~~~
-
-When Redis and Iggy run on the Docker host, point P256_INDEX_REDIS_URL and
-P256_INDEX_IGGY_URL at host.docker.internal (see the note in docker-compose.yaml).
+Only one writer may use a given PRIVATE_KEY at a time. Set
+TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable alert delivery; RELEASE
+adds a build tag to the heartbeat.

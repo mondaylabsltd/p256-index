@@ -1,56 +1,105 @@
-# WebAuthn P256 Public Key Index 服务
+# WebAuthn P256 Public Key Registry 服务
 
-面向 Gnosis 链 V2 合约的单一 Rust 服务，提供 REST API。
+一个中立、无权限的 P-256 passkey 公钥登记处:任何人都可以把自己持有的密钥
+数据存到 Gnosis 链和本服务的数据库。这把钥匙用来干什么——派生钱包、组装
+身份、还是别的用途——完全由存储方决定,承载在单元级的不透明 `metadata`
+里。由 Vela Wallet 构建;Vela 是它的第一个客户,不是它的主人。
 
-| 合约 | Gnosis 地址 |
-| --- | --- |
-| WebAuthnP256PublicKeyIndex | 0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3 |
-| WebAuthnP256BatchHelper | 0xc7B0db5d4974abA3EA25780f40Bf369CC013a16E |
+## 信任模型
+
+- **公钥是主键,持有是唯一被验证的东西——在链上验证。**每条存储都要求
+  该公钥自己的 WebAuthn 格式 P-256 assertion,签在存储授权挑战
+  `keccak256(abi.encode(chainid, registry, rpId, publicKey, unitNonce))`
+  上,合约通过 EIP-7951/RIP-7212 预编译验签。没有人能往自己不持有的
+  钥匙下面挂数据。
+- **除此之外零独占、零解释。**一把钥匙可以出现在任意多个注册单元里;
+  查询返回列表,读方按自己的 metadata schema 过滤。credentialId、显示
+  名、钱包派生前像,全部编码在 `metadata`(≤1024 字节,不透明)里。
+- **注册单元** = 1..7 个成员共享一个 rpId、一份 metadata、一个一次性
+  `unitNonce`,一笔 `register` 交易原子落地。nonce 上链即消耗:所有
+  证明随注册作废,相同内容永久只注册一次。
+- **读取是列表形态且 id 恒定。**entry id 顺序分配、永不变化——记住
+  自己的 entry id 就能永远 O(1) 直读。无本地状态时的发现:从任意一次
+  登录签名恢复两个候选公钥、各查一次——只有被持有的钥匙才可能有条目,
+  所以至多一个桶非空。
+
+## 客户端流程
+
+1. 流程开始时生成随机 32 字节 `unitNonce`(空 body `POST /api/challenge`
+   可以给建议值)。
+2. 每把 passkey:`create()` 收集公钥,然后一次 `get()`,其挑战 = 该成员
+   的存储授权挑战(`POST /api/challenge` 带 `{rpId, publicKey, unitNonce}`
+   可代算,也可本地算)。每把钥匙两次弹窗,顺序任意、设备任意、彼此独立。
+3. `POST /api/register` 提交单元。服务端逐个验签(合约校验的纯 Rust
+   镜像——无效证明永远到不了链上)、双阶段持久化入队(Redis + Iggy),
+   worker 一笔交易落链。轮询 `GET /api/task/{id}`。
+4. 上链前 `GET /api/query?publicKey=` 已经用 `_queue` 标记应答:交给
+   本服务的数据绝不会有不可见窗口。
 
 ## 架构
 
-- Cargo workspace 含两个 crate：`p256-registrar` 拥有业务词汇与决策规则
-  （任务生命周期、准入类型、链上协议编解码、链错误分类、Safe 钱包推导），
-  刻意不含任何 I/O；`p256-index-server` 是 Shell，把这些规则接到
-  Axum、Redis、Iggy、Gnosis RPC 与 Telegram。
-- Rust/Axum 提供公开 API，默认端口 11256。
-- Redis 保存共享响应缓存、限流、任务状态、去重索引、队列深度投影与 DLQ 投影。
-- Iggy 提供持久化的 p256-index / create 流；共享消费组提供有序、至少一次处理。
-- 消费者先把任务持久化到 Redis，再通过 WebAuthnP256BatchHelper 处理批量
-  commit-reveal 调用。
-- Redis 准入与 Iggy 追加刻意分两阶段：若 Iggy 确认丢失，同一任务 ID 可安全重投，
-  消费者保持幂等。
-- 合约读取使用有界的 Gnosis RPC 故障转移池；Redis 缓存新鲜命中不触达 RPC。
+- Cargo workspace 两个 crate:`p256-registrar` 拥有业务词汇与决策规则
+  (任务生命周期、验签、准入、查询/缓存策略、提交状态机、gas 策略、
+  链错误分类),刻意零 I/O;`p256-index-server` 是 shell,接 Axum、
+  Redis、Iggy、Gnosis RPC 与 Telegram。
+- Redis:响应缓存、限流、任务状态、nonce 幂等键与成员公钥占位、队列
+  深度/DLQ 投影、广播账本。
+- Iggy:持久化注册流(至少一次、有序);Redis 准入与 Iggy 追加两阶段,
+  丢确认可安全重投,消费者幂等。
+- worker **一单元一交易**(无批量、无 commit-reveal、单资金钱包):
+  失败精确归属;revert 回执先按内容哈希对账、再重发一次以取得 revert
+  原因用于分类。
+- 链读走有界 RPC 故障转移池;缓存新鲜命中不触达 RPC;RPC 故障期间以
+  `_stale` 标记服务陈旧副本。
 
-POST /api/create 保持公开契约：返回 202 与 { id, status: "pending" }，状态读取
-会隐藏揭示前的敏感字段，已存在的链上记录返回 201 与 status "done"。
+## API
+
+| 方法 | 路由 | 用途 |
+| --- | --- | --- |
+| POST | /api/register | 验签并持久化入队一个单元(1..7 成员) |
+| GET | /api/task/{id} | 任务状态(全量披露;不回显证明) |
+| POST | /api/challenge | 计算成员存储挑战;空 body 给 unitNonce 建议 |
+| GET | /api/query?publicKey= | 某公钥的分页条目(上链前带 `_queue` 标记) |
+| GET | /api/query?entryId= | 按恒定 id 取单条 |
+| GET | /api/stats/total | {totalEntries, totalUnits, totalRpIds} |
+| GET | /api/stats/sites | 分页 rpId 列表 |
+| GET | /api/stats/keys?rpId= | 某 rpId 下的分页条目 |
+| GET | /api/health | 健康、RPC 熔断、队列/DLQ 指标、registry 地址 |
+
+`attestation` 为 20 字节版本化注册期信号(版本、AAGUID、authData flags、
+attachment、transports)——形状校验,真实性属存储方声明;展示映射归客户端。
+
+409 只出现在 unitNonce 问题上(在途 nonce 承载了不同单元,或 nonce 已被
+链上消耗——证明作废,换新 nonce 重新收集签名)。相同内容已上链则回 200
+"done"。
 
 ## 配置
 
-把 .env.example 复制为 .env。Redis 与 Iggy 为必需依赖；无法连接任一者时服务
-立即失败退出。
+复制 .env.example 为 .env。Redis 与 Iggy 必需,连不上即快速失败;
+`P256_INDEX_CONTRACT_ADDRESS`(已部署的 registry)始终必需。
 
 ~~~dotenv
 P256_INDEX_IGGY_URL=iggy+tcp://user:password@iggy.example:5100?reconnection_retries=5&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=3s&nodelay=true
 P256_INDEX_REDIS_URL=redis://redis.example:6379/0
-PRIVATE_KEY=0x...
+P256_INDEX_CONTRACT_ADDRESS=0x…
+PRIVATE_KEY=0x…
 ~~~
 
-PRIVATE_KEY 仅在只读运行时可省略。缺失时 HTTP API 仍启动，但 Iggy 消费者被禁用，
-新建任务保持 pending。commit 钱包按 SHA-256(PRIVATE_KEY bytes) 确定性推导，以
-保持既有链上行为。
+PRIVATE_KEY 仅在只读运行时可省略:HTTP 读 API 照常,Iggy 消费者禁用,新
+任务保持 pending。gas 由本服务支付;每 IP 5/分钟与全局创建预算是成本闸门。
 
-首次启动时 Iggy 会创建以下拓扑（provisioner 身份需有创建权限）：
+## 合约
 
-| 资源 | 名称 |
-| --- | --- |
-| stream | p256-index |
-| topic | create |
-| partitions | 1 |
-| consumer group | p256-index-server-v1 |
+`contracts/src/WebAuthnP256PublicKeyRegistry.sol` ——部署要求目标链在
+0x100 有 P256VERIFY 预编译(EIP-7951/RIP-7212,Gnosis 已上线;部署前用
+`contracts/script/DeployRegistry.s.sol` 注释里的 cast 一行命令实测)。
 
-生产环境请通过 P256_INDEX_IGGY_CONSUMER_URL 与 P256_INDEX_IGGY_PROVISIONER_URL
-使用独立的最小权限消费者/provisioner 身份。
+~~~sh
+cd contracts && forge test
+forge script script/DeployRegistry.s.sol --rpc-url $RPC --broadcast
+~~~
+
+gas:单成员单元约 70 万,7 成员约 310 万(按成员线性)。
 
 ## 本地检查
 
@@ -62,83 +111,30 @@ cargo test --workspace --locked
 cargo run --release -p p256-index-server
 ~~~
 
-Rust 二进制在开发时加载本地 .env，在 systemd/容器部署中使用常规进程环境变量。
-
-## 接口兼容
-
-保留以下路由与 JSON 字段名：
-
-| 方法 | 路由 | 用途 |
-| --- | --- | --- |
-| GET | /api/challenge | Base64url 随机挑战 |
-| POST | /api/create | 校验并持久化入队一次公钥注册 |
-| GET | /api/create/:id | 注册状态；隐藏未揭示字段 |
-| GET | /api/query?rpId=&credentialId= | 按凭证查询记录 |
-| GET | /api/query?walletRef= | 按确定性钱包引用查询记录 |
-| GET | /api/stats/total | 凭证总数 |
-| GET | /api/stats/sites | 分页站点列表 |
-| GET | /api/stats/keys?rpId= | 某站点的分页公钥列表 |
-| GET | /api/health | 健康、RPC 熔断与队列/DLQ 指标 |
-
-服务保留 CORS（GET, POST, OPTIONS）、请求体与 P-256 校验、walletRef 绑定、
-每 IP 每分钟 5 次创建、全局创建预算、缓存未命中的读限流、RPC 故障期间的陈旧
-缓存响应，以及 pending → committed → done | failed 状态机。
-
-## 可靠性与告警
-
-队列 worker 旁挂一个维护循环，为无人值守、会花钱的队列提供运维安全网：
-
-- 每日心跳（队列深度、DLQ、create/commit 钱包余额、可用创建次数、运行时长）
-  经 Telegram 发送；
-- 运维告警：create 钱包资金不足、RPC 读熔断打开、DLQ 增长、卡死 nonce 无法解卡；
-- 卡死 nonce 解卡扫描：用 Redis 广播账本记录在途交易，对确实卡死的 nonce 以
-  150% gas 发同 nonce 零值自转覆盖；
-- 瞬时链上失败指数退避（5s → 15s → 45s …，上限 60s）；
-- commit 批次 poison 隔离：把确定性 revert 的单条 commitment 单独隔离，其余
-  继续推进。
-
-配置 TELEGRAM_BOT_TOKEN 与 TELEGRAM_CHAT_ID 后才会真正投递，否则只记日志。
-设置 RELEASE 可在心跳中带上构建标签。每日心跳同时是存活信号：若心跳停止到达，
-说明进程、链读取或 Telegram 通道出了问题。
-
-## 端到端测试
-
-契约级与链级行为由门控集成测试覆盖（不在无基础设施的 CI 中运行）：
+门控集成测试(不进无基础设施的 CI):
 
 ~~~sh
-# 真实 Redis + Iggy 的 HTTP + 队列契约：
+# 真实 Redis 上的 HTTP 契约:
+P256_INDEX_TEST_REDIS_URL='redis://127.0.0.1:6379/0' \
+  cargo test -p p256-index-server --lib -- --ignored http_contract
+
+# 真实 Redis + Iggy 的 HTTP + 队列契约:
 P256_INDEX_TEST_REDIS_URL='redis://127.0.0.1:6379/0' \
 P256_INDEX_TEST_IGGY_URL='iggy+tcp://user:pass@127.0.0.1:5100' \
   cargo test --test e2e -- --ignored
 
-# 完整 create -> 链上 -> confirmed（真实 Gnosis 写入，会花费 gas）：
+# 完整 register -> 链上 -> confirmed(真实 Gnosis 写入,花费 gas):
 P256_INDEX_E2E_CHAIN=1 cargo test --lib -- --ignored \
-  e2e_chain_tests::create_persists_on_chain_end_to_end
+  e2e_chain_tests::register_persists_on_chain_end_to_end
 ~~~
 
-## 运维注意
+## 可靠性与告警
 
-同一 PRIVATE_KEY 同一时刻只能有一个写入进程：再起一个用同一私钥的写入进程会导致
-nonce 争用。用 Redis 与 Iggy 启动服务，确认 /api/health 与一次只读查询后再开启写入。
+- 每日 Telegram 心跳(队列深度、DLQ、钱包余额、可注册次数、运行时长);
+- 运维告警:资金 runway 低、RPC 读熔断、DLQ 增长、无法解卡的 nonce;
+- 卡死 nonce 解卡扫描(Redis 广播账本 + 单调同 nonce 替换定价);
+- 瞬时故障指数退避(5s → 15s → 45s …,上限 60s);
+- 单任务 poison 隔离:一单元一交易,确定性 revert 精确进 DLQ。
 
-## 部署
-
-为目标架构构建 release 二进制并安装到
-/opt/webauthnp256-publickey-index/current/p256-index-server。随附的 systemd 单元
-读取 /opt/webauthnp256-publickey-index/data/.env。
-
-打 v* tag 的发布还会通过 .github/workflows/release.yml 发布各平台二进制归档与
-多架构 Docker 镜像。Docker 作业需要仓库变量 DOCKERHUB_USERNAME 与 secret
-DOCKERHUB_TOKEN。
-
-## Docker / Compose
-
-仅服务本身在容器中运行（Redis 与 Iggy 仍为外部依赖）。
-docker-compose.yaml 构建 p256-index-server/Dockerfile 并读取 p256-index-server/.env：
-
-~~~sh
-docker compose up --build
-~~~
-
-当 Redis 与 Iggy 运行在 Docker 宿主机上时，把 P256_INDEX_REDIS_URL 与
-P256_INDEX_IGGY_URL 指向 host.docker.internal（见 docker-compose.yaml 中的说明）。
+同一 PRIVATE_KEY 同时只能有一个写入进程。配置 TELEGRAM_BOT_TOKEN 与
+TELEGRAM_CHAT_ID 启用告警投递;RELEASE 在心跳中带构建标签。
