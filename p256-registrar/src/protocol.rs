@@ -1,85 +1,78 @@
-//! The on-chain index protocol: contract addresses, calldata encoding,
-//! response decoding, commit-reveal commitment construction, and chain-error
+//! The on-chain registry protocol: calldata encoding, response decoding,
+//! challenge construction, and the single home for chain-error
 //! classification.
 //!
-//! This module is the single home for the protocol's error vocabulary. The
-//! four classification predicates below used to live in the server's
-//! `chain.rs` as overlapping string matches (`is_revert` and `is_transient`
-//! are deliberate near-inverses); they are kept byte-for-byte compatible and
-//! locked in by the truth-table tests at the bottom.
-
-use std::str::FromStr;
+//! The registry (`WebAuthnP256PublicKeyRegistry`) is an append-only log of
+//! possession-proven P-256 public keys. There is one write —
+//! `register(rpId, metadata, unitNonce, members)` — and read views joined as
+//! `EntryView`. No commit-reveal exists: a registration is one transaction.
 
 use alloy::{
-    primitives::{Address, B256, Bytes, U256, keccak256},
+    primitives::{Address, B256, U256, keccak256},
     sol,
     sol_types::{SolCall, SolValue},
 };
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{lookup::Record, task::CreateTask};
+use crate::lookup::Entry;
+use crate::task::RegisterTask;
 
-/// Default active index. Override with P256_INDEX_CONTRACT_ADDRESS to point at
-/// the V3 deployment at cutover (V3 reads fall back to V2 on-chain, so the
-/// server needs no dual-address read logic of its own).
-pub const CONTRACT_ADDRESS: &str = "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3";
-/// The frozen V2 index — same value V3 embeds as its V2_ADDRESS fallback.
-/// Admission probes it directly to detect cross-version walletRef conflicts.
-pub const V2_CONTRACT_ADDRESS: &str = "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3";
-pub const BATCH_HELPER_ADDRESS: &str = "0xc7B0db5d4974abA3EA25780f40Bf369CC013a16E";
 pub const CHAIN_ID: u64 = 100;
 
-pub type SiteEntry = (String, u64, u64);
+/// Revert selectors of the registry's terminal classifications.
+pub const SELECTOR_NONCE_ALREADY_USED: &str = "0x8c242285";
+pub const SELECTOR_UNIT_ALREADY_REGISTERED: &str = "0x3cd13628";
+pub const SELECTOR_INVALID_PROOF: &str = "0x09bde339";
+
+/// keccak("UnitRegistered(uint256,bytes32,uint256,uint256)") — the receipt
+/// log the shell parses to learn a confirmed unit's ids.
+pub const UNIT_REGISTERED_TOPIC: &str =
+    "0xb98a5d6ba38178d12f1bddae50c0268ec87d36ee974b0e7ac85d2f8ae5c9e856";
 
 sol! {
-    struct PublicKeyRecord {
-        string rpId;
-        string credentialId;
-        bytes32 walletRef;
+    struct EntryViewSol {
+        uint256 entryId;
+        uint256 unitId;
         bytes publicKey;
-        string name;
-        string initialCredentialId;
+        bytes attestation;
+        string rpId;
         bytes metadata;
+        uint64 firstEntryId;
+        uint32 memberCount;
         uint256 createdAt;
     }
 
-    struct CreateParams {
-        string rpId;
-        string credentialId;
-        bytes32 walletRef;
-        bytes publicKey;
-        string name;
-        string initialCredentialId;
-        bytes metadata;
+    struct ProofSol {
+        bytes authenticatorData;
+        string clientDataJSON;
+        uint256 challengeIndex;
+        uint256 typeIndex;
+        uint256 r;
+        uint256 s;
     }
 
-    struct WalletMemberSol {
-        string credentialId;
+    struct MemberSol {
         bytes publicKey;
-        string name;
+        bytes attestation;
+        ProofSol proof;
     }
 
-    interface WebAuthnP256PublicKeyIndex {
-        function createWallet(string calldata rpId, bytes32 walletRef, WalletMemberSol[] calldata members) external;
-        function getRecord(string calldata rpId, string calldata credentialId)
-            external view returns (PublicKeyRecord memory);
-        function getRecordByWalletRef(bytes32 walletRef)
-            external view returns (PublicKeyRecord memory);
-        function hasRecord(string calldata rpId, string calldata credentialId)
-            external view returns (bool);
-        function getCommitBlock(bytes32 commitment) external view returns (uint256);
-        function getTotalCredentials() external view returns (uint256);
-        function getTotalWallets() external view returns (uint256);
+    interface WebAuthnP256PublicKeyRegistry {
+        function register(string calldata rpId, bytes calldata metadata, bytes32 unitNonce, MemberSol[] calldata members) external;
+        function getTotalUnits() external view returns (uint256);
+        function getTotalEntries() external view returns (uint256);
+        function getEntry(uint256 entryId) external view returns (EntryViewSol memory);
+        function hasEntries(bytes calldata publicKey) external view returns (bool);
+        function getEntriesByKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
+            external view returns (uint256 total, EntryViewSol[] memory records);
+        function getEntriesByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
+            external view returns (uint256 total, EntryViewSol[] memory records);
+        function getTotalRpIds() external view returns (uint256);
         function getRpIds(uint256 offset, uint256 limit, bool desc)
             external view returns (uint256 total, string[] memory rpIds, uint256[] memory counts, uint256[] memory createdAts);
-        function getKeysByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
-            external view returns (uint256 total, PublicKeyRecord[] memory records);
-    }
-
-    interface WebAuthnP256BatchHelper {
-        function batchCommit(address index, bytes32[] calldata commitments) external;
-        function batchCreateRecord(address index, CreateParams[] calldata params) external;
+        function isNonceUsed(bytes32 unitNonce) external view returns (bool);
+        function isContentRegistered(bytes32 contentHash) external view returns (bool);
     }
 }
 
@@ -110,28 +103,28 @@ impl std::fmt::Display for ChainError {
 impl std::error::Error for ChainError {}
 
 /// Whether an RPC error text describes an EVM revert. Matches the generic
-/// revert phrasing plus the two custom-error selectors this protocol can
-/// throw (RecordAlreadyExists, WalletRefAlreadyExists). Case-insensitive.
+/// revert phrasing plus the registry's terminal custom-error selectors.
 pub fn is_revert(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     value.contains("execution reverted")
         || value.contains("revert")
-        || value.contains("0x46a08bc5")
-        || value.contains("0xc9af4506")
+        || value.contains(SELECTOR_NONCE_ALREADY_USED)
+        || value.contains(SELECTOR_UNIT_ALREADY_REGISTERED)
 }
 
-/// The record for this (rpId, credentialId) already exists on chain — a
-/// terminal success for the task that tried to create it.
-pub fn is_record_exists_error(error: &ChainError) -> bool {
+/// The unit's nonce was already consumed on-chain. Either our own earlier
+/// transaction landed with a lost receipt (reconcile via the content hash),
+/// or a third party consumed it — a terminal conflict either way once
+/// content reconciliation says the unit is absent.
+pub fn is_nonce_used_error(error: &ChainError) -> bool {
     matches!(error, ChainError::Reverted(value) | ChainError::Rejected(value)
-        if value.contains("RecordAlreadyExists") || value.contains("0x46a08bc5"))
+        if value.contains("NonceAlreadyUsed") || value.contains(SELECTOR_NONCE_ALREADY_USED))
 }
 
-/// The wallet ref is already bound to a different credential — a terminal
-/// failure (business conflict) for the task.
-pub fn is_wallet_conflict_error(error: &ChainError) -> bool {
+/// Identical unit content already exists on-chain — retroactive success.
+pub fn is_content_registered_error(error: &ChainError) -> bool {
     matches!(error, ChainError::Reverted(value) | ChainError::Rejected(value)
-        if value.contains("WalletRefAlreadyExists") || value.contains("0xc9af4506"))
+        if value.contains("UnitAlreadyRegistered") || value.contains(SELECTOR_UNIT_ALREADY_REGISTERED))
 }
 
 /// Whether the node saw a same-nonce replacement and refused it on price.
@@ -152,37 +145,38 @@ pub fn is_replacement_underpriced(error: &ChainError) -> bool {
 }
 
 /// Whether the error is worth retrying. Unavailable/InvalidResponse always
-/// are; Rejected only when it carries none of the terminal markers above and
-/// no revert phrasing. Reverted and MissingSigner are never transient.
+/// are; Rejected only when it carries none of the terminal markers and does
+/// not read as an EVM revert.
 pub fn is_transient(error: &ChainError) -> bool {
-    matches!(error, ChainError::Unavailable | ChainError::InvalidResponse)
-        || matches!(error, ChainError::Rejected(value)
-            if !value.contains("RecordAlreadyExists") && !value.contains("WalletRefAlreadyExists")
-                && !value.contains("execution reverted") && !value.contains("revert"))
+    match error {
+        ChainError::Unavailable | ChainError::InvalidResponse => true,
+        ChainError::Rejected(value) => {
+            !is_revert(value)
+                && !value.contains("NonceAlreadyUsed")
+                && !value.contains("UnitAlreadyRegistered")
+                && !value.contains("InvalidProof")
+        }
+        ChainError::Reverted(_) | ChainError::MissingSigner => false,
+    }
 }
 
-/// What a chain write error means for the task that caused it. This is the
-/// four-way decision `worker.rs` used to spell out as an if/else chain in
-/// `handle_task_error`; the precedence (exists > conflict > transient >
-/// poison) is part of the contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The four-way verdict for a failed chain write, in precedence order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorClass {
-    /// The record already exists on chain: the task is retroactively done.
-    RecordExists,
-    /// The wallet ref belongs to another credential: terminal business failure.
-    WalletConflict,
-    /// Worth retrying later.
+    /// Identical content already on-chain: retroactive success.
+    ContentRegistered,
+    /// The unit nonce was consumed (by us with a lost receipt, or by a
+    /// third party) — reconcile content, then treat as terminal conflict.
+    NonceUsed,
     Transient,
-    /// Deterministic failure: quarantine the task so it cannot block others.
     Poison,
 }
 
 pub fn classify_chain_error(error: &ChainError) -> ErrorClass {
-    if is_record_exists_error(error) {
-        ErrorClass::RecordExists
-    } else if is_wallet_conflict_error(error) {
-        ErrorClass::WalletConflict
+    if is_content_registered_error(error) {
+        ErrorClass::ContentRegistered
+    } else if is_nonce_used_error(error) {
+        ErrorClass::NonceUsed
     } else if is_transient(error) {
         ErrorClass::Transient
     } else {
@@ -190,451 +184,313 @@ pub fn classify_chain_error(error: &ChainError) -> ErrorClass {
     }
 }
 
-// ── Calldata builders ──────────────────────────────────────────────────────
+// ── Hex plumbing ───────────────────────────────────────────────────────────
 
-pub fn index_get_record_calldata(rp_id: String, credential_id: String) -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::getRecordCall {
-        rpId: rp_id,
-        credentialId: credential_id,
+pub fn parse_hex_bytes(value: &str) -> Result<Vec<u8>> {
+    let raw = value.strip_prefix("0x").unwrap_or(value);
+    if !raw.len().is_multiple_of(2) {
+        bail!("invalid hex");
     }
-    .abi_encode()
+    hex::decode(raw).map_err(Into::into)
 }
 
-pub fn index_get_record_by_wallet_ref_calldata(wallet_ref: B256) -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::getRecordByWalletRefCall {
-        walletRef: wallet_ref,
+pub fn parse_b256(value: &str) -> Result<B256> {
+    let bytes = parse_hex_bytes(value)?;
+    if bytes.len() != 32 {
+        bail!("expected 32 bytes");
     }
-    .abi_encode()
+    Ok(B256::from_slice(&bytes))
 }
 
-pub fn index_has_record_calldata(rp_id: String, credential_id: String) -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::hasRecordCall {
-        rpId: rp_id,
-        credentialId: credential_id,
+// ── Challenge and content hash ─────────────────────────────────────────────
+
+/// The storage-authorization challenge one member's key signs, mirroring the
+/// contract: keccak256(abi.encode(chainid, registry, rpId, publicKey, nonce)).
+pub fn challenge_for(
+    chain_id: u64,
+    registry: Address,
+    rp_id: &str,
+    public_key: &[u8],
+    unit_nonce: B256,
+) -> B256 {
+    keccak256(
+        (
+            U256::from(chain_id),
+            registry,
+            rp_id.to_owned(),
+            alloy::primitives::Bytes::from(public_key.to_vec()),
+            unit_nonce,
+        )
+            .abi_encode(),
+    )
+}
+
+/// The duplicate-suppression content hash, mirroring the contract's
+/// `contentHashFor`: keccak256(abi.encode(rpId, metadata, memberHashes)).
+pub fn content_hash_for(task: &RegisterTask) -> Result<B256> {
+    let mut member_hashes = Vec::with_capacity(task.members.len());
+    for member in &task.members {
+        let public_key: alloy::primitives::Bytes = parse_hex_bytes(&member.public_key)?.into();
+        let attestation: alloy::primitives::Bytes = parse_hex_bytes(&member.attestation)?.into();
+        member_hashes.push(keccak256((public_key, attestation).abi_encode()));
     }
-    .abi_encode()
-}
-
-pub fn index_get_commit_block_calldata(commitment: B256) -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::getCommitBlockCall { commitment }.abi_encode()
-}
-
-pub fn index_total_calldata() -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::getTotalCredentialsCall {}.abi_encode()
-}
-
-pub fn index_total_wallets_calldata() -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::getTotalWalletsCall {}.abi_encode()
-}
-
-pub fn index_sites_calldata(offset: u64, limit: u64, descending: bool) -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::getRpIdsCall {
-        offset: U256::from(offset),
-        limit: U256::from(limit),
-        desc: descending,
-    }
-    .abi_encode()
-}
-
-pub fn index_keys_calldata(rp_id: String, offset: u64, limit: u64, descending: bool) -> Vec<u8> {
-    WebAuthnP256PublicKeyIndex::getKeysByRpIdCall {
-        rpId: rp_id,
-        offset: U256::from(offset),
-        limit: U256::from(limit),
-        desc: descending,
-    }
-    .abi_encode()
-}
-
-pub fn batch_commit_calldata(index: Address, commitments: Vec<B256>) -> Vec<u8> {
-    WebAuthnP256BatchHelper::batchCommitCall { index, commitments }.abi_encode()
-}
-
-pub fn batch_create_calldata(index: Address, tasks: &[CreateTask]) -> Result<Vec<u8>> {
-    if tasks.iter().any(CreateTask::is_wallet) {
-        bail!("wallet tasks must be revealed alone via createWallet");
-    }
-    let params = tasks
-        .iter()
-        .map(|task| {
-            Ok(CreateParams {
-                rpId: task.rp_id.clone(),
-                credentialId: task.credential_id.clone(),
-                walletRef: parse_b256(&task.wallet_ref)?,
-                publicKey: parse_hex_bytes(&task.public_key)?.into(),
-                name: task.name.clone(),
-                initialCredentialId: task.initial_credential_id.clone(),
-                metadata: parse_hex_bytes(&task.metadata)?.into(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(WebAuthnP256BatchHelper::batchCreateRecordCall { index, params }.abi_encode())
-}
-
-// ── Response decoders ──────────────────────────────────────────────────────
-
-pub fn decode_record(bytes: &[u8]) -> Result<Record> {
-    let value = WebAuthnP256PublicKeyIndex::getRecordCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getRecord response"))?;
-    record_from_sol(value)
-}
-
-pub fn decode_record_by_wallet_ref(bytes: &[u8]) -> Result<Record> {
-    let value = WebAuthnP256PublicKeyIndex::getRecordByWalletRefCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getRecordByWalletRef response"))?;
-    record_from_sol(value)
-}
-
-pub fn decode_has_record(bytes: &[u8]) -> Result<bool> {
-    WebAuthnP256PublicKeyIndex::hasRecordCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid hasRecord response"))
-}
-
-pub fn decode_commit_block(bytes: &[u8]) -> Result<u64> {
-    let value = WebAuthnP256PublicKeyIndex::getCommitBlockCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getCommitBlock response"))?;
-    u64::try_from(value).map_err(|_| anyhow!("commit block exceeds u64"))
-}
-
-pub fn decode_total(bytes: &[u8]) -> Result<u64> {
-    let value = WebAuthnP256PublicKeyIndex::getTotalCredentialsCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getTotalCredentials response"))?;
-    u64::try_from(value).map_err(|_| anyhow!("total exceeds u64"))
-}
-
-pub fn decode_total_wallets(bytes: &[u8]) -> Result<u64> {
-    let value = WebAuthnP256PublicKeyIndex::getTotalWalletsCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getTotalWallets response"))?;
-    u64::try_from(value).map_err(|_| anyhow!("total exceeds u64"))
-}
-
-pub fn decode_sites(bytes: &[u8], page: u64, page_size: u64) -> Result<(u64, Vec<SiteEntry>)> {
-    let response = WebAuthnP256PublicKeyIndex::getRpIdsCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getRpIds response"))?;
-    let total = u64::try_from(response.total).map_err(|_| anyhow!("total exceeds u64"))?;
-    let mut items = Vec::with_capacity(response.rpIds.len());
-    for ((rp_id, count), created_at) in response
-        .rpIds
-        .into_iter()
-        .zip(response.counts)
-        .zip(response.createdAts)
-    {
-        items.push((
-            rp_id,
-            u64::try_from(count).map_err(|_| anyhow!("count exceeds u64"))?,
-            u64::try_from(created_at).map_err(|_| anyhow!("timestamp exceeds u64"))? * 1000,
-        ));
-    }
-    let _ = (page, page_size);
-    Ok((total, items))
-}
-
-pub fn decode_keys(bytes: &[u8]) -> Result<(u64, Vec<Record>)> {
-    let response = WebAuthnP256PublicKeyIndex::getKeysByRpIdCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getKeysByRpId response"))?;
-    Ok((
-        u64::try_from(response.total).map_err(|_| anyhow!("total exceeds u64"))?,
-        response
-            .records
-            .into_iter()
-            .map(record_from_sol)
-            .collect::<Result<Vec<_>>>()?,
+    let metadata: alloy::primitives::Bytes = parse_hex_bytes(&task.metadata)?.into();
+    Ok(keccak256(
+        (task.rp_id.clone(), metadata, member_hashes).abi_encode(),
     ))
 }
 
-pub fn record_from_sol(value: PublicKeyRecord) -> Result<Record> {
-    Ok(Record {
-        rp_id: value.rpId,
-        credential_id: value.credentialId,
-        wallet_ref: value.walletRef.to_string().to_lowercase(),
-        public_key: hex::encode(value.publicKey),
-        name: value.name,
-        initial_credential_id: value.initialCredentialId,
-        metadata: hex::encode(value.metadata),
-        created_at: u64::try_from(value.createdAt)
-            .map_err(|_| anyhow!("record timestamp exceeds u64"))?
-            .saturating_mul(1000),
+// ── Calldata builders ──────────────────────────────────────────────────────
+
+fn member_sol(member: &crate::task::Member) -> Result<MemberSol> {
+    Ok(MemberSol {
+        publicKey: parse_hex_bytes(&member.public_key)?.into(),
+        attestation: parse_hex_bytes(&member.attestation)?.into(),
+        proof: ProofSol {
+            authenticatorData: parse_hex_bytes(&member.proof.authenticator_data)?.into(),
+            clientDataJSON: member.proof.client_data_json.clone(),
+            challengeIndex: U256::from(member.proof.challenge_index),
+            typeIndex: U256::from(member.proof.type_index),
+            r: U256::from_be_bytes(parse_b256(&member.proof.r)?.0),
+            s: U256::from_be_bytes(parse_b256(&member.proof.s)?.0),
+        },
     })
 }
 
-// ── Commit-reveal commitment ───────────────────────────────────────────────
-
-/// The V3 contract's WALLET_COMMIT_TAG: bytes32("V3.createWallet"), the
-/// domain separator that keeps wallet commitments disjoint from record ones.
-pub fn wallet_commit_tag() -> B256 {
-    let mut tag = [0u8; 32];
-    tag[..15].copy_from_slice(b"V3.createWallet");
-    B256::from(tag)
-}
-
-fn sol_members(members: &[crate::task::WalletMember]) -> Result<Vec<WalletMemberSol>> {
-    members
+/// One register() transaction for one task.
+pub fn register_calldata(task: &RegisterTask) -> Result<Vec<u8>> {
+    let members = task
+        .members
         .iter()
-        .map(|member| {
-            Ok(WalletMemberSol {
-                credentialId: member.credential_id.clone(),
-                publicKey: parse_hex_bytes(&member.public_key)?.into(),
-                name: member.name.clone(),
-            })
-        })
-        .collect()
-}
-
-pub fn build_commitment(task: &CreateTask) -> Result<B256> {
-    if task.is_wallet() {
-        return build_wallet_commitment(task);
-    }
-    let wallet_ref = parse_b256(&task.wallet_ref)?;
-    let public_key: Bytes = parse_hex_bytes(&task.public_key)?.into();
-    let metadata: Bytes = parse_hex_bytes(&task.metadata)?.into();
-    Ok(keccak256(
-        (
-            task.rp_id.clone(),
-            task.credential_id.clone(),
-            wallet_ref,
-            public_key,
-            task.name.clone(),
-            task.initial_credential_id.clone(),
-            metadata,
-        )
-            .abi_encode_params(),
-    ))
-}
-
-/// One commitment covers the whole wallet bundle:
-/// keccak256(abi.encode(WALLET_COMMIT_TAG, rpId, walletRef, members)).
-pub fn build_wallet_commitment(task: &CreateTask) -> Result<B256> {
-    Ok(keccak256(
-        (
-            wallet_commit_tag(),
-            task.rp_id.clone(),
-            parse_b256(&task.wallet_ref)?,
-            sol_members(&task.members)?,
-        )
-            .abi_encode_params(),
-    ))
-}
-
-/// Calldata for a wallet task's atomic reveal. Unlike batchCreateRecord this
-/// targets the INDEX contract directly, so a wallet task must go out alone.
-pub fn wallet_create_calldata(task: &CreateTask) -> Result<Vec<u8>> {
-    Ok(WebAuthnP256PublicKeyIndex::createWalletCall {
+        .map(member_sol)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(WebAuthnP256PublicKeyRegistry::registerCall {
         rpId: task.rp_id.clone(),
-        walletRef: parse_b256(&task.wallet_ref)?,
-        members: sol_members(&task.members)?,
+        metadata: parse_hex_bytes(&task.metadata)?.into(),
+        unitNonce: parse_b256(&task.unit_nonce)?,
+        members,
     }
     .abi_encode())
 }
 
-// ── Hex parsing helpers ────────────────────────────────────────────────────
+// ── Read calldata ──────────────────────────────────────────────────────────
 
-pub fn parse_b256(value: &str) -> Result<B256> {
-    B256::from_str(value).map_err(|_| anyhow!("invalid bytes32 hex"))
+pub fn total_units_calldata() -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getTotalUnitsCall {}.abi_encode()
 }
 
-pub fn parse_hex_bytes(value: &str) -> Result<Vec<u8>> {
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("invalid hex");
+pub fn total_entries_calldata() -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getTotalEntriesCall {}.abi_encode()
+}
+
+pub fn get_entry_calldata(entry_id: u64) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getEntryCall {
+        entryId: U256::from(entry_id),
     }
-    hex::decode(value).map_err(Into::into)
+    .abi_encode()
+}
+
+pub fn has_entries_calldata(public_key: Vec<u8>) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::hasEntriesCall {
+        publicKey: public_key.into(),
+    }
+    .abi_encode()
+}
+
+pub fn entries_by_key_calldata(
+    public_key: Vec<u8>,
+    offset: u64,
+    limit: u64,
+    desc: bool,
+) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getEntriesByKeyCall {
+        publicKey: public_key.into(),
+        offset: U256::from(offset),
+        limit: U256::from(limit),
+        desc,
+    }
+    .abi_encode()
+}
+
+pub fn entries_by_rp_id_calldata(rp_id: String, offset: u64, limit: u64, desc: bool) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getEntriesByRpIdCall {
+        rpId: rp_id,
+        offset: U256::from(offset),
+        limit: U256::from(limit),
+        desc,
+    }
+    .abi_encode()
+}
+
+pub fn total_rp_ids_calldata() -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getTotalRpIdsCall {}.abi_encode()
+}
+
+pub fn rp_ids_calldata(offset: u64, limit: u64, desc: bool) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getRpIdsCall {
+        offset: U256::from(offset),
+        limit: U256::from(limit),
+        desc,
+    }
+    .abi_encode()
+}
+
+pub fn is_nonce_used_calldata(unit_nonce: B256) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::isNonceUsedCall {
+        unitNonce: unit_nonce,
+    }
+    .abi_encode()
+}
+
+pub fn is_content_registered_calldata(content_hash: B256) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::isContentRegisteredCall {
+        contentHash: content_hash,
+    }
+    .abi_encode()
+}
+
+// ── Response decoders ──────────────────────────────────────────────────────
+
+pub type SiteEntry = (String, u64, u64);
+
+fn entry_from_sol(value: EntryViewSol) -> Result<Entry> {
+    Ok(Entry {
+        entry_id: u64::try_from(value.entryId).map_err(|_| anyhow!("entry id exceeds u64"))?,
+        unit_id: u64::try_from(value.unitId).map_err(|_| anyhow!("unit id exceeds u64"))?,
+        public_key: hex::encode(value.publicKey),
+        attestation: hex::encode(value.attestation),
+        rp_id: value.rpId,
+        metadata: hex::encode(value.metadata),
+        first_entry_id: value.firstEntryId,
+        member_count: value.memberCount,
+        created_at: u64::try_from(value.createdAt)
+            .map_err(|_| anyhow!("timestamp exceeds u64"))?
+            .saturating_mul(1000),
+    })
+}
+
+pub fn decode_entry(bytes: &[u8]) -> Result<Entry> {
+    let value = WebAuthnP256PublicKeyRegistry::getEntryCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getEntry response"))?;
+    entry_from_sol(value)
+}
+
+pub fn decode_entries_page(bytes: &[u8]) -> Result<(u64, Vec<Entry>)> {
+    let value = WebAuthnP256PublicKeyRegistry::getEntriesByKeyCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid entries page response"))?;
+    Ok((
+        u64::try_from(value.total).map_err(|_| anyhow!("total exceeds u64"))?,
+        value
+            .records
+            .into_iter()
+            .map(entry_from_sol)
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+pub fn decode_has_entries(bytes: &[u8]) -> Result<bool> {
+    WebAuthnP256PublicKeyRegistry::hasEntriesCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid hasEntries response"))
+}
+
+pub fn decode_bool(bytes: &[u8]) -> Result<bool> {
+    WebAuthnP256PublicKeyRegistry::isNonceUsedCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid bool response"))
+}
+
+pub fn decode_total(bytes: &[u8]) -> Result<u64> {
+    let value = WebAuthnP256PublicKeyRegistry::getTotalEntriesCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid total response"))?;
+    u64::try_from(value).map_err(|_| anyhow!("total exceeds u64"))
+}
+
+pub fn decode_rp_ids(bytes: &[u8]) -> Result<(u64, Vec<SiteEntry>)> {
+    let value = WebAuthnP256PublicKeyRegistry::getRpIdsCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getRpIds response"))?;
+    let total = u64::try_from(value.total).map_err(|_| anyhow!("total exceeds u64"))?;
+    let mut sites = Vec::with_capacity(value.rpIds.len());
+    for ((rp_id, count), created_at) in value
+        .rpIds
+        .into_iter()
+        .zip(value.counts)
+        .zip(value.createdAts)
+    {
+        sites.push((
+            rp_id,
+            u64::try_from(count).map_err(|_| anyhow!("count exceeds u64"))?,
+            u64::try_from(created_at)
+                .map_err(|_| anyhow!("timestamp exceeds u64"))?
+                .saturating_mul(1000),
+        ));
+    }
+    Ok((total, sites))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ChainError, is_record_exists_error, is_revert, is_transient, is_wallet_conflict_error,
-    };
+    use super::*;
+    use crate::task::{Member, Proof, RegisterTask, TaskStatus};
 
-    // These tests are the truth table for the four classification predicates.
-    // They lock in the behaviour that used to be spread over `chain.rs` so the
-    // upcoming commit_reveal state machine can rely on it.
+    const PK: &str = "041a8cc55e2d14a61c8f3f1bcf6f8e7e40fe09cc624a6b77f0539d5eebfafa7bc7880184f26b47cfc67b445168c34355416c93c73cb9b896b82be84486adf88ca0";
 
-    #[test]
-    fn revert_detection_is_case_insensitive_and_knows_both_selectors() {
-        assert!(is_revert("EXECUTION REVERTED"));
-        assert!(is_revert("Revert: something"));
-        assert!(is_revert("data 0x46A08BC5"));
-        assert!(is_revert("data 0xc9af4506"));
-        assert!(!is_revert("rate limited"));
-    }
-
-    #[test]
-    fn record_exists_matches_name_or_selector_on_reverted_and_rejected() {
-        for wrap in [ChainError::Reverted, ChainError::Rejected] {
-            assert!(is_record_exists_error(&wrap("RecordAlreadyExists".into())));
-            assert!(is_record_exists_error(&wrap("data: 0x46a08bc5".into())));
-            assert!(!is_record_exists_error(&wrap(
-                "WalletRefAlreadyExists".into()
-            )));
-        }
-        assert!(!is_record_exists_error(&ChainError::Unavailable));
-    }
-
-    #[test]
-    fn wallet_conflict_matches_name_or_selector_on_reverted_and_rejected() {
-        for wrap in [ChainError::Reverted, ChainError::Rejected] {
-            assert!(is_wallet_conflict_error(&wrap(
-                "WalletRefAlreadyExists".into()
-            )));
-            assert!(is_wallet_conflict_error(&wrap("data: 0xc9af4506".into())));
-            assert!(!is_wallet_conflict_error(&wrap(
-                "RecordAlreadyExists".into()
-            )));
-        }
-        assert!(!is_wallet_conflict_error(&ChainError::Unavailable));
-    }
-
-    #[test]
-    fn transient_covers_infrastructure_errors_and_neutral_rejections_only() {
-        assert!(is_transient(&ChainError::Unavailable));
-        assert!(is_transient(&ChainError::InvalidResponse));
-        assert!(is_transient(&ChainError::Rejected("rate limited".into())));
-
-        // Terminal markers make a rejection non-transient.
-        assert!(!is_transient(&ChainError::Rejected(
-            "RecordAlreadyExists".into()
-        )));
-        assert!(!is_transient(&ChainError::Rejected(
-            "WalletRefAlreadyExists".into()
-        )));
-        assert!(!is_transient(&ChainError::Rejected(
-            "execution reverted".into()
-        )));
-        assert!(!is_transient(&ChainError::Rejected("revert".into())));
-
-        // Reverted and MissingSigner are never transient.
-        assert!(!is_transient(&ChainError::Reverted("anything".into())));
-        assert!(!is_transient(&ChainError::MissingSigner));
-    }
-
-    #[test]
-    fn transient_rejection_matching_is_case_sensitive_like_the_original() {
-        // The predicates match exact case, as the original chain.rs code did.
-        // A lowercase marker therefore still counts as transient — this test
-        // documents (not endorses) that behaviour.
-        assert!(is_transient(&ChainError::Rejected(
-            "recordalreadyexists".into()
-        )));
-    }
-
-    #[test]
-    fn commitment_construction_matches_the_golden_value() {
-        // Golden value: keccak256(abi.encode(rpId, credentialId, walletRef,
-        // publicKey, name, initialCredentialId, metadata)) for the fixed task
-        // below. Pins field order and encoding against silent regressions —
-        // the commit_reveal tests derive expectations from this same
-        // function, so without this anchor they would drift with it.
-        use crate::task::{CreateTask, TaskStatus};
-
-        let task = CreateTask {
-            id: "golden".into(),
+    fn task() -> RegisterTask {
+        RegisterTask {
+            id: "t1".into(),
             status: TaskStatus::Pending,
             rp_id: "example.com".into(),
-            credential_id: "cred-1".into(),
-            wallet_ref: "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
-            public_key: "04".repeat(65),
-            name: "n".into(),
-            initial_credential_id: "cred-1".into(),
-            metadata: "0x00".into(),
-            members: Vec::new(),
+            metadata: "0xaa".into(),
+            unit_nonce: format!("0x{}", "11".repeat(32)),
+            members: vec![Member {
+                public_key: PK.into(),
+                attestation: String::new(),
+                proof: Proof {
+                    authenticator_data: "00".repeat(37),
+                    client_data_json: "{}".into(),
+                    challenge_index: 23,
+                    type_index: 1,
+                    r: format!("0x{}", "22".repeat(32)),
+                    s: format!("0x{}", "33".repeat(32)),
+                },
+            }],
             tx_hash: None,
+            first_entry_id: None,
             error: None,
             retries: 0,
             created_at: 0,
             admitted: true,
-        };
-        assert_eq!(
-            super::build_commitment(&task).unwrap().to_string(),
-            "0xe7bec4938ed5410d3ede4770a739064cabd7110b918140690eb944208cfa3ff9"
-        );
+        }
     }
 
     #[test]
-    fn wallet_commitment_matches_the_contract_golden_value() {
-        // Pinned against the Solidity side (test_walletCommitment_goldenValue)
-        // and an independent `cast abi-encode | cast keccak` computation.
-        use crate::task::{CreateTask, TaskStatus, WalletMember};
-
-        const PK1: &str = "045ff257819a8927dc548d62eeb90a7a61a8e90afd70c9f774e7ed78d0c5bbbc0e8ed0f6a55f675f162b2e8450f79cd0e6766e56f10f762430ec15d2a4388f19fb";
-        const PK2: &str = "04550f471003f3df97c3df506ac797f6721fb1a1fb7b8f6f83d224498a65c88e24136093d7012e509a73715cbd0b00a3cc0ff4b5c01b3ffa196ab1fb327036b8e6";
-        let task = CreateTask {
-            id: "wallet-golden".into(),
-            status: TaskStatus::Pending,
-            rp_id: "rp1".into(),
-            credential_id: "cred-1".into(),
-            wallet_ref: "0x0000000000000000000000000000000000000000000000000000000000000042".into(),
-            public_key: PK1.into(),
-            name: "A".into(),
-            initial_credential_id: "cred-1".into(),
-            metadata: "0x00".into(),
-            members: vec![
-                WalletMember {
-                    credential_id: "cred-1".into(),
-                    public_key: PK1.into(),
-                    name: "A".into(),
-                },
-                WalletMember {
-                    credential_id: "cred-2".into(),
-                    public_key: PK2.into(),
-                    name: "B".into(),
-                },
-            ],
-            tx_hash: None,
-            error: None,
-            retries: 0,
-            created_at: 0,
-            admitted: true,
-        };
-        assert_eq!(
-            super::build_commitment(&task).unwrap().to_string(),
-            "0x0bcf64f774f9f6721c25a0e2a2da9288add57fbf8c3625b1c72357f3c54383f2"
-        );
-
-        // The reveal calldata targets createWallet, and the batch encoder
-        // refuses to mix a wallet task into a batchCreateRecord.
-        let data = super::wallet_create_calldata(&task).unwrap();
-        use alloy::sol_types::SolCall;
+    fn register_calldata_uses_the_register_selector() {
+        let data = register_calldata(&task()).unwrap();
         assert_eq!(
             &data[..4],
-            super::WebAuthnP256PublicKeyIndex::createWalletCall::SELECTOR
-        );
-        assert!(
-            super::batch_create_calldata(
-                alloy::primitives::Address::ZERO,
-                std::slice::from_ref(&task)
-            )
-            .is_err()
-        );
-
-        // Altering any member changes the commitment.
-        let mut altered = task.clone();
-        altered.members[1].credential_id = "cred-CHANGED".into();
-        assert_ne!(
-            super::build_commitment(&altered).unwrap(),
-            super::build_commitment(&task).unwrap()
+            WebAuthnP256PublicKeyRegistry::registerCall::SELECTOR
         );
     }
 
     #[test]
-    fn classification_precedence_matches_the_original_if_else_chain() {
-        use super::{ErrorClass, classify_chain_error};
-
+    fn classification_precedence_matches_the_contract_vocabulary() {
         assert_eq!(
-            classify_chain_error(&ChainError::Rejected("RecordAlreadyExists".into())),
-            ErrorClass::RecordExists
+            classify_chain_error(&ChainError::Rejected("UnitAlreadyRegistered".into())),
+            ErrorClass::ContentRegistered
         );
         assert_eq!(
-            classify_chain_error(&ChainError::Reverted("WalletRefAlreadyExists".into())),
-            ErrorClass::WalletConflict
+            classify_chain_error(&ChainError::Reverted(format!(
+                "data: {SELECTOR_UNIT_ALREADY_REGISTERED}"
+            ))),
+            ErrorClass::ContentRegistered
         );
-        // An error carrying both markers resolves to RecordExists: exists is
-        // checked first, exactly as handle_task_error did.
         assert_eq!(
-            classify_chain_error(&ChainError::Reverted(
-                "RecordAlreadyExists WalletRefAlreadyExists".into()
-            )),
-            ErrorClass::RecordExists
+            classify_chain_error(&ChainError::Rejected("NonceAlreadyUsed".into())),
+            ErrorClass::NonceUsed
+        );
+        assert_eq!(
+            classify_chain_error(&ChainError::Reverted(format!(
+                "data: {SELECTOR_NONCE_ALREADY_USED}"
+            ))),
+            ErrorClass::NonceUsed
         );
         assert_eq!(
             classify_chain_error(&ChainError::Unavailable),
@@ -645,12 +501,47 @@ mod tests {
             ErrorClass::Transient
         );
         assert_eq!(
-            classify_chain_error(&ChainError::Reverted("some assert".into())),
+            classify_chain_error(&ChainError::Reverted("InvalidProof".into())),
             ErrorClass::Poison
         );
         assert_eq!(
             classify_chain_error(&ChainError::MissingSigner),
             ErrorClass::Poison
         );
+    }
+
+    #[test]
+    fn transiency_respects_revert_markers() {
+        assert!(is_transient(&ChainError::Rejected("timeout".into())));
+        assert!(!is_transient(&ChainError::Rejected(
+            "execution reverted".into()
+        )));
+        assert!(!is_transient(&ChainError::Rejected(
+            "InvalidProof()".into()
+        )));
+        assert!(!is_transient(&ChainError::Reverted("anything".into())));
+    }
+
+    #[test]
+    fn challenge_and_content_hash_are_deterministic() {
+        use std::str::FromStr;
+        let registry = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
+        let nonce = parse_b256(&format!("0x{}", "11".repeat(32))).unwrap();
+        let pk = parse_hex_bytes(PK).unwrap();
+        let a = challenge_for(100, registry, "example.com", &pk, nonce);
+        let b = challenge_for(100, registry, "example.com", &pk, nonce);
+        assert_eq!(a, b);
+        // Any component changes the challenge.
+        assert_ne!(a, challenge_for(1, registry, "example.com", &pk, nonce));
+        assert_ne!(a, challenge_for(100, registry, "other.com", &pk, nonce));
+
+        let hash_one = content_hash_for(&task()).unwrap();
+        let mut altered = task();
+        altered.metadata = "0xbb".into();
+        assert_ne!(hash_one, content_hash_for(&altered).unwrap());
+        // The nonce is NOT part of the content hash.
+        let mut renonced = task();
+        renonced.unit_nonce = format!("0x{}", "44".repeat(32));
+        assert_eq!(hash_one, content_hash_for(&renonced).unwrap());
     }
 }

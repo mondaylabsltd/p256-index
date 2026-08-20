@@ -87,7 +87,6 @@ mod tests {
         Config {
             listen_addr: "127.0.0.1:0".parse().expect("addr"),
             private_key: None,
-            commit_private_key: None,
             alchemy_api_key: None,
             iggy_url: "iggy+tcp://unused".into(),
             iggy_consumer_url: "iggy+tcp://unused".into(),
@@ -100,7 +99,7 @@ mod tests {
             global_write_limit: 40,
             iggy_enqueue_timeout: Duration::from_secs(5),
             iggy_consumer_group: "test".into(),
-            contract_address: None,
+            contract_address: "0x1111111111111111111111111111111111111111".into(),
         }
     }
 

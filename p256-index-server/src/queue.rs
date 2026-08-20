@@ -6,7 +6,7 @@ use iggy::prelude::{
     MaxTopicSize, MessageClient, Partitioning, StreamClient, TopicClient,
 };
 
-use p256_registrar::task::CreateTask;
+use p256_registrar::task::RegisterTask;
 
 pub const STREAM_NAME: &str = "p256-index";
 pub const TOPIC_NAME: &str = "create";
@@ -35,8 +35,8 @@ impl std::fmt::Display for QueueError {
 impl std::error::Error for QueueError {}
 
 #[async_trait]
-pub trait CreateTaskQueue: Send + Sync {
-    async fn enqueue(&self, task: &CreateTask) -> Result<(), QueueError>;
+pub trait RegisterTaskQueue: Send + Sync {
+    async fn enqueue(&self, task: &RegisterTask) -> Result<(), QueueError>;
 }
 
 impl CreateQueue {
@@ -75,7 +75,7 @@ impl CreateQueue {
 
     /// Returns success only after Iggy confirms the append. An error after calling this is an
     /// ambiguous outcome; callers retain Redis state and retry the same task ID later.
-    async fn enqueue_inner(&self, task: &CreateTask) -> Result<(), QueueError> {
+    async fn enqueue_inner(&self, task: &RegisterTask) -> Result<(), QueueError> {
         let payload = serde_json::to_string(task)
             .map_err(|_| QueueError("could not serialize Iggy create task"))?;
         match self.append(&payload).await {
@@ -182,8 +182,8 @@ impl CreateQueue {
 }
 
 #[async_trait]
-impl CreateTaskQueue for CreateQueue {
-    async fn enqueue(&self, task: &CreateTask) -> Result<(), QueueError> {
+impl RegisterTaskQueue for CreateQueue {
+    async fn enqueue(&self, task: &RegisterTask) -> Result<(), QueueError> {
         self.enqueue_inner(task).await
     }
 }

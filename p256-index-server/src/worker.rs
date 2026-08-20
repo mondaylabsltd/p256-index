@@ -1,17 +1,13 @@
-//! Shell for the commit-reveal task lifecycle.
+//! Shell for the submission task lifecycle.
 //!
-//! All decisions live in `p256_registrar::commit_reveal`; this worker owns
-//! the machinery: the Iggy consumer loop (offset advance, backoff, malformed
-//! message discard), nonce management for the two signing wallets, the
+//! All decisions live in `p256_registrar::submission`; this worker owns the
+//! machinery: the Iggy consumer loop (offset advance, backoff, malformed
+//! message discard), nonce management for the single signing wallet, the
 //! pending-tx ledger for the unstick sweep, and the execution of Core
 //! operations against Redis and the chain. One Core instance drives one
 //! polled batch to a `BatchVerdict`.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use iggy::prelude::{
     Client, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient,
@@ -21,17 +17,17 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use p256_registrar::{
-    commit_reveal::{
-        BatchVerdict, CommitRevealApp, CommitRevealEffect, CommitRevealEvent,
-        CommitRevealOperation, CommitRevealResult, TxOutcome,
-    },
     gas::FeeVerdict,
     protocol::parse_b256,
-    task::CreateTask,
+    submission::{
+        BatchVerdict, SubmissionApp, SubmissionEffect, SubmissionEvent, SubmissionOperation,
+        SubmissionResult, TxOutcome,
+    },
+    task::RegisterTask,
 };
 
 use crate::{
-    chain::{Broadcast, Chain, ReceiptStatus, WalletRole},
+    chain::{Broadcast, Chain, ReceiptOutcome, WalletRole},
     queue::{STREAM_NAME, TOPIC_NAME},
     store::RedisStore,
 };
@@ -66,13 +62,7 @@ pub struct CreateWorker {
 }
 
 struct NonceManager {
-    values: Mutex<HashMap<NonceRole, Option<u64>>>,
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum NonceRole {
-    Create,
-    Commit,
+    value: Mutex<Option<u64>>,
 }
 
 impl CreateWorker {
@@ -89,7 +79,7 @@ impl CreateWorker {
             consumer_url,
             consumer_group,
             nonces: Arc::new(NonceManager {
-                values: Mutex::new(HashMap::new()),
+                value: Mutex::new(None),
             }),
         };
         let task = tokio::spawn({
@@ -160,7 +150,7 @@ impl CreateWorker {
                 .messages
                 .into_iter()
                 .filter_map(|message| {
-                    match serde_json::from_slice::<CreateTask>(&message.payload) {
+                    match serde_json::from_slice::<RegisterTask>(&message.payload) {
                         Ok(task) => Some(task),
                         Err(_) => {
                             // A malformed message cannot be executed and must not permanently block
@@ -233,19 +223,19 @@ impl CreateWorker {
     /// Drive one polled batch through the commit-reveal Core. The queue
     /// messages are only envelopes: the Core loads the authoritative records
     /// itself, so only the ids cross into it.
-    async fn process_batch(&self, queue_tasks: Vec<CreateTask>) -> Result<(), WorkerError> {
+    async fn process_batch(&self, queue_tasks: Vec<RegisterTask>) -> Result<(), WorkerError> {
         if queue_tasks.is_empty() {
             return Ok(());
         }
         let envelope_ids = queue_tasks.into_iter().map(|task| task.id).collect();
 
-        let core: crux_core::Core<CommitRevealApp> = crux_core::Core::new();
-        let mut effects: VecDeque<CommitRevealEffect> = core
-            .process_event(CommitRevealEvent::Start { envelope_ids })
+        let core: crux_core::Core<SubmissionApp> = crux_core::Core::new();
+        let mut effects: VecDeque<SubmissionEffect> = core
+            .process_event(SubmissionEvent::Start { envelope_ids })
             .into_iter()
             .collect();
         while let Some(effect) = effects.pop_front() {
-            let CommitRevealEffect::Work(mut request) = effect;
+            let SubmissionEffect::Work(mut request) = effect;
             let output = self.execute(&request.operation).await;
             let next = core
                 .resolve(&mut request, output)
@@ -262,66 +252,40 @@ impl CreateWorker {
 
     /// Execute one Core operation against real infrastructure. Failures are
     /// mapped into result variants — the Core decides what they mean.
-    async fn execute(&self, operation: &CommitRevealOperation) -> CommitRevealResult {
+    async fn execute(&self, operation: &SubmissionOperation) -> SubmissionResult {
         match operation {
-            CommitRevealOperation::LoadTasks { ids } => {
+            SubmissionOperation::LoadTasks { ids } => {
                 let mut tasks = Vec::with_capacity(ids.len());
                 for id in ids {
                     match self.store.get_task(id).await {
                         Ok(task) => tasks.push(task),
-                        Err(_) => return CommitRevealResult::StoreUnavailable,
+                        Err(_) => return SubmissionResult::StoreUnavailable,
                     }
                 }
-                CommitRevealResult::TasksLoaded { tasks }
+                SubmissionResult::TasksLoaded { tasks }
             }
-            CommitRevealOperation::CheckRecord {
-                rp_id,
-                credential_id,
-            } => match self.chain.has_record(rp_id, credential_id).await {
-                Ok(exists) => CommitRevealResult::RecordChecked { exists },
-                Err(_) => CommitRevealResult::ChainReadFailed,
-            },
-            CommitRevealOperation::GetCommitBlock { commitment } => {
-                let Ok(commitment) = parse_b256(commitment) else {
-                    return CommitRevealResult::ChainReadFailed;
+            SubmissionOperation::CheckContentRegistered { content_hash } => {
+                let Ok(content_hash) = parse_b256(content_hash) else {
+                    return SubmissionResult::ChainReadFailed;
                 };
-                match self.chain.get_commit_block(commitment).await {
-                    Ok(block) => CommitRevealResult::CommitBlock {
-                        block,
-                        now_ms: monotonic_ms(),
-                    },
-                    Err(_) => CommitRevealResult::ChainReadFailed,
+                match self.chain.is_content_registered(content_hash).await {
+                    Ok(registered) => SubmissionResult::ContentChecked { registered },
+                    Err(_) => SubmissionResult::ChainReadFailed,
                 }
             }
-            CommitRevealOperation::GetCurrentBlock => match self.chain.current_block().await {
-                Ok(block) => CommitRevealResult::CurrentBlock {
-                    block,
-                    now_ms: monotonic_ms(),
-                },
-                Err(_) => CommitRevealResult::ChainReadFailed,
-            },
-            CommitRevealOperation::Sleep { ms } => {
-                tokio::time::sleep(Duration::from_millis(*ms)).await;
-                CommitRevealResult::Slept {
-                    now_ms: monotonic_ms(),
-                }
+            SubmissionOperation::SubmitRegister { task } => {
+                SubmissionResult::Tx(self.submit(task).await)
             }
-            CommitRevealOperation::SubmitCommit { tasks } => {
-                CommitRevealResult::Tx(self.submit(NonceRole::Commit, tasks).await)
-            }
-            CommitRevealOperation::SubmitCreate { tasks } => {
-                CommitRevealResult::Tx(self.submit(NonceRole::Create, tasks).await)
-            }
-            CommitRevealOperation::MarkCommitted { task_id } => {
-                store_ack(self.store.mark_committed(task_id).await)
-            }
-            CommitRevealOperation::MarkDone { task_id, tx_hash } => {
-                store_ack(self.store.mark_done(task_id, tx_hash.clone()).await)
-            }
-            CommitRevealOperation::MarkPendingAgain { task_id, reason } => {
-                store_ack(self.store.mark_pending(task_id, Some(reason)).await)
-            }
-            CommitRevealOperation::MarkFailed {
+            SubmissionOperation::MarkDone {
+                task_id,
+                tx_hash,
+                first_entry_id,
+            } => store_ack(
+                self.store
+                    .mark_done(task_id, tx_hash.clone(), *first_entry_id)
+                    .await,
+            ),
+            SubmissionOperation::MarkFailed {
                 task_id,
                 kind,
                 message,
@@ -330,7 +294,7 @@ impl CreateWorker {
                     .mark_failed(task_id, kind.as_store_class(), message)
                     .await,
             ),
-            CommitRevealOperation::RecordTransientFailure { task_id, message } => {
+            SubmissionOperation::RecordTransientFailure { task_id, message } => {
                 store_ack(self.store.record_transient_failure(task_id, message).await)
             }
         }
@@ -343,51 +307,45 @@ impl CreateWorker {
     /// the unstick sweep still sees a possibly-stuck tx; the cached nonce is
     /// released on every failure path so the next send re-syncs with the
     /// chain.
-    async fn submit(&self, role: NonceRole, tasks: &[CreateTask]) -> TxOutcome {
-        let Ok(nonce) = self.acquire(role).await else {
+    async fn submit(&self, task: &RegisterTask) -> TxOutcome {
+        let Ok(nonce) = self.acquire().await else {
             return TxOutcome::NoncePoolUnavailable;
         };
-        let sent = match role {
-            NonceRole::Commit => self.chain.commit(tasks, nonce).await,
-            NonceRole::Create => self.chain.create(tasks, nonce).await,
-        };
-        match sent {
+        match self.chain.register(task, nonce).await {
             Ok(Broadcast { hash, fees_wei }) => {
-                self.record_pending(role, nonce, &hash, fees_wei).await;
+                self.record_pending(nonce, &hash, fees_wei).await;
                 match self.chain.wait_for_receipt(&hash, RECEIPT_TIMEOUT).await {
-                    Ok(ReceiptStatus::Success) => {
-                        self.clear_pending(role, nonce).await;
-                        TxOutcome::Confirmed { tx_hash: hash }
+                    Ok(ReceiptOutcome::Success { first_entry_id }) => {
+                        self.clear_pending(nonce).await;
+                        TxOutcome::Confirmed {
+                            tx_hash: hash,
+                            first_entry_id,
+                        }
                     }
-                    Ok(ReceiptStatus::Reverted) => {
-                        self.clear_pending(role, nonce).await;
-                        self.release(role).await;
+                    Ok(ReceiptOutcome::Reverted) => {
+                        self.clear_pending(nonce).await;
+                        self.release().await;
                         TxOutcome::Reverted { tx_hash: hash }
                     }
                     Err(error) => {
-                        self.release(role).await;
+                        self.release().await;
                         TxOutcome::ReceiptUncertain { error }
                     }
                 }
             }
             Err(error) => {
-                self.release(role).await;
+                self.release().await;
                 TxOutcome::SendFailed { error }
             }
         }
     }
 
-    async fn acquire(&self, role: NonceRole) -> Result<u64, WorkerError> {
-        let mut values = self.nonces.values.lock().await;
-        let value = values.entry(role).or_insert(None);
+    async fn acquire(&self) -> Result<u64, WorkerError> {
+        let mut value = self.nonces.value.lock().await;
         if value.is_none() {
-            let wallet_role = match role {
-                NonceRole::Create => WalletRole::Create,
-                NonceRole::Commit => WalletRole::Commit,
-            };
             *value = Some(
                 self.chain
-                    .pending_nonce(wallet_role)
+                    .pending_nonce(WalletRole::Register)
                     .await
                     .map_err(|_| WorkerError::new("could not acquire pending chain nonce"))?,
             );
@@ -397,36 +355,40 @@ impl CreateWorker {
         Ok(nonce)
     }
 
-    async fn release(&self, role: NonceRole) {
-        self.nonces.values.lock().await.insert(role, None);
+    async fn release(&self) {
+        *self.nonces.value.lock().await = None;
     }
 
     /// Record a freshly-broadcast tx in the ledger so the unstick sweep can replace it if its
     /// receipt never arrives. Best-effort: a ledger write failure must not fail the send path.
-    async fn record_pending(
-        &self,
-        role: NonceRole,
-        nonce: u64,
-        hash: &str,
-        fees_wei: Option<(u128, u128)>,
-    ) {
+    async fn record_pending(&self, nonce: u64, hash: &str, fees_wei: Option<(u128, u128)>) {
         let _ = self
             .store
-            .record_pending_tx(role_name(role), nonce, hash, now_ms(), 0, fees_wei)
+            .record_pending_tx(
+                WalletRole::Register.ledger_name(),
+                nonce,
+                hash,
+                now_ms(),
+                0,
+                fees_wei,
+            )
             .await;
     }
 
     /// Clear the ledger only once a receipt is definite (success or reverted). On a receipt
     /// timeout the row is deliberately kept so the unstick sweep still sees a possibly-stuck tx.
-    async fn clear_pending(&self, role: NonceRole, nonce: u64) {
-        let _ = self.store.delete_pending_tx(role_name(role), nonce).await;
+    async fn clear_pending(&self, nonce: u64) {
+        let _ = self
+            .store
+            .delete_pending_tx(WalletRole::Register.ledger_name(), nonce)
+            .await;
     }
 }
 
-fn store_ack<T>(result: Result<T, crate::store::StoreError>) -> CommitRevealResult {
+fn store_ack<T>(result: Result<T, crate::store::StoreError>) -> SubmissionResult {
     match result {
-        Ok(_) => CommitRevealResult::Persisted,
-        Err(_) => CommitRevealResult::StoreUnavailable,
+        Ok(_) => SubmissionResult::Persisted,
+        Err(_) => SubmissionResult::StoreUnavailable,
     }
 }
 
@@ -463,13 +425,6 @@ async fn ensure_consumer_group(
     Err(WorkerError::new("could not create Iggy consumer group"))
 }
 
-fn role_name(role: NonceRole) -> &'static str {
-    match role {
-        NonceRole::Create => "create",
-        NonceRole::Commit => "commit",
-    }
-}
-
 /// Wall-clock milliseconds, used for the pending-tx ledger whose ages are
 /// compared across processes by the unstick sweep.
 fn now_ms() -> u64 {
@@ -483,14 +438,6 @@ fn now_ms() -> u64 {
 /// only ever compares these timestamps to each other, so a process-local
 /// monotonic clock is correct and immune to wall-clock steps — matching the
 /// original worker's `Instant`-based elapsed check.
-fn monotonic_ms() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-}
-
 #[derive(Debug)]
 struct WorkerError(String);
 
@@ -511,20 +458,22 @@ impl std::error::Error for WorkerError {}
 #[cfg(test)]
 mod e2e_chain_tests {
     use std::{
-        collections::HashMap,
         env,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::elliptic_curve::Generate as _;
+    use sha2::{Digest, Sha256};
     use tokio::sync::Mutex;
 
     use super::{CreateWorker, NonceManager};
     use crate::{chain::Chain, config::Config, store::RedisStore};
     use p256_registrar::{
-        task::{CreateTask, TaskStatus},
-        wallet::{build_wallet_ref, default_metadata},
+        protocol::{challenge_for, parse_b256},
+        task::{Member, Proof, RegisterTask, TaskStatus},
+        verify::base64url_32,
     };
 
     fn now_ms() -> u64 {
@@ -534,30 +483,31 @@ mod e2e_chain_tests {
             .as_millis() as u64
     }
 
-    /// Full replacement proof for the retired Deno queue worker's on-chain write path: a single
-    /// create task is driven through commit -> reveal -> create -> done against the real Gnosis
-    /// chain, then confirmed on-chain. This spends real gas from the funded `.env` PRIVATE_KEY, so
-    /// it is double-gated: `#[ignore]` keeps it out of `cargo test`, and it no-ops unless
+    /// One register task is driven through submit -> done against the real
+    /// Gnosis registry, then confirmed on-chain. This spends real gas from
+    /// the funded `.env` PRIVATE_KEY, so it is double-gated: `#[ignore]`
+    /// keeps it out of `cargo test`, and it no-ops unless
     /// `P256_INDEX_E2E_CHAIN=1` even when run with `--ignored`.
     ///
     /// ```sh
     /// P256_INDEX_E2E_CHAIN=1 cargo test --lib -- --ignored --nocapture \
-    ///   e2e_chain_tests::create_persists_on_chain_end_to_end
+    ///   e2e_chain_tests::register_persists_on_chain_end_to_end
     /// ```
     #[tokio::test]
     #[ignore = "requires P256_INDEX_E2E_CHAIN=1 and a funded PRIVATE_KEY (spends real gas)"]
-    async fn create_persists_on_chain_end_to_end() {
+    async fn register_persists_on_chain_end_to_end() {
         if env::var("P256_INDEX_E2E_CHAIN").as_deref() != Ok("1") {
             eprintln!("skipping on-chain e2e: set P256_INDEX_E2E_CHAIN=1 to run (spends gas)");
             return;
         }
 
-        // Real chain (funded signer + Alchemy) and Redis come from the crate `.env`.
+        // Real chain (funded signer + registry address) and Redis come from
+        // the crate `.env`.
         let config = Config::from_env().expect("Config::from_env from .env");
         let chain = Chain::new(&config).expect("real Chain");
         assert!(
-            chain.has_signers(),
-            "PRIVATE_KEY with derived commit key is required for the on-chain e2e"
+            chain.has_signer(),
+            "PRIVATE_KEY is required for the on-chain e2e"
         );
         let redis_url =
             env::var("P256_INDEX_TEST_REDIS_URL").unwrap_or_else(|_| config.redis_url.clone());
@@ -565,40 +515,73 @@ mod e2e_chain_tests {
             .await
             .expect("Redis connect");
 
-        // A fresh, unique, valid task persisted as an admitted pending record.
-        let signing_key = p256::SecretKey::generate();
-        let public_key = hex::encode(signing_key.public_key().to_sec1_point(false).as_bytes());
-        let wallet_ref = build_wallet_ref(&public_key).expect("wallet ref");
+        // A fresh key with a REAL possession proof over its storage challenge.
+        let signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+        let public_key = hex::encode(signing.verifying_key().to_sec1_point(false).as_bytes());
         let suffix = uuid::Uuid::new_v4();
-        let task = CreateTask {
+        let rp_id = format!("e2e-chain-{suffix}.example");
+        let nonce_hex = format!(
+            "0x{}",
+            hex::encode(uuid::Uuid::new_v4().as_bytes().repeat(2))
+        );
+        let nonce = parse_b256(&nonce_hex).unwrap();
+        let registry = config.contract_address.parse().expect("registry address");
+        let challenge = challenge_for(
+            chain.chain_id(),
+            registry,
+            &rp_id,
+            &hex::decode(&public_key).unwrap(),
+            nonce,
+        );
+        let client_data = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
+            base64url_32(&challenge)
+        );
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        auth_data.push(0x05);
+        auth_data.extend_from_slice(&[0, 0, 0, 0]);
+        let client_hash: [u8; 32] = Sha256::digest(client_data.as_bytes()).into();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&client_hash);
+        let digest: [u8; 32] = Sha256::digest(&signed).into();
+        let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let bytes = signature.to_bytes();
+
+        let task = RegisterTask {
             id: format!("e2e-chain-{suffix}"),
             status: TaskStatus::Pending,
-            rp_id: format!("e2e-chain-{suffix}.example"),
-            credential_id: format!("cred-{suffix}"),
-            wallet_ref: wallet_ref.clone(),
-            public_key: public_key.clone(),
-            name: "on-chain e2e".to_owned(),
-            initial_credential_id: format!("cred-{suffix}"),
-            metadata: default_metadata(&public_key).expect("default metadata"),
-            members: Vec::new(),
+            rp_id: rp_id.clone(),
+            metadata: "0xe2e0".into(),
+            unit_nonce: nonce_hex,
+            members: vec![Member {
+                public_key: public_key.clone(),
+                attestation: String::new(),
+                proof: Proof {
+                    authenticator_data: hex::encode(auth_data),
+                    client_data_json: client_data,
+                    challenge_index: 23,
+                    type_index: 1,
+                    r: format!("0x{}", hex::encode(&bytes[..32])),
+                    s: format!("0x{}", hex::encode(&bytes[32..])),
+                },
+            }],
             tx_hash: None,
+            first_entry_id: None,
             error: None,
             retries: 0,
             created_at: now_ms() as i64,
             admitted: true,
         };
         store.admit(&task).await.expect("admit task");
-        store.mark_admitted(&task.id).await.expect("mark admitted");
 
-        // Drive exactly this task through the real worker chain logic — no Iggy topic drain, so no
-        // other queued message can ever be written on-chain by this test.
         let worker = CreateWorker {
             store: store.clone(),
             chain: chain.clone(),
-            consumer_url: config.iggy_consumer_url.clone(),
-            consumer_group: config.iggy_consumer_group.clone(),
+            consumer_url: String::new(),
+            consumer_group: String::new(),
             nonces: Arc::new(NonceManager {
-                values: Mutex::new(HashMap::new()),
+                value: Mutex::new(None),
             }),
         };
         worker
@@ -606,26 +589,24 @@ mod e2e_chain_tests {
             .await
             .expect("process_batch drives the task to done on-chain");
 
-        // Terminal success in Redis, and the record is visible on-chain.
-        let done = store
+        let stored = store
             .get_task(&task.id)
             .await
             .expect("load task")
-            .expect("task still present");
-        assert_eq!(done.status, TaskStatus::Done);
-        assert!(done.tx_hash.is_some(), "a done task must carry its tx hash");
-        assert!(
-            chain
-                .has_record(&task.rp_id, &task.credential_id)
-                .await
-                .expect("has_record"),
-            "the credential must exist on-chain after the worker completes"
+            .expect("task exists");
+        assert_eq!(stored.status, TaskStatus::Done, "error: {:?}", stored.error);
+        assert!(stored.tx_hash.is_some());
+        eprintln!(
+            "on-chain e2e complete: tx {:?}, first entry {:?}",
+            stored.tx_hash, stored.first_entry_id
         );
-        let record = chain
-            .get_record(&task.rp_id, &task.credential_id)
+
+        // The entry is now readable by its key.
+        let page = chain
+            .entries_by_key(&public_key, 1, 10, false)
             .await
-            .expect("get_record")
-            .expect("record present on-chain");
-        assert_eq!(record.wallet_ref.to_lowercase(), wallet_ref.to_lowercase());
+            .expect("entries by key");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].metadata, "e2e0");
     }
 }

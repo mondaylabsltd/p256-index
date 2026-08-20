@@ -1,44 +1,65 @@
-//! The `CreateTask` lifecycle vocabulary.
+//! The `RegisterTask` lifecycle vocabulary.
 //!
-//! A task is the unit of work that carries one credential from an accepted
-//! create request to an on-chain record. Its status walks Pending → Committed
-//! → Done/Failed; the transition rules currently live in the server's worker
-//! and store and will migrate here as the `commit_reveal` domain.
+//! A task carries one registration unit — 1..7 possession-proven members
+//! sharing an rpId, an opaque metadata payload and a one-time unitNonce —
+//! from an accepted request to on-chain entries. Its status walks Pending →
+//! Done/Failed; there is no commit-reveal, so no intermediate state.
 
 use serde::{Deserialize, Serialize};
 
-/// One member of a multi-key wallet task, mirroring the contract's
-/// `WalletMember` struct (credential + key in derivation order).
+/// The WebAuthn-formatted possession proof for one member, mirroring the
+/// registry's `Proof` struct: `(r, s)` signs
+/// `sha256(authenticatorData || sha256(clientDataJSON))`, and clientDataJSON
+/// carries base64url(the member's storage-authorization challenge) at
+/// `challenge_index`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalletMember {
-    pub credential_id: String,
+pub struct Proof {
+    /// Hex (0x optional): rpIdHash(32) || flags(1) || counter(4) [|| ...].
+    pub authenticator_data: String,
+    /// The raw JSON string, exactly as signed.
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: String,
+    pub challenge_index: u64,
+    pub type_index: u64,
+    /// Hex 32-byte scalars.
+    pub r: String,
+    pub s: String,
+}
+
+/// One member of a registration unit, mirroring the registry's `Member`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Member {
+    /// Uncompressed P-256 point: 04 || x || y, hex (0x optional).
     pub public_key: String,
-    pub name: String,
+    /// Empty, or 20 versioned bytes of registration-time WebAuthn signals.
+    #[serde(default)]
+    pub attestation: String,
+    pub proof: Proof,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateTask {
+pub struct RegisterTask {
     pub id: String,
     pub status: TaskStatus,
     pub rp_id: String,
-    pub credential_id: String,
-    pub wallet_ref: String,
-    pub public_key: String,
-    pub name: String,
-    pub initial_credential_id: String,
+    /// The unit's shared opaque payload, hex, may be empty. Credential ids,
+    /// display names, wallet derivation preimages — all caller-defined.
     pub metadata: String,
-    /// Non-empty marks a multi-key WALLET task: the reveal is one atomic
-    /// `createWallet(rpId, walletRef, members)` call. The flat fields above
-    /// mirror `members[0]` so every single-record code path (placeholders,
-    /// reconciliation via the first member, disclosure) keeps working.
-    /// Empty (the serde default) is a plain single-key `createRecord` task,
-    /// keeping old queue/store payloads byte-compatible.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub members: Vec<WalletMember>,
+    /// The unit's one-time nonce (32-byte hex): every member's challenge
+    /// binds it, the contract consumes it, and it doubles as the service's
+    /// idempotency key.
+    pub unit_nonce: String,
+    /// 1..=7 members, registered atomically in one `register` transaction.
+    pub members: Vec<Member>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<String>,
+    /// The unit's first on-chain entry id once Done; members occupy
+    /// `first_entry_id .. first_entry_id + members.len()` contiguously.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_entry_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub retries: u32,
@@ -46,18 +67,10 @@ pub struct CreateTask {
     pub admitted: bool,
 }
 
-impl CreateTask {
-    /// True for a multi-key wallet task (atomic `createWallet` reveal).
-    pub fn is_wallet(&self) -> bool {
-        !self.members.is_empty()
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
     Pending,
-    Committed,
     Done,
     Failed,
 }

@@ -1,7 +1,6 @@
 use std::{env, net::SocketAddr, time::Duration};
 
 use anyhow::{Result, bail};
-use sha2::{Digest, Sha256};
 
 pub const DEFAULT_PORT: u16 = 11256;
 
@@ -9,7 +8,6 @@ pub const DEFAULT_PORT: u16 = 11256;
 pub struct Config {
     pub listen_addr: SocketAddr,
     pub private_key: Option<String>,
-    pub commit_private_key: Option<String>,
     pub alchemy_api_key: Option<String>,
     pub iggy_url: String,
     pub iggy_consumer_url: String,
@@ -24,10 +22,9 @@ pub struct Config {
     pub max_gas_price_wei: u128,
     pub iggy_enqueue_timeout: Duration,
     pub iggy_consumer_group: String,
-    /// Active index contract override (P256_INDEX_CONTRACT_ADDRESS). Point it
-    /// at the V3 deployment at cutover; unset falls back to the compiled-in
-    /// default in `p256_registrar::protocol::CONTRACT_ADDRESS`.
-    pub contract_address: Option<String>,
+    /// The deployed registry address (P256_INDEX_CONTRACT_ADDRESS). Always
+    /// required — the service is meaningless without a registry to read.
+    pub contract_address: String,
 }
 
 impl Config {
@@ -45,7 +42,6 @@ impl Config {
         if let Some(key) = private_key.as_deref() {
             validate_private_key(key)?;
         }
-        let commit_private_key = private_key.as_deref().map(derive_commit_key);
 
         let iggy_url = required("P256_INDEX_IGGY_URL")?;
         let redis_url = required("P256_INDEX_REDIS_URL")?;
@@ -71,7 +67,6 @@ impl Config {
         Ok(Self {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], port)),
             private_key,
-            commit_private_key,
             alchemy_api_key: optional("ALCHEMY_API_KEY"),
             iggy_url,
             iggy_consumer_url,
@@ -82,7 +77,7 @@ impl Config {
             telegram_chat_id: optional("TELEGRAM_CHAT_ID"),
             global_write_limit,
             max_gas_price_wei,
-            contract_address: optional("P256_INDEX_CONTRACT_ADDRESS"),
+            contract_address: required("P256_INDEX_CONTRACT_ADDRESS")?,
             iggy_enqueue_timeout: Duration::from_secs(
                 optional("P256_INDEX_IGGY_ENQUEUE_TIMEOUT_SECS")
                     .map(|value| value.parse::<u64>())
@@ -117,15 +112,9 @@ fn validate_private_key(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn derive_commit_key(private_key: &str) -> String {
-    let bytes = hex::decode(private_key.strip_prefix("0x").unwrap_or(private_key))
-        .expect("validated private key is hex");
-    format!("0x{}", hex::encode(Sha256::digest(bytes)))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{derive_commit_key, required_value};
+    use super::required_value;
 
     #[test]
     fn the_shipped_gas_cap_leaves_room_above_the_live_gnosis_base_fee() {
@@ -133,15 +122,6 @@ mod tests {
         // a cap below the market silently stalls every registration instead of
         // failing loudly. Observed Gnosis base fee is ~9_000 wei.
         const { assert!(p256_registrar::gas::DEFAULT_MAX_FEE_WEI > 9_960 * 100) };
-    }
-
-    #[test]
-    fn derives_a_distinct_commit_key_without_exposing_the_source() {
-        let private_key = "0x0000000000000000000000000000000000000000000000000000000000000001";
-        assert_eq!(
-            derive_commit_key(private_key),
-            "0xec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5"
-        );
     }
 
     #[test]

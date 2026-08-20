@@ -19,19 +19,16 @@ use serde_json::{Value, json};
 
 use p256_registrar::{
     gas::{self, FeePlan, FeeVerdict},
-    lookup::{Page, Record, SiteItem},
+    lookup::{Entry, Page, SiteItem},
     protocol::{
-        BATCH_HELPER_ADDRESS, CHAIN_ID, CONTRACT_ADDRESS, V2_CONTRACT_ADDRESS,
-        batch_commit_calldata, batch_create_calldata, build_commitment, decode_commit_block,
-        decode_has_record, decode_keys, decode_record, decode_record_by_wallet_ref, decode_sites,
-        decode_total, decode_total_wallets, index_get_commit_block_calldata,
-        index_get_record_by_wallet_ref_calldata, index_get_record_calldata,
-        index_has_record_calldata, index_keys_calldata, index_sites_calldata, index_total_calldata,
-        index_total_wallets_calldata, is_revert, wallet_create_calldata,
+        CHAIN_ID, UNIT_REGISTERED_TOPIC, decode_bool, decode_entries_page, decode_entry,
+        decode_has_entries, decode_rp_ids, decode_total, entries_by_key_calldata,
+        entries_by_rp_id_calldata, get_entry_calldata, has_entries_calldata,
+        is_content_registered_calldata, is_nonce_used_calldata, is_revert, register_calldata,
+        rp_ids_calldata, total_entries_calldata, total_rp_ids_calldata, total_units_calldata,
     },
     roster::{Lane, Roster},
-    task::CreateTask,
-    wallet::default_metadata,
+    task::RegisterTask,
 };
 
 // Chain's error vocabulary and its classification rules live in the registrar
@@ -52,13 +49,9 @@ const WRITE_RPCS: &[&str] = &[
 
 #[derive(Clone)]
 pub struct Chain {
-    /// The frozen V2 index, probed directly for cross-version wallet conflicts.
-    v2_address: Address,
     rpc: RpcPool,
-    index_address: Address,
-    batch_helper_address: Address,
-    create_key: Option<SecretKey>,
-    commit_key: Option<SecretKey>,
+    registry_address: Address,
+    signer_key: Option<SecretKey>,
     /// Absolute ceiling on `max_fee_per_gas`; see [`Config::max_gas_price_wei`].
     max_gas_price_wei: U256,
 }
@@ -72,10 +65,20 @@ struct RpcPool {
     roster: Arc<Mutex<Roster>>,
 }
 
+/// The service runs a single funded wallet (there is no commit wallet — the
+/// registry has no commit-reveal). The enum survives as the broadcast
+/// ledger's role vocabulary.
 #[derive(Clone, Copy)]
 pub enum WalletRole {
-    Create,
-    Commit,
+    Register,
+}
+
+impl WalletRole {
+    pub fn ledger_name(self) -> &'static str {
+        match self {
+            Self::Register => "register",
+        }
+    }
 }
 
 struct Transaction {
@@ -94,66 +97,58 @@ struct Transaction {
 pub struct Broadcast {
     pub hash: String,
     /// `(max_fee_per_gas, max_priority_fee_per_gas)` as signed. Both are needed
-    /// because a same-nonce replacement must outbid this transaction on each
+    /// because a same-nonce replacement must outbid the old transaction on each
     /// axis independently.
     pub fees_wei: Option<(u128, u128)>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum ReceiptStatus {
-    Success,
+/// A definite receipt verdict. On success the receipt's UnitRegistered log
+/// yields the unit's first entry id (absent for non-register transactions).
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum ReceiptOutcome {
+    Success { first_entry_id: Option<u64> },
     Reverted,
 }
 
-/// Read-only chain surface used by the HTTP API. Keeping this boundary explicit makes the
-/// public endpoint contract testable without a live RPC endpoint or a signing key.
+/// Read-only chain surface used by the HTTP API. Keeping this boundary
+/// explicit makes the public endpoint contract testable without a live RPC
+/// endpoint or a signing key.
 #[async_trait]
 pub trait ReadChain: Send + Sync {
     fn rpc_circuit_state(&self) -> &'static str;
-    /// The RESOLVED active index address (env override applied), so operator
-    /// surfaces like /api/health report what is actually being called.
-    fn index_address(&self) -> String;
-    async fn get_record(
+    /// The configured registry address, EIP-55 checksummed.
+    fn registry_address(&self) -> String;
+    async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError>;
+    async fn entries_by_key(
+        &self,
+        public_key: &str,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Page<Entry>, ChainError>;
+    async fn entries_by_rp_id(
         &self,
         rp_id: &str,
-        credential_id: &str,
-    ) -> Result<Option<Record>, ChainError>;
-    async fn get_record_by_wallet_ref(
-        &self,
-        wallet_ref: B256,
-    ) -> Result<Option<Record>, ChainError>;
-    /// Direct read against the frozen V2 index (cross-version conflict probe).
-    async fn get_v2_record_by_wallet_ref(
-        &self,
-        wallet_ref: B256,
-    ) -> Result<Option<Record>, ChainError>;
-    async fn total_credentials(&self) -> Result<u64, ChainError>;
-    /// None when the active contract predates getTotalWallets (still on V2).
-    async fn total_wallets(&self) -> Result<Option<u64>, ChainError>;
-    async fn list_sites(
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Page<Entry>, ChainError>;
+    async fn rp_ids(
         &self,
         page: u64,
         page_size: u64,
         descending: bool,
     ) -> Result<Page<SiteItem>, ChainError>;
-    async fn list_keys(
-        &self,
-        rp_id: &str,
-        page: u64,
-        page_size: u64,
-        descending: bool,
-    ) -> Result<Page<Record>, ChainError>;
+    /// (total entries, total units, total rpIds)
+    async fn totals(&self) -> Result<(u64, u64, u64), ChainError>;
+    async fn is_nonce_used(&self, unit_nonce: B256) -> Result<bool, ChainError>;
+    async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError>;
 }
 
 impl Chain {
     pub fn new(config: &Config) -> Result<Self> {
-        let create_key = config
+        let signer_key = config
             .private_key
-            .as_deref()
-            .map(parse_secret_key)
-            .transpose()?;
-        let commit_key = config
-            .commit_private_key
             .as_deref()
             .map(parse_secret_key)
             .transpose()?;
@@ -169,16 +164,9 @@ impl Chain {
                 FALLBACK_RPCS.iter().map(|url| (*url).to_owned()).collect(),
                 writes,
             )?,
-            index_address: Address::from_str(
-                config
-                    .contract_address
-                    .as_deref()
-                    .unwrap_or(CONTRACT_ADDRESS),
-            )?,
-            v2_address: Address::from_str(V2_CONTRACT_ADDRESS)?,
-            batch_helper_address: Address::from_str(BATCH_HELPER_ADDRESS)?,
-            create_key,
-            commit_key,
+            registry_address: Address::from_str(&config.contract_address)
+                .map_err(|_| anyhow!("P256_INDEX_CONTRACT_ADDRESS is not a valid address"))?,
+            signer_key,
             max_gas_price_wei: U256::from(config.max_gas_price_wei),
         })
     }
@@ -191,18 +179,22 @@ impl Chain {
         }
     }
 
-    pub fn has_signers(&self) -> bool {
-        self.create_key.is_some() && self.commit_key.is_some()
+    pub fn has_signer(&self) -> bool {
+        self.signer_key.is_some()
     }
 
-    pub async fn get_record(
-        &self,
-        rp_id: &str,
-        credential_id: &str,
-    ) -> Result<Option<Record>, ChainError> {
-        let data = index_get_record_calldata(rp_id.to_owned(), credential_id.to_owned());
-        match self.call_contract(self.index_address, data).await {
-            Ok(bytes) => decode_record(&bytes)
+    pub fn chain_id(&self) -> u64 {
+        CHAIN_ID
+    }
+
+    // ── Reads ──────────────────────────────────────────────────────────────
+
+    pub async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError> {
+        match self
+            .call_contract(self.registry_address, get_entry_calldata(entry_id))
+            .await
+        {
+            Ok(bytes) => decode_entry(&bytes)
                 .map(Some)
                 .map_err(|_| ChainError::InvalidResponse),
             Err(ChainError::Reverted(_)) => Ok(None),
@@ -210,140 +202,24 @@ impl Chain {
         }
     }
 
-    pub async fn get_record_by_wallet_ref(
+    pub async fn entries_by_key(
         &self,
-        wallet_ref: B256,
-    ) -> Result<Option<Record>, ChainError> {
-        match self
-            .call_contract(
-                self.index_address,
-                index_get_record_by_wallet_ref_calldata(wallet_ref),
-            )
-            .await
-        {
-            Ok(bytes) => decode_record_by_wallet_ref(&bytes)
-                .map(Some)
-                .map_err(|_| ChainError::InvalidResponse),
-            Err(ChainError::Reverted(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Probe the frozen V2 index directly. Metadata is normalized to the V3
-    /// packed convention (prefix word || pubkey), mirroring what the V3
-    /// contract's own read fallback returns, so cached copies stay uniform.
-    pub async fn get_v2_record_by_wallet_ref(
-        &self,
-        wallet_ref: B256,
-    ) -> Result<Option<Record>, ChainError> {
-        match self
-            .call_contract(
-                self.v2_address,
-                index_get_record_by_wallet_ref_calldata(wallet_ref),
-            )
-            .await
-        {
-            Ok(bytes) => {
-                let mut record =
-                    decode_record_by_wallet_ref(&bytes).map_err(|_| ChainError::InvalidResponse)?;
-                record.metadata = default_metadata(&record.public_key)
-                    .map_err(|_| ChainError::InvalidResponse)?
-                    .trim_start_matches("0x")
-                    .to_owned();
-                Ok(Some(record))
-            }
-            Err(ChainError::Reverted(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub async fn has_record(&self, rp_id: &str, credential_id: &str) -> Result<bool, ChainError> {
-        let bytes = self
-            .call_contract(
-                self.index_address,
-                index_has_record_calldata(rp_id.to_owned(), credential_id.to_owned()),
-            )
-            .await?;
-        decode_has_record(&bytes).map_err(|_| ChainError::InvalidResponse)
-    }
-
-    pub async fn get_commit_block(&self, commitment: B256) -> Result<u64, ChainError> {
-        let bytes = self
-            .call_contract(
-                self.index_address,
-                index_get_commit_block_calldata(commitment),
-            )
-            .await?;
-        decode_commit_block(&bytes).map_err(|_| ChainError::InvalidResponse)
-    }
-
-    pub async fn total_credentials(&self) -> Result<u64, ChainError> {
-        let bytes = self
-            .call_contract(self.index_address, index_total_calldata())
-            .await?;
-        decode_total(&bytes).map_err(|_| ChainError::InvalidResponse)
-    }
-
-    /// V3-only view; a V2 target has no such function, so a revert maps to
-    /// None and the stats payload simply omits the wallet count.
-    pub async fn total_wallets(&self) -> Result<Option<u64>, ChainError> {
-        match self
-            .call_contract(self.index_address, index_total_wallets_calldata())
-            .await
-        {
-            Ok(bytes) => decode_total_wallets(&bytes)
-                .map(Some)
-                .map_err(|_| ChainError::InvalidResponse),
-            Err(ChainError::Reverted(_)) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub async fn list_sites(
-        &self,
+        public_key: &str,
         page: u64,
         page_size: u64,
         descending: bool,
-    ) -> Result<Page<SiteItem>, ChainError> {
+    ) -> Result<Page<Entry>, ChainError> {
+        let key = hex::decode(public_key.strip_prefix("0x").unwrap_or(public_key))
+            .map_err(|_| ChainError::InvalidResponse)?;
         let offset = page.saturating_sub(1).saturating_mul(page_size);
         let bytes = self
             .call_contract(
-                self.index_address,
-                index_sites_calldata(offset, page_size, descending),
+                self.registry_address,
+                entries_by_key_calldata(key, offset, page_size, descending),
             )
             .await?;
         let (total, items) =
-            decode_sites(&bytes, page, page_size).map_err(|_| ChainError::InvalidResponse)?;
-        Ok(Page {
-            total,
-            page,
-            page_size,
-            items: items
-                .into_iter()
-                .map(|(rp_id, public_key_count, created_at)| SiteItem {
-                    rp_id,
-                    public_key_count,
-                    created_at,
-                })
-                .collect(),
-        })
-    }
-
-    pub async fn list_keys(
-        &self,
-        rp_id: &str,
-        page: u64,
-        page_size: u64,
-        descending: bool,
-    ) -> Result<Page<Record>, ChainError> {
-        let offset = page.saturating_sub(1).saturating_mul(page_size);
-        let bytes = self
-            .call_contract(
-                self.index_address,
-                index_keys_calldata(rp_id.to_owned(), offset, page_size, descending),
-            )
-            .await?;
-        let (total, items) = decode_keys(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+            decode_entries_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
         Ok(Page {
             total,
             page,
@@ -352,14 +228,109 @@ impl Chain {
         })
     }
 
-    pub async fn current_block(&self) -> Result<u64, ChainError> {
-        let value = self.rpc.call("eth_blockNumber", json!([])).await?;
-        parse_quantity_value(&value)
+    pub async fn entries_by_rp_id(
+        &self,
+        rp_id: &str,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Page<Entry>, ChainError> {
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                entries_by_rp_id_calldata(rp_id.to_owned(), offset, page_size, descending),
+            )
+            .await?;
+        let (total, items) =
+            decode_entries_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        Ok(Page {
+            total,
+            page,
+            page_size,
+            items,
+        })
+    }
+
+    pub async fn rp_ids(
+        &self,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Page<SiteItem>, ChainError> {
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                rp_ids_calldata(offset, page_size, descending),
+            )
+            .await?;
+        let (total, items) = decode_rp_ids(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        Ok(Page {
+            total,
+            page,
+            page_size,
+            items: items
+                .into_iter()
+                .map(|(rp_id, entry_count, created_at)| SiteItem {
+                    rp_id,
+                    entry_count,
+                    created_at,
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
+        let entries = self
+            .call_contract(self.registry_address, total_entries_calldata())
+            .await
+            .and_then(|bytes| decode_total(&bytes).map_err(|_| ChainError::InvalidResponse))?;
+        let units = self
+            .call_contract(self.registry_address, total_units_calldata())
+            .await
+            .and_then(|bytes| decode_total(&bytes).map_err(|_| ChainError::InvalidResponse))?;
+        let rp_ids = self
+            .call_contract(self.registry_address, total_rp_ids_calldata())
+            .await
+            .and_then(|bytes| decode_total(&bytes).map_err(|_| ChainError::InvalidResponse))?;
+        Ok((entries, units, rp_ids))
+    }
+
+    pub async fn has_entries(&self, public_key: &str) -> Result<bool, ChainError> {
+        let key = hex::decode(public_key.strip_prefix("0x").unwrap_or(public_key))
+            .map_err(|_| ChainError::InvalidResponse)?;
+        let bytes = self
+            .call_contract(self.registry_address, has_entries_calldata(key))
+            .await?;
+        decode_has_entries(&bytes).map_err(|_| ChainError::InvalidResponse)
+    }
+
+    pub async fn is_nonce_used(&self, unit_nonce: B256) -> Result<bool, ChainError> {
+        let bytes = self
+            .call_contract(self.registry_address, is_nonce_used_calldata(unit_nonce))
+            .await?;
+        decode_bool(&bytes).map_err(|_| ChainError::InvalidResponse)
+    }
+
+    pub async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError> {
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                is_content_registered_calldata(content_hash),
+            )
+            .await?;
+        decode_bool(&bytes).map_err(|_| ChainError::InvalidResponse)
     }
 
     pub async fn gas_price(&self) -> Result<U256, ChainError> {
         let value = self.rpc.call("eth_gasPrice", json!([])).await?;
         parse_u256_value(&value)
+    }
+
+    pub async fn current_block(&self) -> Result<u64, ChainError> {
+        let value = self.rpc.call("eth_blockNumber", json!([])).await?;
+        parse_quantity_value(&value)
     }
 
     pub async fn pending_nonce(&self, role: WalletRole) -> Result<u64, ChainError> {
@@ -395,42 +366,23 @@ impl Chain {
         parse_u256_value(&value)
     }
 
-    pub async fn commit(&self, tasks: &[CreateTask], nonce: u64) -> Result<Broadcast, ChainError> {
-        let commitments = tasks
-            .iter()
-            .map(build_commitment)
-            .collect::<Result<Vec<_>>>()
-            .map_err(|_| ChainError::Rejected("could not encode a commit".into()))?;
-        let data = batch_commit_calldata(self.index_address, commitments);
-        self.send_contract_transaction(WalletRole::Commit, self.batch_helper_address, data, nonce)
+    // ── Writes ─────────────────────────────────────────────────────────────
+
+    /// One register() transaction for one task.
+    pub async fn register(&self, task: &RegisterTask, nonce: u64) -> Result<Broadcast, ChainError> {
+        let data = register_calldata(task)
+            .map_err(|_| ChainError::Rejected("could not encode a register call".into()))?;
+        self.send_contract_transaction(WalletRole::Register, self.registry_address, data, nonce)
             .await
     }
 
-    pub async fn create(&self, tasks: &[CreateTask], nonce: u64) -> Result<Broadcast, ChainError> {
-        // A wallet task reveals alone as one atomic createWallet on the index
-        // itself; single-key tasks batch through the helper contract.
-        let (to, data) = if tasks.len() == 1 && tasks[0].is_wallet() {
-            (
-                self.index_address,
-                wallet_create_calldata(&tasks[0])
-                    .map_err(|_| ChainError::Rejected("could not encode a createWallet".into()))?,
-            )
-        } else {
-            (
-                self.batch_helper_address,
-                batch_create_calldata(self.index_address, tasks)
-                    .map_err(|_| ChainError::Rejected("could not encode a create batch".into()))?,
-            )
-        };
-        self.send_contract_transaction(WalletRole::Create, to, data, nonce)
-            .await
-    }
-
+    /// Wait for a definite receipt. On success, parse the UnitRegistered log
+    /// for the unit's first entry id.
     pub async fn wait_for_receipt(
         &self,
         hash: &str,
         timeout: Duration,
-    ) -> Result<ReceiptStatus, ChainError> {
+    ) -> Result<ReceiptOutcome, ChainError> {
         let started = Instant::now();
         while started.elapsed() < timeout {
             let value = self
@@ -446,8 +398,10 @@ impl Chain {
                 .and_then(Value::as_str)
                 .ok_or(ChainError::InvalidResponse)?;
             return match status {
-                "0x1" | "0x01" => Ok(ReceiptStatus::Success),
-                _ => Ok(ReceiptStatus::Reverted),
+                "0x1" | "0x01" => Ok(ReceiptOutcome::Success {
+                    first_entry_id: parse_first_entry_id(&value),
+                }),
+                _ => Ok(ReceiptOutcome::Reverted),
             };
         }
         Err(ChainError::Unavailable)
@@ -500,10 +454,8 @@ impl Chain {
         let estimate = self.estimate_gas_on(&url, from, to, &data).await?;
         let gas_limit = estimate.saturating_mul(120).saturating_div(100);
         if !gas::gas_limit_within_bounds(gas_limit) {
-            // A batch this large cannot be scheduled reliably against a
-            // 17M-gas block; broadcasting it would burn the fee for nothing.
             return Err(ChainError::Rejected(format!(
-                "gas limit {gas_limit} exceeds the {} cap; split the batch",
+                "gas limit {gas_limit} exceeds the {} cap",
                 gas::MAX_GAS_LIMIT
             )));
         }
@@ -655,26 +607,42 @@ impl Chain {
     async fn balance_on(&self, url: &str, address: Address) -> Result<U256, ChainError> {
         let value = self
             .rpc
-            .call_on(
-                url,
-                "eth_getBalance",
-                json!([address.to_string(), "latest"]),
-            )
+            .call("eth_getBalance", json!([address.to_string(), "latest"]))
             .await?;
+        let _ = url;
         parse_u256_value(&value)
     }
 
     fn wallet_key(&self, role: WalletRole) -> Result<&SecretKey, ChainError> {
-        match role {
-            WalletRole::Create => self.create_key.as_ref(),
-            WalletRole::Commit => self.commit_key.as_ref(),
-        }
-        .ok_or(ChainError::MissingSigner)
+        let WalletRole::Register = role;
+        self.signer_key.as_ref().ok_or(ChainError::MissingSigner)
     }
 
     pub fn wallet_address(&self, role: WalletRole) -> Result<Address, ChainError> {
         Ok(signer_address(self.wallet_key(role)?))
     }
+}
+
+/// Extract the unit's first entry id from a register receipt's
+/// UnitRegistered(uint256 indexed unitId, bytes32 indexed rpIdHash,
+/// uint256 firstEntryId, uint256 memberCount) log.
+fn parse_first_entry_id(receipt: &Value) -> Option<u64> {
+    let logs = receipt.get("logs")?.as_array()?;
+    for log in logs {
+        let topics = log.get("topics")?.as_array()?;
+        if topics.first()?.as_str()? != UNIT_REGISTERED_TOPIC {
+            continue;
+        }
+        let data = log.get("data")?.as_str()?;
+        let raw = data.strip_prefix("0x").unwrap_or(data);
+        if raw.len() < 64 {
+            return None;
+        }
+        return u64::from_str_radix(raw[..64].trim_start_matches('0'), 16)
+            .ok()
+            .or(Some(0));
+    }
+    None
 }
 
 #[async_trait]
@@ -683,57 +651,53 @@ impl ReadChain for Chain {
         Chain::rpc_circuit_state(self)
     }
 
-    fn index_address(&self) -> String {
-        format!("{:#x}", self.index_address)
+    fn registry_address(&self) -> String {
+        self.registry_address.to_checksum(None)
     }
 
-    async fn get_record(
+    async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError> {
+        Chain::entry(self, entry_id).await
+    }
+
+    async fn entries_by_key(
+        &self,
+        public_key: &str,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Page<Entry>, ChainError> {
+        Chain::entries_by_key(self, public_key, page, page_size, descending).await
+    }
+
+    async fn entries_by_rp_id(
         &self,
         rp_id: &str,
-        credential_id: &str,
-    ) -> Result<Option<Record>, ChainError> {
-        Chain::get_record(self, rp_id, credential_id).await
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Page<Entry>, ChainError> {
+        Chain::entries_by_rp_id(self, rp_id, page, page_size, descending).await
     }
 
-    async fn get_record_by_wallet_ref(
-        &self,
-        wallet_ref: B256,
-    ) -> Result<Option<Record>, ChainError> {
-        Chain::get_record_by_wallet_ref(self, wallet_ref).await
-    }
-
-    async fn get_v2_record_by_wallet_ref(
-        &self,
-        wallet_ref: B256,
-    ) -> Result<Option<Record>, ChainError> {
-        Chain::get_v2_record_by_wallet_ref(self, wallet_ref).await
-    }
-
-    async fn total_credentials(&self) -> Result<u64, ChainError> {
-        Chain::total_credentials(self).await
-    }
-
-    async fn total_wallets(&self) -> Result<Option<u64>, ChainError> {
-        Chain::total_wallets(self).await
-    }
-
-    async fn list_sites(
+    async fn rp_ids(
         &self,
         page: u64,
         page_size: u64,
         descending: bool,
     ) -> Result<Page<SiteItem>, ChainError> {
-        Chain::list_sites(self, page, page_size, descending).await
+        Chain::rp_ids(self, page, page_size, descending).await
     }
 
-    async fn list_keys(
-        &self,
-        rp_id: &str,
-        page: u64,
-        page_size: u64,
-        descending: bool,
-    ) -> Result<Page<Record>, ChainError> {
-        Chain::list_keys(self, rp_id, page, page_size, descending).await
+    async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
+        Chain::totals(self).await
+    }
+
+    async fn is_nonce_used(&self, unit_nonce: B256) -> Result<bool, ChainError> {
+        Chain::is_nonce_used(self, unit_nonce).await
+    }
+
+    async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError> {
+        Chain::is_content_registered(self, content_hash).await
     }
 }
 
@@ -845,8 +809,7 @@ fn sign_eip1559(
     // These two are deliberately distinct. `max_fee_per_gas` is a ceiling, not
     // a price — the chain charges `min(max_fee, base_fee + priority)` — so the
     // headroom in it is free and is what keeps the transaction includable as
-    // the base fee climbs. Setting both to the same quoted number (the
-    // original behaviour) removed that headroom entirely.
+    // the base fee climbs.
     let max_fee_per_gas = u128::try_from(fees.max_fee_per_gas)
         .map_err(|_| ChainError::Rejected("gas price exceeds u128".into()))?;
     let max_priority_fee_per_gas = u128::try_from(fees.max_priority_fee_per_gas)
@@ -891,7 +854,7 @@ mod tests {
     use alloy::primitives::U256;
     use serde_json::json;
 
-    use super::{parse_quantity_value, parse_u256_value};
+    use super::{parse_first_entry_id, parse_quantity_value, parse_u256_value};
 
     #[test]
     fn parses_json_rpc_hex_quantities_without_precision_loss() {
@@ -899,6 +862,72 @@ mod tests {
         assert_eq!(
             parse_u256_value(&json!("0xffffffffffffffff")).unwrap(),
             U256::from(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn extracts_the_first_entry_id_from_a_register_receipt() {
+        let receipt = json!({
+            "logs": [
+                { "topics": ["0xdead"], "data": "0x" },
+                {
+                    "topics": [p256_registrar::protocol::UNIT_REGISTERED_TOPIC, "0x01", "0x02"],
+                    // firstEntryId = 0x2a, memberCount = 3
+                    "data": format!("0x{:064x}{:064x}", 0x2a, 3),
+                },
+            ]
+        });
+        assert_eq!(parse_first_entry_id(&receipt), Some(42));
+        // firstEntryId zero decodes as zero, not None.
+        let zero = json!({
+            "logs": [{
+                "topics": [p256_registrar::protocol::UNIT_REGISTERED_TOPIC],
+                "data": format!("0x{:064x}{:064x}", 0, 1),
+            }]
+        });
+        assert_eq!(parse_first_entry_id(&zero), Some(0));
+        assert_eq!(parse_first_entry_id(&json!({"logs": []})), None);
+    }
+
+    use std::time::Duration;
+
+    use crate::config::Config;
+
+    fn offline_config(private_key: Option<&str>) -> Config {
+        Config {
+            listen_addr: "127.0.0.1:0".parse().expect("test address"),
+            private_key: private_key.map(str::to_owned),
+            alchemy_api_key: None,
+            iggy_url: "iggy+tcp://unused".into(),
+            iggy_consumer_url: "iggy+tcp://unused".into(),
+            iggy_provisioner_url: "iggy+tcp://unused".into(),
+            redis_url: "redis://unused".into(),
+            queue_worker_enabled: false,
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            max_gas_price_wei: p256_registrar::gas::DEFAULT_MAX_FEE_WEI,
+            global_write_limit: 10_000,
+            iggy_enqueue_timeout: Duration::from_secs(1),
+            iggy_consumer_group: "test".into(),
+            contract_address: "0x1111111111111111111111111111111111111111".into(),
+        }
+    }
+
+    #[test]
+    fn registry_address_renders_eip55_checksummed() {
+        use super::ReadChain as _;
+        let chain = super::Chain::new(&offline_config(None)).expect("read-only chain");
+        assert_eq!(
+            chain.registry_address(),
+            "0x1111111111111111111111111111111111111111"
+        );
+        let mut mixed = offline_config(None);
+        mixed.contract_address = "0xDD93420bd49baabdff4a363ddd300622ae87e9c3".into();
+        let chain = super::Chain::new(&mixed).expect("read-only chain");
+        // Re-checksummed, not echoed.
+        assert_eq!(
+            chain.registry_address(),
+            "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3"
         );
     }
 }

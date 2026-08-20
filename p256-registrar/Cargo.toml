@@ -11,6 +11,7 @@ alloy = { version = "2.2.0", default-features = false, features = ["sol-types"] 
 anyhow = "1"
 crux_core = "0.19"
 hex = "0.4"
+sha2 = "0.10"
 p256 = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

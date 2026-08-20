@@ -139,7 +139,7 @@ impl Maintenance {
             }
         };
 
-        for role in [WalletRole::Create, WalletRole::Commit] {
+        for role in [WalletRole::Register] {
             let confirmed = match self.chain.confirmed_nonce(role).await {
                 Ok(nonce) => nonce,
                 Err(_) => {
@@ -296,7 +296,7 @@ impl Maintenance {
 
         // Low funding runway on the create wallet: top up before creates start failing.
         if let (Ok(balance), Ok(price)) = (
-            self.chain.balance(WalletRole::Create).await,
+            self.chain.balance(WalletRole::Register).await,
             self.chain.gas_price().await,
         ) {
             let runway = sentinel::estimate_create_runway(wei_to_xdai(balance), wei_to_gwei(price));
@@ -341,27 +341,19 @@ impl Maintenance {
 
         let stats = self.store.queue_stats().await.ok();
         let gas_price = self.chain.gas_price().await.ok();
-        let create_address = self
+        let wallet_address = self
             .chain
-            .wallet_address(WalletRole::Create)
+            .wallet_address(WalletRole::Register)
             .map(|a| a.to_string())
             .unwrap_or_default();
-        let commit_address = self
-            .chain
-            .wallet_address(WalletRole::Commit)
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        let create_balance = self.chain.balance(WalletRole::Create).await.ok();
-        let commit_balance = self.chain.balance(WalletRole::Commit).await.ok();
+        let wallet_balance = self.chain.balance(WalletRole::Register).await.ok();
 
         let message = sentinel::build_heartbeat_message(&sentinel::HeartbeatInput {
             runtime: "Rust",
             queue_depth: stats.as_ref().map(|s| s.depth).unwrap_or(0),
             dlq_count: stats.as_ref().map(|s| s.dlq_count).unwrap_or(0),
-            create_address: &create_address,
-            create_balance_xdai: create_balance.map(wei_to_xdai).unwrap_or(0.0),
-            commit_address: &commit_address,
-            commit_balance_xdai: commit_balance.map(wei_to_xdai).unwrap_or(0.0),
+            wallet_address: &wallet_address,
+            wallet_balance_xdai: wallet_balance.map(wei_to_xdai).unwrap_or(0.0),
             gas_price_gwei: gas_price.map(wei_to_gwei).unwrap_or(0.0),
             uptime: self.started.elapsed(),
             release: self.release.as_deref(),
@@ -389,10 +381,7 @@ enum AlertKind {
 }
 
 fn role_name(role: WalletRole) -> &'static str {
-    match role {
-        WalletRole::Create => "create",
-        WalletRole::Commit => "commit",
-    }
+    role.ledger_name()
 }
 
 fn wei_to_xdai(wei: U256) -> f64 {

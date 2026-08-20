@@ -100,17 +100,15 @@ pub fn low_runway_alert(runway: f64, balance_xdai: f64, gas_price_gwei: f64) -> 
 // ── Daily heartbeat ────────────────────────────────────────────────────────
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Rough all-in gas per create (commit + createRecord shares). Only used for the runway estimate.
-pub const EST_GAS_PER_CREATE: u64 = 300_000;
+/// Rough all-in gas per single-member register(). Only used for the runway estimate.
+pub const EST_GAS_PER_CREATE: u64 = 700_000;
 
 pub struct HeartbeatInput<'a> {
     pub runtime: &'a str,
     pub queue_depth: u64,
     pub dlq_count: u64,
-    pub create_address: &'a str,
-    pub create_balance_xdai: f64,
-    pub commit_address: &'a str,
-    pub commit_balance_xdai: f64,
+    pub wallet_address: &'a str,
+    pub wallet_balance_xdai: f64,
     pub gas_price_gwei: f64,
     pub uptime: Duration,
     pub release: Option<&'a str>,
@@ -126,7 +124,7 @@ pub fn estimate_create_runway(balance_xdai: f64, gas_price_gwei: f64) -> f64 {
 }
 
 pub fn build_heartbeat_message(input: &HeartbeatInput) -> String {
-    let runway = estimate_create_runway(input.create_balance_xdai, input.gas_price_gwei);
+    let runway = estimate_create_runway(input.wallet_balance_xdai, input.gas_price_gwei);
     let runway_text = if runway.is_infinite() {
         "∞".to_owned()
     } else {
@@ -151,20 +149,17 @@ pub fn build_heartbeat_message(input: &HeartbeatInput) -> String {
         .map(|release| format!(", release {release}"))
         .unwrap_or_default();
     format!(
-        "💓 [webauthnp256-publickey-index] [{}] [Gnosis] daily heartbeat\n\
+        "💓 [webauthnp256-publickey-registry] [{}] [Gnosis] daily heartbeat\n\
          {attention}\
          queue: {} active, {} DLQ\n\
-         create wallet {}: {:.6} xDAI ({runway_text} creates @ {:.3} gwei)\n\
-         commit wallet {}: {:.6} xDAI\n\
+         wallet {}: {:.6} xDAI ({runway_text} registrations @ {:.3} gwei)\n\
          up {up_text}{release}",
         input.runtime,
         input.queue_depth,
         input.dlq_count,
-        input.create_address,
-        input.create_balance_xdai,
+        input.wallet_address,
+        input.wallet_balance_xdai,
         input.gas_price_gwei,
-        input.commit_address,
-        input.commit_balance_xdai,
     )
 }
 
@@ -194,10 +189,10 @@ mod tests {
 
     #[test]
     fn runway_multiplies_before_dividing() {
-        assert_eq!(EST_GAS_PER_CREATE, 300_000);
-        assert_eq!(estimate_create_runway(0.3, 1.0), 1000.0);
-        assert_eq!(estimate_create_runway(0.3, 10.0), 100.0);
-        assert!(estimate_create_runway(0.3, 0.0).is_infinite());
+        assert_eq!(EST_GAS_PER_CREATE, 700_000);
+        assert_eq!(estimate_create_runway(0.7, 1.0), 1000.0);
+        assert_eq!(estimate_create_runway(0.7, 10.0), 100.0);
+        assert!(estimate_create_runway(0.7, 0.0).is_infinite());
     }
 
     #[test]
@@ -206,10 +201,8 @@ mod tests {
             runtime: "Rust",
             queue_depth: 2,
             dlq_count: 0,
-            create_address: "0xAAA",
-            create_balance_xdai: 0.3,
-            commit_address: "0xBBB",
-            commit_balance_xdai: 0.019,
+            wallet_address: "0xAAA",
+            wallet_balance_xdai: 0.7,
             gas_price_gwei: 1.0,
             uptime: Duration::from_secs(3 * 3_600),
             release: Some("20260710-004026"),
@@ -217,10 +210,9 @@ mod tests {
         assert!(message.contains("daily heartbeat"));
         assert!(message.contains("2 active, 0 DLQ"));
         assert!(
-            message.contains("0xAAA: 0.300000 xDAI (~1000 creates @ 1.000 gwei)"),
+            message.contains("0xAAA: 0.700000 xDAI (~1000 registrations @ 1.000 gwei)"),
             "{message}"
         );
-        assert!(message.contains("0xBBB: 0.019000 xDAI"));
         assert!(message.contains("up 3h"));
         assert!(message.contains("release 20260710-004026"));
         assert!(
@@ -235,10 +227,8 @@ mod tests {
             runtime: "Rust",
             queue_depth: 0,
             dlq_count: 3,
-            create_address: "0xAAA",
-            create_balance_xdai: 0.1,
-            commit_address: "0xBBB",
-            commit_balance_xdai: 0.01,
+            wallet_address: "0xAAA",
+            wallet_balance_xdai: 0.1,
             gas_price_gwei: 1.5,
             uptime: Duration::from_secs(73 * 3_600),
             release: None,

@@ -1,49 +1,39 @@
-//! The lookup domain: read-side vocabulary, the read-through cache policy,
-//! and the pre-reveal disclosure rules.
+//! Read-side vocabulary and cache policy: the decision half of every query
+//! endpoint.
 //!
-//! One [`LookupApp`] instance drives one query request. The five server
-//! handlers (`/api/query` by record or wallet ref, `/api/stats/total`,
-//! `/api/stats/sites`, `/api/stats/keys`) used to hand-expand the same
-//! read-through skeleton five times; here it is one program parameterized by
-//! [`LookupEndpoint`]:
+//! One [`LookupApp`] instance drives one HTTP query to a [`LookupOutcome`].
+//! The rules:
 //!
-//! - parameter validation and pagination clamps (page ≥ 1, pageSize 1..=100
-//!   default 20, descending unless `order=asc`), with the page > 10 000
-//!   short-circuit that answers an empty page without touching the chain;
-//! - cache read with per-kind freshness: record/wallet reads honour negative
-//!   entries (falling back to in-flight tasks), stats reads treat a negative
-//!   entry as a miss — exactly as the original handlers did;
-//! - the uncached-read rate limit, fail-open on store errors;
-//! - chain fetch, then a must-succeed cache backfill (`allow_stale` differs
-//!   by kind), a negative-cache write on empty record results, and the
-//!   stale-downgrade decision when the chain is unavailable;
-//! - the queue fallback re-uses [`crate::admission::is_active_placeholder`]:
-//!   a non-Failed in-flight task answers for a record the chain does not
-//!   have yet.
+//! - read-through cache per rendered response page: fresh hit → serve, no
+//!   RPC; miss → rate-limited chain fetch → backfill;
+//! - stale grace: when the chain read fails and a stale copy exists within
+//!   its TTL class (records 24h, stats 1h — durations owned by the shell),
+//!   serve it marked `_stale`;
+//! - a key with no on-chain entries but an in-flight task answers with a
+//!   `_queue` marker instead of an empty page, so "submitted to p256-index"
+//!   is always visible before it lands on-chain ("没上链前先查 p256-index");
+//! - entry-by-id misses are negative-cached briefly to absorb hot 404s.
 //!
-//! Disclosure is commit-reveal policy and lives here as pure functions:
-//! [`task_status_body`] reveals the sensitive fields (credentialId,
-//! walletRef, txHash) only once a task is Done; [`queue_fallback_body`] is
-//! the fallback shape. Both used to be duplicated response builders in
-//! `http.rs`.
+//! The shell owns key naming, TTL values, Redis and RPC execution.
 
 use crux_core::{App, Command, command::CommandContext, macros::effect};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::admission::{is_active_placeholder, validate_strings, validate_wallet_ref};
-use crate::task::{CreateTask, TaskStatus};
+use crate::task::{RegisterTask, TaskStatus};
 
+/// One registry entry joined with its unit, as served to clients.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Record {
-    pub rp_id: String,
-    pub credential_id: String,
-    pub wallet_ref: String,
+pub struct Entry {
+    pub entry_id: u64,
+    pub unit_id: u64,
     pub public_key: String,
-    pub name: String,
-    pub initial_credential_id: String,
+    pub attestation: String,
+    pub rp_id: String,
     pub metadata: String,
+    pub first_entry_id: u64,
+    pub member_count: u32,
     pub created_at: u64,
 }
 
@@ -51,7 +41,7 @@ pub struct Record {
 #[serde(rename_all = "camelCase")]
 pub struct SiteItem {
     pub rp_id: String,
-    pub public_key_count: u64,
+    pub entry_count: u64,
     pub created_at: u64,
 }
 
@@ -64,93 +54,91 @@ pub struct Page<T> {
     pub items: Vec<T>,
 }
 
-// ── Disclosure (commit-reveal policy) ──────────────────────────────────────
+/// "A non-Failed in-flight task is a valid placeholder."
+pub fn is_active_placeholder(task: &RegisterTask) -> bool {
+    task.status != TaskStatus::Failed
+}
 
-/// The `/api/create/{id}` status body. Before a task reaches Done, the
-/// commitment must stay unrevealable: credentialId, walletRef and txHash are
-/// withheld and the last error is shown instead.
-pub fn task_status_body(task: &CreateTask) -> Value {
-    if task.status == TaskStatus::Done {
-        return json!({
-            "id": task.id,
-            "status": task.status,
-            "rpId": task.rp_id,
-            "credentialId": task.credential_id,
-            "walletRef": task.wallet_ref,
-            "publicKey": task.public_key,
-            "name": task.name,
-            "txHash": task.tx_hash,
-            "createdAt": task.created_at,
-        });
-    }
+// ── Response bodies ────────────────────────────────────────────────────────
+
+/// The `/api/task/{id}` status body. With no commit-reveal there is nothing
+/// to redact: the full unit (minus the bulky proofs) is disclosed.
+pub fn task_status_body(task: &RegisterTask) -> Value {
     json!({
         "id": task.id,
         "status": task.status,
         "rpId": task.rp_id,
-        "publicKey": task.public_key,
-        "name": task.name,
+        "metadata": task.metadata,
+        "unitNonce": task.unit_nonce,
+        "members": task.members.iter().map(|member| json!({
+            "publicKey": member.public_key,
+            "attestation": member.attestation,
+        })).collect::<Vec<_>>(),
+        "txHash": task.tx_hash,
+        "firstEntryId": task.first_entry_id,
         "error": task.error,
         "createdAt": task.created_at,
     })
 }
 
-/// The queue-fallback body served when a record is not on chain yet but an
-/// active task is in flight. Same pre-reveal discipline: no credentialId, no
-/// walletRef, no txHash.
-pub fn queue_fallback_body(task: &CreateTask) -> Value {
+/// Served for a key with no on-chain entries but an in-flight task: the
+/// pre-chain visibility guarantee.
+pub fn queue_pending_body(task: &RegisterTask, public_key: &str) -> Value {
     json!({
-        "rpId": task.rp_id,
-        "publicKey": task.public_key,
-        "name": task.name,
-        "metadata": task.metadata,
-        "createdAt": task.created_at,
-        "_queue": { "id": task.id, "status": task.status },
+        "total": 0,
+        "items": [],
+        "_queue": { "id": task.id, "status": task.status, "publicKey": public_key },
     })
 }
 
 // ── Shell protocol ─────────────────────────────────────────────────────────
 
-/// Which endpoint the shell routed. `Query` covers `/api/query`: the Core
-/// decides between the record and wallet flows from the parameters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LookupEndpoint {
-    Query,
-    Total,
-    Sites,
-    Keys,
-}
-
-/// Raw query parameters, mirroring the HTTP layer's deserialized shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LookupParams {
-    pub rp_id: Option<String>,
-    pub credential_id: Option<String>,
-    pub wallet_ref: Option<String>,
+    pub public_key: Option<String>,
+    pub entry_id: Option<String>,
     pub page: Option<u64>,
     pub page_size: Option<u64>,
     pub order: Option<String>,
 }
 
-/// Logical cache keys; the shell owns the physical key strings.
+/// Which endpoint the shell routed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LookupEndpoint {
+    /// `/api/query` — by publicKey (paged) or by entryId.
+    Query { params: LookupParams },
+    /// `/api/stats/total`
+    StatsTotal,
+    /// `/api/stats/sites`
+    StatsSites { params: LookupParams },
+    /// `/api/stats/keys?rpId=`
+    StatsKeys { rp_id: String, params: LookupParams },
+}
+
+/// Cache identity of one rendered response. The shell maps this to a key
+/// string; TTL freshness/staleness verdicts also happen shell-side against
+/// the [`TtlClass`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LookupCacheKey {
-    Record {
-        rp_id: String,
-        credential_id: String,
-    },
-    Wallet {
-        wallet_ref: String,
-    },
-    StatsTotal,
-    StatsSites {
+    EntriesByKey {
+        key_hash: String,
         page: u64,
         page_size: u64,
         descending: bool,
     },
-    StatsKeys {
+    Entry {
+        entry_id: u64,
+    },
+    StatsTotal,
+    Sites {
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    },
+    Keys {
         rp_id: String,
         page: u64,
         page_size: u64,
@@ -158,8 +146,16 @@ pub enum LookupCacheKey {
     },
 }
 
-/// Which staleness budget the cache read runs under; the shell maps these to
-/// its configured durations (24h for records, 1h for stats).
+impl LookupCacheKey {
+    /// Which stale-grace window applies when RPC is down.
+    pub fn ttl_class(&self) -> TtlClass {
+        match self {
+            Self::EntriesByKey { .. } | Self::Entry { .. } => TtlClass::Record,
+            Self::StatsTotal | Self::Sites { .. } | Self::Keys { .. } => TtlClass::Stats,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtlClass {
@@ -167,48 +163,53 @@ pub enum TtlClass {
     Stats,
 }
 
+/// What the shell fetches from the chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChainFetch {
+    EntriesByKey {
+        public_key: String,
+        offset: u64,
+        limit: u64,
+        descending: bool,
+    },
+    Entry {
+        entry_id: u64,
+    },
+    Totals,
+    Sites {
+        offset: u64,
+        limit: u64,
+        descending: bool,
+    },
+    Keys {
+        rp_id: String,
+        offset: u64,
+        limit: u64,
+        descending: bool,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LookupOperation {
     ReadCache {
         key: LookupCacheKey,
-        ttl: TtlClass,
     },
-    /// May this client perform an uncached read?
-    AllowRead,
-    FetchRecord {
-        rp_id: String,
-        credential_id: String,
-    },
-    FetchRecordByWalletRef {
-        wallet_ref: String,
-    },
-    FetchTotal,
-    FetchSites {
-        page: u64,
-        page_size: u64,
-        descending: bool,
-    },
-    FetchKeys {
-        rp_id: String,
-        page: u64,
-        page_size: u64,
-        descending: bool,
-    },
-    StoreCache {
+    /// `negative: true` caches a short-lived 404 marker.
+    WriteCache {
         key: LookupCacheKey,
         value: Value,
-        allow_stale: bool,
+        negative: bool,
     },
-    StoreNegative {
-        key: LookupCacheKey,
+    /// May this client take a cache miss to RPC? (Fail-open shell-side.)
+    AllowRead,
+    FetchChain {
+        fetch: ChainFetch,
     },
-    FindTaskByRecord {
-        rp_id: String,
-        credential_id: String,
-    },
-    FindTaskByWalletRef {
-        wallet_ref: String,
+    /// The in-flight placeholder for a member public key (hash), if any.
+    FindTaskByKey {
+        key_hash: String,
     },
 }
 
@@ -216,9 +217,6 @@ impl crux_core::capability::Operation for LookupOperation {
     type Output = LookupResult;
 }
 
-// One result value exists per request at a time and lives microseconds;
-// boxing the task-bearing variants would complicate the protocol for nothing.
-#[expect(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LookupResult {
@@ -231,29 +229,22 @@ pub enum LookupResult {
         age_ms: u64,
     },
     CacheMiss,
+    Persisted,
+    StoreUnavailable,
     Allowed {
         allowed: bool,
     },
-    /// Record-shaped fetches: found (serialized record) or definitively absent.
-    Fetched {
-        value: Option<Value>,
-    },
-    /// Stats fetches: the serialized payload.
-    Data {
+    /// A successful chain fetch, already rendered by the shell into the
+    /// response JSON for this endpoint. `not_found` marks a revert that
+    /// means "no such entry".
+    Chain {
         value: Value,
     },
-    /// The total-credentials count, plus the wallet count where the contract
-    /// exposes one (V3; None while still pointed at V2).
-    Total {
-        total: u64,
-        wallets: Option<u64>,
-    },
-    ChainReadFailed,
+    ChainNotFound,
+    ChainFailed,
     TaskFound {
-        task: Option<CreateTask>,
+        task: Option<RegisterTask>,
     },
-    Persisted,
-    StoreUnavailable,
 }
 
 #[effect]
@@ -263,37 +254,31 @@ pub enum LookupEffect {
 
 // ── App ────────────────────────────────────────────────────────────────────
 
-/// The lookup verdict; the shell renders these into the exact original
-/// responses (status codes, cache headers, stale markers).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LookupOutcome {
+    /// 200 with Cache-Control (served from fresh cache).
+    CachedOk { value: Value },
+    /// 200, freshly fetched.
+    Ok { value: Value },
+    /// 200 with `_stale` markers and no-cache headers.
+    StaleOk { value: Value, age_ms: u64 },
+    /// 200: nothing on-chain but an in-flight task exists for the key.
+    QueuePending { value: Value },
     /// 400 with the validation message.
     Invalid { message: String },
-    /// 200 with `Cache-Control: public, max-age=3600`.
-    CachedOk { value: Value },
-    /// 200 empty page: the page > 10 000 short-circuit.
-    EmptyPage { page: u64, page_size: u64 },
-    /// 429 for uncached reads over the limit.
-    ReadLimited,
-    /// 200 with `_stale`/`_staleAgeMs` markers and no-cache headers; the
-    /// markers are already inserted into `value`.
-    ServedStale { value: Value },
-    /// 200 queue fallback; `body` is the disclosed shape.
-    QueueFallback { body: Value },
-    /// 404 "not found".
+    /// 404.
     NotFound,
-    /// 503 retryable, naming the failed dependency ("redis" / "rpc").
+    /// 429 for a cache miss over the read budget.
+    ReadLimited,
+    /// 503 naming the dependency ("redis" / "rpc").
     DependencyUnavailable { dependency: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LookupEvent {
-    Query {
-        endpoint: LookupEndpoint,
-        params: LookupParams,
-    },
+    Start { endpoint: LookupEndpoint },
     Settled(LookupOutcome),
 }
 
@@ -322,8 +307,8 @@ impl App for LookupApp {
         model: &mut Self::Model,
     ) -> Command<Self::Effect, Self::Event> {
         match event {
-            LookupEvent::Query { endpoint, params } => Command::new(|ctx| async move {
-                let outcome = match drive_lookup(&ctx, endpoint, params).await {
+            LookupEvent::Start { endpoint } => Command::new(|ctx| async move {
+                let outcome = match drive_lookup(&ctx, endpoint).await {
                     Ok(outcome) | Err(outcome) => outcome,
                 };
                 ctx.send_event(LookupEvent::Settled(outcome));
@@ -347,15 +332,15 @@ impl App for LookupApp {
 type Ctx = CommandContext<LookupEffect, LookupEvent>;
 type Flow<T> = Result<T, LookupOutcome>;
 
-fn dependency(name: &str) -> LookupOutcome {
+fn redis_down() -> LookupOutcome {
     LookupOutcome::DependencyUnavailable {
-        dependency: name.to_owned(),
+        dependency: "redis".to_owned(),
     }
 }
 
-fn invalid(message: impl Into<String>) -> LookupOutcome {
-    LookupOutcome::Invalid {
-        message: message.into(),
+fn rpc_down() -> LookupOutcome {
+    LookupOutcome::DependencyUnavailable {
+        dependency: "rpc".to_owned(),
     }
 }
 
@@ -363,8 +348,8 @@ async fn request(ctx: &Ctx, operation: LookupOperation) -> LookupResult {
     ctx.request_from_shell(operation).await
 }
 
-/// Pagination clamps, unchanged: page at least 1, pageSize 1..=100 with a
-/// default of 20, descending unless `order=asc`.
+/// Page params clamp to the published contract: page ≥ 1, pageSize 1..=100
+/// (default 20), newest-first unless `order=asc`.
 pub fn pagination(params: &LookupParams) -> (u64, u64, bool) {
     let page = params.page.unwrap_or(1).max(1);
     let page_size = params.page_size.unwrap_or(20).clamp(1, 100);
@@ -372,59 +357,65 @@ pub fn pagination(params: &LookupParams) -> (u64, u64, bool) {
     (page, page_size, descending)
 }
 
-async fn drive_lookup(
-    ctx: &Ctx,
-    endpoint: LookupEndpoint,
-    params: LookupParams,
-) -> Flow<LookupOutcome> {
+/// Hex-normalize and validate an uncompressed P-256 key parameter.
+pub fn normalize_public_key_param(value: &str) -> Result<String, String> {
+    let raw = value.strip_prefix("0x").unwrap_or(value);
+    if raw.len() != 130 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("publicKey must be an uncompressed P-256 point (04 + 128 hex chars)".into());
+    }
+    if !raw.starts_with("04") {
+        return Err("publicKey must start with the uncompressed prefix 04".into());
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+async fn drive_lookup(ctx: &Ctx, endpoint: LookupEndpoint) -> Flow<LookupOutcome> {
     match endpoint {
-        LookupEndpoint::Query => query_flow(ctx, params).await,
-        LookupEndpoint::Total => {
-            stats_flow(ctx, LookupCacheKey::StatsTotal, StatsFetch::Total).await
+        LookupEndpoint::Query { params } => query_flow(ctx, params).await,
+        LookupEndpoint::StatsTotal => {
+            stats_flow(ctx, LookupCacheKey::StatsTotal, ChainFetch::Totals).await
         }
-        LookupEndpoint::Sites => {
+        LookupEndpoint::StatsSites { params } => {
             let (page, page_size, descending) = pagination(&params);
-            if page > 10_000 {
-                return Ok(LookupOutcome::EmptyPage { page, page_size });
-            }
             stats_flow(
                 ctx,
-                LookupCacheKey::StatsSites {
+                LookupCacheKey::Sites {
                     page,
                     page_size,
                     descending,
                 },
-                StatsFetch::Sites {
-                    page,
-                    page_size,
+                ChainFetch::Sites {
+                    offset: (page - 1) * page_size,
+                    limit: page_size,
                     descending,
                 },
             )
             .await
         }
-        LookupEndpoint::Keys => {
+        LookupEndpoint::StatsKeys { rp_id, params } => {
+            if rp_id.is_empty() {
+                return Ok(LookupOutcome::Invalid {
+                    message: "rpId is required".into(),
+                });
+            }
+            if rp_id.len() > 253 {
+                return Ok(LookupOutcome::Invalid {
+                    message: "rpId exceeds max length (253)".into(),
+                });
+            }
             let (page, page_size, descending) = pagination(&params);
-            let Some(rp_id) = params.rp_id else {
-                return Ok(invalid("rpId is required"));
-            };
-            if let Err(message) = validate_strings(&[("rpId", &rp_id, 253)]) {
-                return Ok(invalid(message));
-            }
-            if page > 10_000 {
-                return Ok(LookupOutcome::EmptyPage { page, page_size });
-            }
             stats_flow(
                 ctx,
-                LookupCacheKey::StatsKeys {
+                LookupCacheKey::Keys {
                     rp_id: rp_id.clone(),
                     page,
                     page_size,
                     descending,
                 },
-                StatsFetch::Keys {
+                ChainFetch::Keys {
                     rp_id,
-                    page,
-                    page_size,
+                    offset: (page - 1) * page_size,
+                    limit: page_size,
                     descending,
                 },
             )
@@ -433,289 +424,217 @@ async fn drive_lookup(
     }
 }
 
-/// `/api/query`: by wallet ref when supplied, else by (rpId, credentialId).
 async fn query_flow(ctx: &Ctx, params: LookupParams) -> Flow<LookupOutcome> {
-    if let Some(wallet_ref) = params.wallet_ref {
-        return wallet_flow(ctx, wallet_ref).await;
+    if let Some(entry_id) = params.entry_id.as_deref() {
+        let Ok(entry_id) = entry_id.parse::<u64>() else {
+            return Ok(LookupOutcome::Invalid {
+                message: "entryId must be an unsigned integer".into(),
+            });
+        };
+        return entry_flow(ctx, entry_id).await;
     }
-    let (Some(rp_id), Some(credential_id)) = (params.rp_id, params.credential_id) else {
-        return Ok(invalid("rpId and credentialId are required (or walletRef)"));
+    let Some(public_key) = params.public_key.as_deref() else {
+        return Ok(LookupOutcome::Invalid {
+            message: "publicKey or entryId is required".into(),
+        });
     };
-    if let Err(message) = validate_strings(&[
-        ("rpId", &rp_id, 253),
-        ("credentialId", &credential_id, 1024),
-    ]) {
-        return Ok(invalid(message));
-    }
-    record_flow(
-        ctx,
-        LookupCacheKey::Record {
-            rp_id: rp_id.clone(),
-            credential_id: credential_id.clone(),
-        },
-        RecordFetch::ByRecord {
-            rp_id,
-            credential_id,
-        },
-    )
-    .await
+    let public_key = match normalize_public_key_param(public_key) {
+        Ok(value) => value,
+        Err(message) => return Ok(LookupOutcome::Invalid { message }),
+    };
+    let (page, page_size, descending) = pagination(&params);
+    entries_by_key_flow(ctx, public_key, page, page_size, descending).await
 }
 
-async fn wallet_flow(ctx: &Ctx, wallet_ref: String) -> Flow<LookupOutcome> {
-    if !wallet_ref.starts_with("0x") || wallet_ref.len() != 66 {
-        return Ok(invalid(
-            "walletRef must be a 0x-prefixed 32-byte hex string",
-        ));
-    }
-    if let Err(message) = validate_wallet_ref(&wallet_ref) {
-        return Ok(invalid(message));
-    }
-    let wallet_ref = wallet_ref.to_ascii_lowercase();
-    record_flow(
-        ctx,
-        LookupCacheKey::Wallet {
-            wallet_ref: wallet_ref.clone(),
-        },
-        RecordFetch::ByWalletRef { wallet_ref },
-    )
-    .await
-}
-
-enum RecordFetch {
-    ByRecord {
-        rp_id: String,
-        credential_id: String,
-    },
-    ByWalletRef {
-        wallet_ref: String,
-    },
-}
-
-impl RecordFetch {
-    fn fetch_operation(&self) -> LookupOperation {
-        match self {
-            Self::ByRecord {
-                rp_id,
-                credential_id,
-            } => LookupOperation::FetchRecord {
-                rp_id: rp_id.clone(),
-                credential_id: credential_id.clone(),
-            },
-            Self::ByWalletRef { wallet_ref } => LookupOperation::FetchRecordByWalletRef {
-                wallet_ref: wallet_ref.clone(),
-            },
-        }
-    }
-
-    fn find_task_operation(&self) -> LookupOperation {
-        match self {
-            Self::ByRecord {
-                rp_id,
-                credential_id,
-            } => LookupOperation::FindTaskByRecord {
-                rp_id: rp_id.clone(),
-                credential_id: credential_id.clone(),
-            },
-            Self::ByWalletRef { wallet_ref } => LookupOperation::FindTaskByWalletRef {
-                wallet_ref: wallet_ref.clone(),
-            },
-        }
-    }
-}
-
-/// The record/wallet read-through: negative entries answer via the queue
-/// fallback; a chain hit backfills the cache (never stale-tolerant); a chain
-/// miss writes a negative entry then falls back; a chain failure downgrades
-/// to stale data when available.
-async fn record_flow(ctx: &Ctx, key: LookupCacheKey, fetch: RecordFetch) -> Flow<LookupOutcome> {
-    let stale = match request(
+/// The shell's canonical key-hash string for placeholders and cache keys:
+/// hex(keccak256(raw key bytes)) is computed shell-side; the Core passes the
+/// normalized hex key and the shell hashes it. To keep the Core pure we use
+/// the normalized key itself as the logical identity here.
+async fn entries_by_key_flow(
+    ctx: &Ctx,
+    public_key: String,
+    page: u64,
+    page_size: u64,
+    descending: bool,
+) -> Flow<LookupOutcome> {
+    let cache_key = LookupCacheKey::EntriesByKey {
+        key_hash: public_key.clone(),
+        page,
+        page_size,
+        descending,
+    };
+    let mut stale: Option<(Value, u64)> = None;
+    match request(
         ctx,
         LookupOperation::ReadCache {
-            key: key.clone(),
-            ttl: TtlClass::Record,
+            key: cache_key.clone(),
         },
     )
     .await
     {
         LookupResult::CacheFresh { value } => return Ok(LookupOutcome::CachedOk { value }),
-        LookupResult::CacheNegative => return queue_fallback(ctx, &fetch).await,
-        LookupResult::CacheStale { value, age_ms } => Some((value, age_ms)),
-        LookupResult::CacheMiss => None,
-        LookupResult::StoreUnavailable => return Err(dependency("redis")),
-        _ => return Err(dependency("redis")),
-    };
-
-    allow_read(ctx).await?;
-
-    match request(ctx, fetch.fetch_operation()).await {
-        LookupResult::Fetched { value: Some(value) } => {
-            match request(
-                ctx,
-                LookupOperation::StoreCache {
-                    key,
-                    value: value.clone(),
-                    allow_stale: false,
-                },
-            )
-            .await
-            {
-                LookupResult::Persisted => Ok(LookupOutcome::CachedOk { value }),
-                _ => Err(dependency("redis")),
-            }
-        }
-        LookupResult::Fetched { value: None } => {
-            match request(ctx, LookupOperation::StoreNegative { key }).await {
-                LookupResult::Persisted => queue_fallback(ctx, &fetch).await,
-                _ => Err(dependency("redis")),
-            }
-        }
-        LookupResult::ChainReadFailed => Ok(serve_stale_or(stale, "rpc")),
-        _ => Err(dependency("rpc")),
+        LookupResult::CacheStale { value, age_ms } => stale = Some((value, age_ms)),
+        LookupResult::CacheNegative | LookupResult::CacheMiss => {}
+        LookupResult::StoreUnavailable => return Err(redis_down()),
+        _ => return Err(redis_down()),
     }
-}
-
-enum StatsFetch {
-    Total,
-    Sites {
-        page: u64,
-        page_size: u64,
-        descending: bool,
-    },
-    Keys {
-        rp_id: String,
-        page: u64,
-        page_size: u64,
-        descending: bool,
-    },
-}
-
-/// The stats read-through: negative entries are treated as misses (the
-/// original handlers never checked for them), and cache backfills are
-/// stale-tolerant.
-async fn stats_flow(ctx: &Ctx, key: LookupCacheKey, fetch: StatsFetch) -> Flow<LookupOutcome> {
-    let stale = match request(
+    allow_read(ctx).await?;
+    match request(
         ctx,
-        LookupOperation::ReadCache {
-            key: key.clone(),
-            ttl: TtlClass::Stats,
+        LookupOperation::FetchChain {
+            fetch: ChainFetch::EntriesByKey {
+                public_key: public_key.clone(),
+                offset: (page - 1) * page_size,
+                limit: page_size,
+                descending,
+            },
         },
     )
     .await
     {
-        LookupResult::CacheFresh { value } => return Ok(LookupOutcome::CachedOk { value }),
-        LookupResult::CacheStale { value, age_ms } => Some((value, age_ms)),
-        LookupResult::CacheNegative | LookupResult::CacheMiss => None,
-        _ => return Err(dependency("redis")),
-    };
-
-    allow_read(ctx).await?;
-
-    let fetched = match fetch {
-        StatsFetch::Total => match request(ctx, LookupOperation::FetchTotal).await {
-            LookupResult::Total { total, wallets } => {
-                let mut body = json!({ "totalCredentials": total });
-                if let Some(wallets) = wallets {
-                    body["totalWallets"] = json!(wallets);
+        LookupResult::Chain { value } => {
+            let empty = value
+                .get("total")
+                .and_then(Value::as_u64)
+                .is_some_and(|total| total == 0);
+            if empty {
+                // Pre-chain visibility: an in-flight task for this key
+                // answers instead of an empty page.
+                match request(
+                    ctx,
+                    LookupOperation::FindTaskByKey {
+                        key_hash: public_key.clone(),
+                    },
+                )
+                .await
+                {
+                    LookupResult::TaskFound { task: Some(task) }
+                        if is_active_placeholder(&task) =>
+                    {
+                        return Ok(LookupOutcome::QueuePending {
+                            value: queue_pending_body(&task, &public_key),
+                        });
+                    }
+                    LookupResult::TaskFound { .. } => {}
+                    _ => return Err(redis_down()),
                 }
-                Ok(body)
             }
-            LookupResult::ChainReadFailed => Err(()),
-            _ => return Err(dependency("rpc")),
-        },
-        StatsFetch::Sites {
-            page,
-            page_size,
-            descending,
-        } => match request(
-            ctx,
-            LookupOperation::FetchSites {
-                page,
-                page_size,
-                descending,
-            },
-        )
-        .await
-        {
-            LookupResult::Data { value } => Ok(value),
-            LookupResult::ChainReadFailed => Err(()),
-            _ => return Err(dependency("rpc")),
-        },
-        StatsFetch::Keys {
-            rp_id,
-            page,
-            page_size,
-            descending,
-        } => match request(
-            ctx,
-            LookupOperation::FetchKeys {
-                rp_id,
-                page,
-                page_size,
-                descending,
-            },
-        )
-        .await
-        {
-            LookupResult::Data { value } => Ok(value),
-            LookupResult::ChainReadFailed => Err(()),
-            _ => return Err(dependency("rpc")),
-        },
-    };
-    match fetched {
-        Ok(value) => {
-            match request(
+            let _ = request(
                 ctx,
-                LookupOperation::StoreCache {
-                    key,
+                LookupOperation::WriteCache {
+                    key: cache_key,
                     value: value.clone(),
-                    allow_stale: true,
+                    negative: false,
                 },
             )
-            .await
-            {
-                LookupResult::Persisted => Ok(LookupOutcome::CachedOk { value }),
-                _ => Err(dependency("redis")),
-            }
+            .await;
+            Ok(LookupOutcome::Ok { value })
         }
-        Err(()) => Ok(serve_stale_or(stale, "rpc")),
+        LookupResult::ChainFailed => match stale {
+            Some((value, age_ms)) => Ok(LookupOutcome::StaleOk { value, age_ms }),
+            None => Err(rpc_down()),
+        },
+        _ => Err(rpc_down()),
     }
 }
 
-/// The uncached-read rate limit. Fail-open: a store failure counts as
-/// allowed, exactly like the original `unwrap_or(true)`.
+async fn entry_flow(ctx: &Ctx, entry_id: u64) -> Flow<LookupOutcome> {
+    let cache_key = LookupCacheKey::Entry { entry_id };
+    let mut stale: Option<(Value, u64)> = None;
+    match request(
+        ctx,
+        LookupOperation::ReadCache {
+            key: cache_key.clone(),
+        },
+    )
+    .await
+    {
+        LookupResult::CacheFresh { value } => return Ok(LookupOutcome::CachedOk { value }),
+        LookupResult::CacheNegative => return Ok(LookupOutcome::NotFound),
+        LookupResult::CacheStale { value, age_ms } => stale = Some((value, age_ms)),
+        LookupResult::CacheMiss => {}
+        LookupResult::StoreUnavailable => return Err(redis_down()),
+        _ => return Err(redis_down()),
+    }
+    allow_read(ctx).await?;
+    match request(
+        ctx,
+        LookupOperation::FetchChain {
+            fetch: ChainFetch::Entry { entry_id },
+        },
+    )
+    .await
+    {
+        LookupResult::Chain { value } => {
+            let _ = request(
+                ctx,
+                LookupOperation::WriteCache {
+                    key: cache_key,
+                    value: value.clone(),
+                    negative: false,
+                },
+            )
+            .await;
+            Ok(LookupOutcome::Ok { value })
+        }
+        LookupResult::ChainNotFound => {
+            let _ = request(
+                ctx,
+                LookupOperation::WriteCache {
+                    key: cache_key,
+                    value: Value::Null,
+                    negative: true,
+                },
+            )
+            .await;
+            Ok(LookupOutcome::NotFound)
+        }
+        LookupResult::ChainFailed => match stale {
+            Some((value, age_ms)) => Ok(LookupOutcome::StaleOk { value, age_ms }),
+            None => Err(rpc_down()),
+        },
+        _ => Err(rpc_down()),
+    }
+}
+
+async fn stats_flow(ctx: &Ctx, key: LookupCacheKey, fetch: ChainFetch) -> Flow<LookupOutcome> {
+    let mut stale: Option<(Value, u64)> = None;
+    match request(ctx, LookupOperation::ReadCache { key: key.clone() }).await {
+        LookupResult::CacheFresh { value } => return Ok(LookupOutcome::CachedOk { value }),
+        LookupResult::CacheStale { value, age_ms } => stale = Some((value, age_ms)),
+        LookupResult::CacheNegative | LookupResult::CacheMiss => {}
+        LookupResult::StoreUnavailable => return Err(redis_down()),
+        _ => return Err(redis_down()),
+    }
+    allow_read(ctx).await?;
+    match request(ctx, LookupOperation::FetchChain { fetch }).await {
+        LookupResult::Chain { value } => {
+            let _ = request(
+                ctx,
+                LookupOperation::WriteCache {
+                    key,
+                    value: value.clone(),
+                    negative: false,
+                },
+            )
+            .await;
+            Ok(LookupOutcome::Ok { value })
+        }
+        LookupResult::ChainFailed => match stale {
+            Some((value, age_ms)) => Ok(LookupOutcome::StaleOk { value, age_ms }),
+            None => Err(rpc_down()),
+        },
+        _ => Err(rpc_down()),
+    }
+}
+
+/// The read budget applies only to cache misses; the shell's limiter is
+/// fail-open on store errors.
 async fn allow_read(ctx: &Ctx) -> Flow<()> {
     match request(ctx, LookupOperation::AllowRead).await {
+        LookupResult::Allowed { allowed: true } => Ok(()),
         LookupResult::Allowed { allowed: false } => Err(LookupOutcome::ReadLimited),
-        _ => Ok(()),
-    }
-}
-
-/// The in-flight-task fallback shared by the negative-cache and chain-miss
-/// paths: an active placeholder answers with the disclosed queue shape.
-async fn queue_fallback(ctx: &Ctx, fetch: &RecordFetch) -> Flow<LookupOutcome> {
-    match request(ctx, fetch.find_task_operation()).await {
-        LookupResult::TaskFound { task: Some(task) } if is_active_placeholder(&task) => {
-            Ok(LookupOutcome::QueueFallback {
-                body: queue_fallback_body(&task),
-            })
-        }
-        LookupResult::TaskFound { .. } => Ok(LookupOutcome::NotFound),
-        _ => Err(dependency("redis")),
-    }
-}
-
-/// Serve stale data with the `_stale` markers inserted, or report the failed
-/// dependency when nothing stale is available.
-fn serve_stale_or(stale: Option<(Value, u64)>, dependency_name: &str) -> LookupOutcome {
-    match stale {
-        Some((mut value, age_ms)) => {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("_stale".into(), Value::Bool(true));
-                object.insert("_staleAgeMs".into(), json!(age_ms));
-            }
-            LookupOutcome::ServedStale { value }
-        }
-        None => dependency(dependency_name),
+        _ => Ok(()), // fail-open, as ever
     }
 }
 
@@ -724,10 +643,12 @@ mod tests {
     use std::collections::VecDeque;
 
     use crux_core::{Core, Request};
+    use serde_json::json;
 
     use super::*;
+    use crate::task::{Member, Proof, RegisterTask};
 
-    // ── Test driver (same shape as the other apps') ────────────────────────
+    const KEY: &str = "045ff257819a8927dc548d62eeb90a7a61a8e90afd70c9f774e7ed78d0c5bbbc0e8ed0f6a55f675f162b2e8450f79cd0e6766e56f10f762430ec15d2a4388f19fb";
 
     struct Driver {
         core: Core<LookupApp>,
@@ -735,9 +656,9 @@ mod tests {
     }
 
     impl Driver {
-        fn query(endpoint: LookupEndpoint, params: LookupParams) -> Self {
+        fn start(endpoint: LookupEndpoint) -> Self {
             let core = Core::new();
-            let effects = core.process_event(LookupEvent::Query { endpoint, params });
+            let effects = core.process_event(LookupEvent::Start { endpoint });
             let mut driver = Self {
                 core,
                 queue: VecDeque::new(),
@@ -776,108 +697,362 @@ mod tests {
         }
     }
 
-    fn record_params() -> LookupParams {
-        LookupParams {
-            rp_id: Some("example.com".into()),
-            credential_id: Some("cred-1".into()),
-            ..LookupParams::default()
+    fn by_key() -> LookupEndpoint {
+        LookupEndpoint::Query {
+            params: LookupParams {
+                public_key: Some(KEY.into()),
+                ..LookupParams::default()
+            },
         }
     }
 
-    const WALLET: &str = "0x000000000000000000000000d602f36e97fa37801565e3dc02f78ee0769d8fd6";
-
-    fn record_key() -> LookupCacheKey {
-        LookupCacheKey::Record {
-            rp_id: "example.com".into(),
-            credential_id: "cred-1".into(),
+    fn key_cache() -> LookupCacheKey {
+        LookupCacheKey::EntriesByKey {
+            key_hash: KEY.into(),
+            page: 1,
+            page_size: 20,
+            descending: true,
         }
     }
 
-    fn read_record_cache() -> LookupOperation {
-        LookupOperation::ReadCache {
-            key: record_key(),
-            ttl: TtlClass::Record,
+    fn key_fetch() -> LookupOperation {
+        LookupOperation::FetchChain {
+            fetch: ChainFetch::EntriesByKey {
+                public_key: KEY.into(),
+                offset: 0,
+                limit: 20,
+                descending: true,
+            },
         }
     }
 
-    fn value() -> Value {
-        json!({ "rpId": "example.com", "credentialId": "cred-1" })
-    }
-
-    fn task(status: TaskStatus) -> CreateTask {
-        CreateTask {
+    fn task(status: TaskStatus) -> RegisterTask {
+        RegisterTask {
             id: "t1".into(),
             status,
             rp_id: "example.com".into(),
-            credential_id: "cred-1".into(),
-            wallet_ref: WALLET.into(),
-            public_key: "04ab".into(),
-            name: "n".into(),
-            initial_credential_id: "cred-1".into(),
-            metadata: "0x00".into(),
-            members: Vec::new(),
-            tx_hash: Some("0xdeadbeef".into()),
-            error: Some("last error".into()),
-            retries: 2,
+            metadata: "0xaa".into(),
+            unit_nonce: format!("0x{}", "11".repeat(32)),
+            members: vec![Member {
+                public_key: KEY.into(),
+                attestation: String::new(),
+                proof: Proof {
+                    authenticator_data: String::new(),
+                    client_data_json: String::new(),
+                    challenge_index: 0,
+                    type_index: 0,
+                    r: String::new(),
+                    s: String::new(),
+                },
+            }],
+            tx_hash: None,
+            first_entry_id: None,
+            error: None,
+            retries: 0,
             created_at: 7,
             admitted: true,
         }
     }
 
-    // ── Disclosure ─────────────────────────────────────────────────────────
-
     #[test]
-    fn done_task_status_reveals_everything() {
-        let body = task_status_body(&task(TaskStatus::Done));
-        assert_eq!(
-            body,
-            json!({
-                "id": "t1",
-                "status": "done",
-                "rpId": "example.com",
-                "credentialId": "cred-1",
-                "walletRef": WALLET,
-                "publicKey": "04ab",
-                "name": "n",
-                "txHash": "0xdeadbeef",
-                "createdAt": 7,
-            })
+    fn fresh_cache_hit_serves_without_rpc() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheFresh {
+                value: json!({"total": 1}),
+            },
         );
+        driver.assert_settled(LookupOutcome::CachedOk {
+            value: json!({"total": 1}),
+        });
     }
 
     #[test]
-    fn pre_done_task_status_withholds_the_revealable_fields() {
-        for status in [
-            TaskStatus::Pending,
-            TaskStatus::Committed,
-            TaskStatus::Failed,
-        ] {
-            let body = task_status_body(&task(status.clone()));
-            assert!(body.get("credentialId").is_none());
-            assert!(body.get("walletRef").is_none());
-            assert!(body.get("txHash").is_none());
-            assert_eq!(body["error"], json!("last error"));
-            assert_eq!(body["id"], json!("t1"));
-        }
-    }
-
-    #[test]
-    fn queue_fallback_body_is_the_disclosed_shape() {
-        let body = queue_fallback_body(&task(TaskStatus::Pending));
-        assert_eq!(
-            body,
-            json!({
-                "rpId": "example.com",
-                "publicKey": "04ab",
-                "name": "n",
-                "metadata": "0x00",
-                "createdAt": 7,
-                "_queue": { "id": "t1", "status": "pending" },
-            })
+    fn miss_fetches_backfills_and_serves() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheMiss,
         );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        let page = json!({"total": 1, "items": [{"entryId": 0}]});
+        driver.step(
+            key_fetch(),
+            LookupResult::Chain {
+                value: page.clone(),
+            },
+        );
+        driver.step(
+            LookupOperation::WriteCache {
+                key: key_cache(),
+                value: page.clone(),
+                negative: false,
+            },
+            LookupResult::Persisted,
+        );
+        driver.assert_settled(LookupOutcome::Ok { value: page });
     }
 
-    // ── Validation and clamps ──────────────────────────────────────────────
+    #[test]
+    fn empty_chain_page_with_active_task_answers_queue_pending() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        driver.step(
+            key_fetch(),
+            LookupResult::Chain {
+                value: json!({"total": 0, "items": []}),
+            },
+        );
+        driver.step(
+            LookupOperation::FindTaskByKey {
+                key_hash: KEY.into(),
+            },
+            LookupResult::TaskFound {
+                task: Some(task(TaskStatus::Pending)),
+            },
+        );
+        driver.assert_settled(LookupOutcome::QueuePending {
+            value: queue_pending_body(&task(TaskStatus::Pending), KEY),
+        });
+    }
+
+    #[test]
+    fn empty_chain_page_without_task_caches_and_serves_empty() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        let empty = json!({"total": 0, "items": []});
+        driver.step(
+            key_fetch(),
+            LookupResult::Chain {
+                value: empty.clone(),
+            },
+        );
+        driver.step(
+            LookupOperation::FindTaskByKey {
+                key_hash: KEY.into(),
+            },
+            LookupResult::TaskFound { task: None },
+        );
+        driver.step(
+            LookupOperation::WriteCache {
+                key: key_cache(),
+                value: empty.clone(),
+                negative: false,
+            },
+            LookupResult::Persisted,
+        );
+        driver.assert_settled(LookupOutcome::Ok { value: empty });
+    }
+
+    #[test]
+    fn failed_task_is_not_a_placeholder() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        let empty = json!({"total": 0, "items": []});
+        driver.step(
+            key_fetch(),
+            LookupResult::Chain {
+                value: empty.clone(),
+            },
+        );
+        driver.step(
+            LookupOperation::FindTaskByKey {
+                key_hash: KEY.into(),
+            },
+            LookupResult::TaskFound {
+                task: Some(task(TaskStatus::Failed)),
+            },
+        );
+        driver.step(
+            LookupOperation::WriteCache {
+                key: key_cache(),
+                value: empty.clone(),
+                negative: false,
+            },
+            LookupResult::Persisted,
+        );
+        driver.assert_settled(LookupOutcome::Ok { value: empty });
+    }
+
+    #[test]
+    fn chain_failure_serves_stale_within_grace() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheStale {
+                value: json!({"total": 2}),
+                age_ms: 60_000,
+            },
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        driver.step(key_fetch(), LookupResult::ChainFailed);
+        driver.assert_settled(LookupOutcome::StaleOk {
+            value: json!({"total": 2}),
+            age_ms: 60_000,
+        });
+    }
+
+    #[test]
+    fn chain_failure_without_stale_names_rpc() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        driver.step(key_fetch(), LookupResult::ChainFailed);
+        driver.assert_settled(LookupOutcome::DependencyUnavailable {
+            dependency: "rpc".into(),
+        });
+    }
+
+    #[test]
+    fn read_budget_rejects_cache_misses_only() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: false },
+        );
+        driver.assert_settled(LookupOutcome::ReadLimited);
+    }
+
+    #[test]
+    fn read_limiter_store_failure_is_fail_open() {
+        let mut driver = Driver::start(by_key());
+        driver.step(
+            LookupOperation::ReadCache { key: key_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(LookupOperation::AllowRead, LookupResult::StoreUnavailable);
+        let page = json!({"total": 3});
+        driver.step(
+            key_fetch(),
+            LookupResult::Chain {
+                value: page.clone(),
+            },
+        );
+        driver.step(
+            LookupOperation::WriteCache {
+                key: key_cache(),
+                value: page.clone(),
+                negative: false,
+            },
+            LookupResult::Persisted,
+        );
+        driver.assert_settled(LookupOutcome::Ok { value: page });
+    }
+
+    #[test]
+    fn entry_by_id_walks_negative_cache_and_not_found() {
+        let endpoint = LookupEndpoint::Query {
+            params: LookupParams {
+                entry_id: Some("5".into()),
+                ..LookupParams::default()
+            },
+        };
+        // Negative cache answers 404 without RPC.
+        let mut driver = Driver::start(endpoint.clone());
+        driver.step(
+            LookupOperation::ReadCache {
+                key: LookupCacheKey::Entry { entry_id: 5 },
+            },
+            LookupResult::CacheNegative,
+        );
+        driver.assert_settled(LookupOutcome::NotFound);
+
+        // A chain miss caches the negative marker.
+        let mut driver = Driver::start(endpoint);
+        driver.step(
+            LookupOperation::ReadCache {
+                key: LookupCacheKey::Entry { entry_id: 5 },
+            },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        driver.step(
+            LookupOperation::FetchChain {
+                fetch: ChainFetch::Entry { entry_id: 5 },
+            },
+            LookupResult::ChainNotFound,
+        );
+        driver.step(
+            LookupOperation::WriteCache {
+                key: LookupCacheKey::Entry { entry_id: 5 },
+                value: Value::Null,
+                negative: true,
+            },
+            LookupResult::Persisted,
+        );
+        driver.assert_settled(LookupOutcome::NotFound);
+    }
+
+    #[test]
+    fn validation_rejects_bad_params() {
+        let driver = Driver::start(LookupEndpoint::Query {
+            params: LookupParams::default(),
+        });
+        driver.assert_settled(LookupOutcome::Invalid {
+            message: "publicKey or entryId is required".into(),
+        });
+
+        let driver = Driver::start(LookupEndpoint::Query {
+            params: LookupParams {
+                public_key: Some("02abc".into()),
+                ..LookupParams::default()
+            },
+        });
+        driver.assert_settled(LookupOutcome::Invalid {
+            message: "publicKey must be an uncompressed P-256 point (04 + 128 hex chars)".into(),
+        });
+
+        let driver = Driver::start(LookupEndpoint::Query {
+            params: LookupParams {
+                entry_id: Some("not-a-number".into()),
+                ..LookupParams::default()
+            },
+        });
+        driver.assert_settled(LookupOutcome::Invalid {
+            message: "entryId must be an unsigned integer".into(),
+        });
+    }
 
     #[test]
     fn pagination_clamps_to_the_published_contract() {
@@ -897,577 +1072,12 @@ mod tests {
     }
 
     #[test]
-    fn query_without_identifiers_is_invalid() {
-        let driver = Driver::query(LookupEndpoint::Query, LookupParams::default());
-        driver.assert_settled(LookupOutcome::Invalid {
-            message: "rpId and credentialId are required (or walletRef)".into(),
-        });
-    }
-
-    #[test]
-    fn malformed_wallet_ref_is_invalid() {
-        let driver = Driver::query(
-            LookupEndpoint::Query,
-            LookupParams {
-                wallet_ref: Some("d602f36e".into()),
-                ..LookupParams::default()
-            },
-        );
-        driver.assert_settled(LookupOutcome::Invalid {
-            message: "walletRef must be a 0x-prefixed 32-byte hex string".into(),
-        });
-    }
-
-    #[test]
-    fn keys_without_rp_id_is_invalid() {
-        let driver = Driver::query(LookupEndpoint::Keys, LookupParams::default());
-        driver.assert_settled(LookupOutcome::Invalid {
-            message: "rpId is required".into(),
-        });
-    }
-
-    #[test]
-    fn deep_pages_short_circuit_without_any_io() {
-        for endpoint in [LookupEndpoint::Sites, LookupEndpoint::Keys] {
-            let driver = Driver::query(
-                endpoint,
-                LookupParams {
-                    rp_id: Some("example.com".into()),
-                    page: Some(10_001),
-                    ..LookupParams::default()
-                },
-            );
-            driver.assert_settled(LookupOutcome::EmptyPage {
-                page: 10_001,
-                page_size: 20,
-            });
-        }
-    }
-
-    #[test]
-    fn keys_validation_fires_before_the_short_circuit() {
-        // rpId is validated before the page > 10 000 short-circuit, exactly
-        // like the original handler ordering.
-        let driver = Driver::query(
-            LookupEndpoint::Keys,
-            LookupParams {
-                page: Some(10_001),
-                ..LookupParams::default()
-            },
-        );
-        driver.assert_settled(LookupOutcome::Invalid {
-            message: "rpId is required".into(),
-        });
-    }
-
-    // ── Record read-through ────────────────────────────────────────────────
-
-    #[test]
-    fn fresh_cache_answers_without_rate_limiting() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(
-            read_record_cache(),
-            LookupResult::CacheFresh { value: value() },
-        );
-        driver.assert_settled(LookupOutcome::CachedOk { value: value() });
-    }
-
-    #[test]
-    fn negative_cache_falls_back_to_an_active_task() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheNegative);
-        driver.step(
-            LookupOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::TaskFound {
-                task: Some(task(TaskStatus::Pending)),
-            },
-        );
-        // Literal expectation, deliberately NOT derived from
-        // queue_fallback_body: the integration path must fail on its own if
-        // the disclosed shape ever leaks credentialId/walletRef/txHash.
-        driver.assert_settled(LookupOutcome::QueueFallback {
-            body: json!({
-                "rpId": "example.com",
-                "publicKey": "04ab",
-                "name": "n",
-                "metadata": "0x00",
-                "createdAt": 7,
-                "_queue": { "id": "t1", "status": "pending" },
-            }),
-        });
-    }
-
-    #[test]
-    fn negative_cache_with_failed_task_is_not_found() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheNegative);
-        driver.step(
-            LookupOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::TaskFound {
-                task: Some(task(TaskStatus::Failed)),
-            },
-        );
-        driver.assert_settled(LookupOutcome::NotFound);
-    }
-
-    #[test]
-    fn chain_hit_backfills_without_stale_tolerance_then_answers() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheMiss);
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::Fetched {
-                value: Some(value()),
-            },
-        );
-        driver.step(
-            LookupOperation::StoreCache {
-                key: record_key(),
-                value: value(),
-                allow_stale: false,
-            },
-            LookupResult::Persisted,
-        );
-        driver.assert_settled(LookupOutcome::CachedOk { value: value() });
-    }
-
-    #[test]
-    fn chain_miss_writes_negative_then_falls_back() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheMiss);
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::Fetched { value: None },
-        );
-        driver.step(
-            LookupOperation::StoreNegative { key: record_key() },
-            LookupResult::Persisted,
-        );
-        driver.step(
-            LookupOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::TaskFound { task: None },
-        );
-        driver.assert_settled(LookupOutcome::NotFound);
-    }
-
-    #[test]
-    fn chain_failure_serves_stale_with_markers() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(
-            read_record_cache(),
-            LookupResult::CacheStale {
-                value: value(),
-                age_ms: 5_000,
-            },
-        );
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::ChainReadFailed,
-        );
-        let mut expected = value();
-        expected["_stale"] = json!(true);
-        expected["_staleAgeMs"] = json!(5_000);
-        driver.assert_settled(LookupOutcome::ServedStale { value: expected });
-    }
-
-    #[test]
-    fn chain_failure_without_stale_names_the_rpc_dependency() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheMiss);
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::ChainReadFailed,
-        );
-        driver.assert_settled(LookupOutcome::DependencyUnavailable {
-            dependency: "rpc".into(),
-        });
-    }
-
-    #[test]
-    fn read_limit_rejects_uncached_reads() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheMiss);
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: false },
-        );
-        driver.assert_settled(LookupOutcome::ReadLimited);
-    }
-
-    #[test]
-    fn read_limit_fails_open_on_store_errors() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheMiss);
-        driver.step(LookupOperation::AllowRead, LookupResult::StoreUnavailable);
-        // The flow continues to the chain fetch: fail-open.
-        driver.step(
-            LookupOperation::FetchRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::ChainReadFailed,
-        );
-        driver.assert_settled(LookupOutcome::DependencyUnavailable {
-            dependency: "rpc".into(),
-        });
-    }
-
-    // ── Wallet flow ────────────────────────────────────────────────────────
-
-    #[test]
-    fn wallet_query_lowercases_before_keying_and_fetching() {
-        let uppercase = WALLET.to_uppercase().replace("0X", "0x");
-        let mut driver = Driver::query(
-            LookupEndpoint::Query,
-            LookupParams {
-                wallet_ref: Some(uppercase),
-                ..LookupParams::default()
-            },
-        );
-        driver.step(
-            LookupOperation::ReadCache {
-                key: LookupCacheKey::Wallet {
-                    wallet_ref: WALLET.into(),
-                },
-                ttl: TtlClass::Record,
-            },
-            LookupResult::CacheMiss,
-        );
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchRecordByWalletRef {
-                wallet_ref: WALLET.into(),
-            },
-            LookupResult::Fetched { value: None },
-        );
-        driver.step(
-            LookupOperation::StoreNegative {
-                key: LookupCacheKey::Wallet {
-                    wallet_ref: WALLET.into(),
-                },
-            },
-            LookupResult::Persisted,
-        );
-        driver.step(
-            LookupOperation::FindTaskByWalletRef {
-                wallet_ref: WALLET.into(),
-            },
-            LookupResult::TaskFound { task: None },
-        );
-        driver.assert_settled(LookupOutcome::NotFound);
-    }
-
-    // ── Stats flows ────────────────────────────────────────────────────────
-
-    #[test]
-    fn total_builds_the_payload_and_backfills_stale_tolerant() {
-        let mut driver = Driver::query(LookupEndpoint::Total, LookupParams::default());
-        driver.step(
-            LookupOperation::ReadCache {
-                key: LookupCacheKey::StatsTotal,
-                ttl: TtlClass::Stats,
-            },
-            LookupResult::CacheMiss,
-        );
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchTotal,
-            LookupResult::Total {
-                total: 42,
-                wallets: Some(7),
-            },
-        );
-        driver.step(
-            LookupOperation::StoreCache {
-                key: LookupCacheKey::StatsTotal,
-                value: json!({ "totalCredentials": 42, "totalWallets": 7 }),
-                allow_stale: true,
-            },
-            LookupResult::Persisted,
-        );
-        driver.assert_settled(LookupOutcome::CachedOk {
-            value: json!({ "totalCredentials": 42, "totalWallets": 7 }),
-        });
-    }
-
-    #[test]
-    fn stats_treat_a_negative_entry_as_a_miss() {
-        // The original stats handlers never checked for negative entries; a
-        // stray one must not 404 the stats read.
-        let mut driver = Driver::query(LookupEndpoint::Total, LookupParams::default());
-        driver.step(
-            LookupOperation::ReadCache {
-                key: LookupCacheKey::StatsTotal,
-                ttl: TtlClass::Stats,
-            },
-            LookupResult::CacheNegative,
-        );
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(LookupOperation::FetchTotal, LookupResult::ChainReadFailed);
-        driver.assert_settled(LookupOutcome::DependencyUnavailable {
-            dependency: "rpc".into(),
-        });
-    }
-
-    #[test]
-    fn sites_flow_pins_pagination_into_key_and_fetch() {
-        let mut driver = Driver::query(
-            LookupEndpoint::Sites,
-            LookupParams {
-                page: Some(2),
-                page_size: Some(50),
-                order: Some("asc".into()),
-                ..LookupParams::default()
-            },
-        );
-        driver.step(
-            LookupOperation::ReadCache {
-                key: LookupCacheKey::StatsSites {
-                    page: 2,
-                    page_size: 50,
-                    descending: false,
-                },
-                ttl: TtlClass::Stats,
-            },
-            LookupResult::CacheMiss,
-        );
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchSites {
-                page: 2,
-                page_size: 50,
-                descending: false,
-            },
-            LookupResult::Data {
-                value: json!({ "total": 1 }),
-            },
-        );
-        driver.step(
-            LookupOperation::StoreCache {
-                key: LookupCacheKey::StatsSites {
-                    page: 2,
-                    page_size: 50,
-                    descending: false,
-                },
-                value: json!({ "total": 1 }),
-                allow_stale: true,
-            },
-            LookupResult::Persisted,
-        );
-        driver.assert_settled(LookupOutcome::CachedOk {
-            value: json!({ "total": 1 }),
-        });
-    }
-
-    #[test]
-    fn keys_flow_carries_rp_id_through_key_and_fetch() {
-        let mut driver = Driver::query(
-            LookupEndpoint::Keys,
-            LookupParams {
-                rp_id: Some("example.com".into()),
-                ..LookupParams::default()
-            },
-        );
-        driver.step(
-            LookupOperation::ReadCache {
-                key: LookupCacheKey::StatsKeys {
-                    rp_id: "example.com".into(),
-                    page: 1,
-                    page_size: 20,
-                    descending: true,
-                },
-                ttl: TtlClass::Stats,
-            },
-            LookupResult::CacheStale {
-                value: json!({ "total": 9 }),
-                age_ms: 1_000,
-            },
-        );
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchKeys {
-                rp_id: "example.com".into(),
-                page: 1,
-                page_size: 20,
-                descending: true,
-            },
-            LookupResult::ChainReadFailed,
-        );
-        driver.assert_settled(LookupOutcome::ServedStale {
-            value: json!({ "total": 9, "_stale": true, "_staleAgeMs": 1_000 }),
-        });
-    }
-
-    #[test]
-    fn stats_cache_write_failure_is_a_redis_dependency_error() {
-        let mut driver = Driver::query(LookupEndpoint::Total, LookupParams::default());
-        driver.step(
-            LookupOperation::ReadCache {
-                key: LookupCacheKey::StatsTotal,
-                ttl: TtlClass::Stats,
-            },
-            LookupResult::CacheMiss,
-        );
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchTotal,
-            LookupResult::Total {
-                total: 1,
-                wallets: None,
-            },
-        );
-        driver.step(
-            LookupOperation::StoreCache {
-                key: LookupCacheKey::StatsTotal,
-                value: json!({ "totalCredentials": 1 }),
-                allow_stale: true,
-            },
-            LookupResult::StoreUnavailable,
-        );
-        driver.assert_settled(LookupOutcome::DependencyUnavailable {
-            dependency: "redis".into(),
-        });
-    }
-
-    // ── Mutation-killing coverage ──────────────────────────────────────────
-
-    #[test]
-    fn record_cache_backfill_failure_is_a_redis_dependency_error() {
-        // The record-side mirror of the stats test: the post-fetch backfill
-        // is must-succeed, never best-effort.
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheMiss);
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::Fetched {
-                value: Some(value()),
-            },
-        );
-        driver.step(
-            LookupOperation::StoreCache {
-                key: record_key(),
-                value: value(),
-                allow_stale: false,
-            },
-            LookupResult::StoreUnavailable,
-        );
-        driver.assert_settled(LookupOutcome::DependencyUnavailable {
-            dependency: "redis".into(),
-        });
-    }
-
-    #[test]
-    fn negative_cache_write_failure_is_a_redis_dependency_error() {
-        let mut driver = Driver::query(LookupEndpoint::Query, record_params());
-        driver.step(read_record_cache(), LookupResult::CacheMiss);
-        driver.step(
-            LookupOperation::AllowRead,
-            LookupResult::Allowed { allowed: true },
-        );
-        driver.step(
-            LookupOperation::FetchRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            LookupResult::Fetched { value: None },
-        );
-        driver.step(
-            LookupOperation::StoreNegative { key: record_key() },
-            LookupResult::StoreUnavailable,
-        );
-        driver.assert_settled(LookupOutcome::DependencyUnavailable {
-            dependency: "redis".into(),
-        });
-    }
-
-    #[test]
-    fn page_exactly_ten_thousand_reads_through_normally() {
-        // The short-circuit is strictly greater-than: page 10 000 itself
-        // still hits the cache and chain.
-        let mut driver = Driver::query(
-            LookupEndpoint::Sites,
-            LookupParams {
-                page: Some(10_000),
-                ..LookupParams::default()
-            },
-        );
-        driver.step(
-            LookupOperation::ReadCache {
-                key: LookupCacheKey::StatsSites {
-                    page: 10_000,
-                    page_size: 20,
-                    descending: true,
-                },
-                ttl: TtlClass::Stats,
-            },
-            LookupResult::CacheFresh {
-                value: json!({ "total": 0 }),
-            },
-        );
-        driver.assert_settled(LookupOutcome::CachedOk {
-            value: json!({ "total": 0 }),
-        });
+    fn task_status_body_discloses_the_full_unit_without_proofs() {
+        let body = task_status_body(&task(TaskStatus::Pending));
+        assert_eq!(body["id"], "t1");
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["members"][0]["publicKey"], KEY);
+        assert!(body["members"][0].get("proof").is_none());
+        assert_eq!(body["unitNonce"], format!("0x{}", "11".repeat(32)));
     }
 }

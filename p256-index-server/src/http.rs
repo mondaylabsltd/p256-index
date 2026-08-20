@@ -1,63 +1,67 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+//! HTTP shell: routing, transport concerns, and the execution of admission
+//! and lookup Core operations against Redis, the chain and Iggy.
+//!
+//! Every decision — validation (including possession-proof verification),
+//! idempotency, cache policy, degradation — lives in `p256_registrar`; this
+//! module renders outcomes into responses and owns key naming and TTLs.
+
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
-    body::to_bytes,
-    extract::{Path, Query, Request, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
-    middleware::{self, Next},
+    body::{Body, to_bytes},
+    extract::{ConnectInfo, Path, Query, State},
+    http::{HeaderValue, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::Rng;
-use serde::Deserialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crux_core::Core;
+use rand::Rng as _;
 use serde_json::{Value, json};
-use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
 
 use p256_registrar::{
     admission::{
         AdmissionApp, AdmissionEffect, AdmissionEvent, AdmissionOperation, AdmissionOutcome,
-        AdmissionResult, AdmitOutcome, CacheScope, CreateRequest, CreateWalletRequest,
+        AdmissionResult, AdmitOutcome, RegisterRequest,
     },
     lookup::{
-        LookupApp, LookupCacheKey, LookupEffect, LookupEndpoint, LookupEvent, LookupOperation,
-        LookupOutcome, LookupParams, LookupResult, Record, TtlClass, task_status_body,
+        ChainFetch, LookupApp, LookupCacheKey, LookupEffect, LookupEndpoint, LookupEvent,
+        LookupOperation, LookupOutcome, LookupParams, LookupResult, TtlClass, task_status_body,
     },
-    protocol::CHAIN_ID,
+    protocol::{challenge_for, parse_b256, parse_hex_bytes},
     sentinel,
     task::TaskStatus,
 };
 
 use crate::{
-    chain::{Chain, ReadChain},
+    chain::ReadChain,
     config::Config,
-    queue::{CreateQueue, CreateTaskQueue},
+    queue::RegisterTaskQueue,
     store::{Admission, CacheRead, RedisStore, derive_ip_salt, hash_ip},
 };
 
-const MAX_BODY_SIZE: usize = 32 * 1024;
+const MAX_BODY_SIZE: usize = 128 * 1024;
 const RECORD_STALE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 const STATS_STALE_LIMIT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 pub struct AppState {
     store: RedisStore,
-    queue: Arc<dyn CreateTaskQueue>,
+    queue: Arc<dyn RegisterTaskQueue>,
     chain: Arc<dyn ReadChain>,
+    ip_salt: String,
     global_write_limit: u64,
-    ip_hash_salt: Arc<str>,
     telegram_configured: bool,
+    chain_id: u64,
 }
 
 impl AppState {
-    pub fn new(store: RedisStore, queue: CreateQueue, chain: Chain, config: &Config) -> Self {
-        Self::with_clients(store, Arc::new(queue), Arc::new(chain), config)
-    }
-
-    pub fn with_clients(
+    pub fn new(
         store: RedisStore,
-        queue: Arc<dyn CreateTaskQueue>,
+        queue: Arc<dyn RegisterTaskQueue>,
         chain: Arc<dyn ReadChain>,
         config: &Config,
     ) -> Self {
@@ -65,81 +69,81 @@ impl AppState {
             store,
             queue,
             chain,
+            ip_salt: derive_ip_salt(config.private_key.as_deref()),
             global_write_limit: config.global_write_limit,
-            ip_hash_salt: Arc::from(derive_ip_salt(config.private_key.as_deref())),
             telegram_configured: config.telegram_bot_token.is_some()
                 && config.telegram_chat_id.is_some(),
+            chain_id: p256_registrar::protocol::CHAIN_ID,
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct QueryParams {
-    rp_id: Option<String>,
-    credential_id: Option<String>,
-    wallet_ref: Option<String>,
-    page: Option<u64>,
-    page_size: Option<u64>,
-    order: Option<String>,
-}
-
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(home))
+        .route("/", get(root))
         .route("/api/health", get(health))
-        .route("/api/challenge", get(challenge))
-        .route("/api/query", get(query_record))
-        .route("/api/create", post(create))
-        .route("/api/create-wallet", post(create_wallet))
-        .route("/api/create/", get(create_status_missing))
-        .route("/api/create/{id}", get(create_status))
-        .route("/api/stats/total", get(total_credentials))
-        .route("/api/stats/sites", get(list_sites))
-        .route("/api/stats/keys", get(list_keys))
-        .fallback(not_found)
-        .layer(middleware::from_fn(cors_and_request_id))
+        .route("/api/challenge", post(challenge))
+        .route("/api/register", post(register))
+        .route("/api/task/", get(missing_task_id))
+        .route("/api/task/{id}", get(task_status))
+        .route("/api/query", get(query))
+        .route("/api/stats/total", get(stats_total))
+        .route("/api/stats/sites", get(stats_sites))
+        .route("/api/stats/keys", get(stats_keys))
+        .layer(axum::middleware::from_fn(cors))
         .with_state(state)
 }
 
-async fn cors_and_request_id(request: Request, next: Next) -> Response {
-    if request.method() == Method::OPTIONS {
-        let requested_headers = request
-            .headers()
-            .get("access-control-request-headers")
-            .cloned();
+pub async fn serve(
+    state: AppState,
+    address: SocketAddr,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    tracing::info!(%address, "HTTP API listening");
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
+    .await?;
+    Ok(())
+}
+
+async fn cors(request: Request<Body>, next: axum::middleware::Next) -> Response {
+    if request.method() == axum::http::Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
-        apply_cors(response.headers_mut(), requested_headers.as_ref());
+        apply_cors(response.headers_mut());
         return response;
     }
-    let request_id = Uuid::new_v4().simple().to_string()[..8].to_owned();
     let mut response = next.run(request).await;
-    apply_cors(response.headers_mut(), None);
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
-        response.headers_mut().insert("x-request-id", value);
-    }
+    apply_cors(response.headers_mut());
     response
 }
 
-fn apply_cors(headers: &mut HeaderMap, requested_headers: Option<&HeaderValue>) {
-    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+fn apply_cors(headers: &mut axum::http::HeaderMap) {
     headers.insert(
-        "access-control-allow-methods",
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("GET, POST, OPTIONS"),
     );
     headers.insert(
-        "access-control-allow-headers",
-        requested_headers
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("*")),
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type"),
     );
-    headers.insert("access-control-max-age", HeaderValue::from_static("86400"));
+    headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("86400"),
+    );
 }
 
-async fn home() -> Response {
+async fn root() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        "<!doctype html><html><head><title>WebAuthn P256 Public Key Index</title></head><body><h1>WebAuthn P256 Public Key Index</h1><p>See the REST API documentation in this service repository.</p></body></html>",
+        "<!doctype html><html><head><title>WebAuthn P256 Public Key Registry</title></head><body><h1>WebAuthn P256 Public Key Registry</h1><p>See the REST API documentation in this service repository.</p></body></html>",
     ).into_response()
 }
 
@@ -154,10 +158,10 @@ async fn health(State(state): State<AppState>) -> Response {
             });
             let status = if reasons.is_empty() { "ok" } else { "degraded" };
             let mut body = json!({
-                "service": "webauthn-p256-publickey-index",
-                "version": "1.0.0",
-                "chainId": CHAIN_ID,
-                "contract": state.chain.index_address(),
+                "service": "webauthn-p256-publickey-registry",
+                "version": "2.0.0",
+                "chainId": state.chain_id,
+                "registry": state.chain.registry_address(),
                 "rpcCircuit": state.chain.rpc_circuit_state(),
                 "telegramConfigured": state.telegram_configured,
                 "status": status,
@@ -175,10 +179,10 @@ async fn health(State(state): State<AppState>) -> Response {
         Err(_) => json_response(
             StatusCode::OK,
             json!({
-                "service": "webauthn-p256-publickey-index",
-                "version": "1.0.0",
-                "chainId": CHAIN_ID,
-                "contract": state.chain.index_address(),
+                "service": "webauthn-p256-publickey-registry",
+                "version": "2.0.0",
+                "chainId": state.chain_id,
+                "registry": state.chain.registry_address(),
                 "rpcCircuit": state.chain.rpc_circuit_state(),
                 "telegramConfigured": state.telegram_configured,
                 "status": "degraded",
@@ -189,16 +193,59 @@ async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn challenge() -> Response {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
+/// Convenience: compute the storage-authorization challenge one member's key
+/// must sign for this registry and chain — pure arithmetic, so clients that
+/// would rather not implement abi.encode/keccak can fetch it. With no body it
+/// returns a random unitNonce suggestion.
+async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let Ok(bytes) = to_bytes(request.into_body(), MAX_BODY_SIZE).await else {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    };
+    if bytes.is_empty() {
+        let mut nonce = [0u8; 32];
+        rand::rng().fill(&mut nonce);
+        return json_response(
+            StatusCode::OK,
+            json!({ "unitNonce": format!("0x{}", hex::encode(nonce)) }),
+        );
+    }
+    let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid JSON body");
+    };
+    let (Some(rp_id), Some(public_key), Some(unit_nonce)) = (
+        body.get("rpId").and_then(Value::as_str),
+        body.get("publicKey").and_then(Value::as_str),
+        body.get("unitNonce").and_then(Value::as_str),
+    ) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "rpId, publicKey, and unitNonce are required",
+        );
+    };
+    let Ok(registry) = state.chain.registry_address().parse() else {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "registry misconfigured");
+    };
+    let (Ok(key_bytes), Ok(nonce)) = (parse_hex_bytes(public_key), parse_b256(unit_nonce)) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "publicKey must be hex and unitNonce 32-byte hex",
+        );
+    };
+    let challenge = challenge_for(state.chain_id, registry, rp_id, &key_bytes, nonce);
     json_response(
         StatusCode::OK,
-        json!({ "challenge": URL_SAFE_NO_PAD.encode(bytes) }),
+        json!({
+            "challenge": format!("{challenge:#x}"),
+            "challengeBase64url": URL_SAFE_NO_PAD.encode(challenge.0),
+        }),
     )
 }
 
-async fn create(State(state): State<AppState>, request: Request) -> Response {
+async fn register(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response {
     let content_length = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -210,116 +257,39 @@ async fn create(State(state): State<AppState>, request: Request) -> Response {
     if content_length.is_some_and(|length| length > MAX_BODY_SIZE) {
         return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
     }
-    let ip = client_ip(request.headers());
-    let body = match to_bytes(request.into_body(), MAX_BODY_SIZE + 1).await {
-        Ok(body) if body.len() <= MAX_BODY_SIZE => body,
-        Ok(_) | Err(_) => {
-            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-        }
-    };
-    let request: CreateRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
-    };
-
-    let ip_hash = hash_ip(&state.ip_hash_salt, &ip);
-    render_admission(run_admission(&state, &ip_hash, request).await)
-}
-
-/// POST /api/create-wallet: register a multi-key wallet atomically (one
-/// commitment, one createWallet reveal). Same body limits, rate limits, and
-/// response vocabulary as /api/create.
-async fn create_wallet(State(state): State<AppState>, request: Request) -> Response {
-    let content_length = request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
-    if request.headers().contains_key(header::CONTENT_LENGTH) && content_length.is_none() {
+    let Ok(bytes) = to_bytes(request.into_body(), MAX_BODY_SIZE).await else {
         return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-    }
-    if content_length.is_some_and(|length| length > MAX_BODY_SIZE) {
-        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-    }
-    let ip = client_ip(request.headers());
-    let body = match to_bytes(request.into_body(), MAX_BODY_SIZE + 1).await {
-        Ok(body) if body.len() <= MAX_BODY_SIZE => body,
-        Ok(_) | Err(_) => {
-            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-        }
     };
-    let request: CreateWalletRequest = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
+    let Ok(body) = serde_json::from_slice::<RegisterRequest>(&bytes) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid JSON body");
     };
 
-    let ip_hash = hash_ip(&state.ip_hash_salt, &ip);
-    render_admission(run_wallet_admission(&state, &ip_hash, request).await)
-}
+    let ip_hash = hash_ip(&state.ip_salt, &peer.ip().to_string());
+    let core: Core<AdmissionApp> = Core::new();
+    let mut effects = core.process_event(AdmissionEvent::Submit {
+        request: body,
+        new_task_id: uuid::Uuid::new_v4().to_string(),
+        now_ms: now_ms(),
+        chain_id: state.chain_id,
+        registry: state.chain.registry_address(),
+    });
 
-/// Drive one create request through the admission Core. The shell supplies
-/// task identity and time, executes each operation against Redis / the chain
-/// / Iggy, and renders the outcome; every admission decision lives in
-/// `p256_registrar::admission`.
-async fn run_admission(
-    state: &AppState,
-    ip_hash: &str,
-    request: CreateRequest,
-) -> AdmissionOutcome {
-    drive_admission_event(
-        state,
-        ip_hash,
-        AdmissionEvent::Submit {
-            request,
-            new_task_id: Uuid::new_v4().to_string(),
-            now_ms: now_ms(),
-        },
-    )
-    .await
-}
-
-/// Same Core, same operations, multi-key entry event.
-async fn run_wallet_admission(
-    state: &AppState,
-    ip_hash: &str,
-    request: CreateWalletRequest,
-) -> AdmissionOutcome {
-    drive_admission_event(
-        state,
-        ip_hash,
-        AdmissionEvent::SubmitWallet {
-            request,
-            new_task_id: Uuid::new_v4().to_string(),
-            now_ms: now_ms(),
-        },
-    )
-    .await
-}
-
-async fn drive_admission_event(
-    state: &AppState,
-    ip_hash: &str,
-    event: AdmissionEvent,
-) -> AdmissionOutcome {
-    let core: crux_core::Core<AdmissionApp> = crux_core::Core::new();
-    let mut effects: VecDeque<AdmissionEffect> = core.process_event(event).into_iter().collect();
-    while let Some(effect) = effects.pop_front() {
+    loop {
+        let Some(effect) = effects.pop() else {
+            break;
+        };
         let AdmissionEffect::Work(mut request) = effect;
-        let output = execute_admission(state, ip_hash, &request.operation).await;
-        match core.resolve(&mut request, output) {
-            Ok(next) => effects.extend(next),
-            Err(_) => {
-                return AdmissionOutcome::DependencyUnavailable {
-                    dependency: "redis".to_owned(),
-                };
-            }
+        let result = execute_admission(&state, &ip_hash, &request.operation).await;
+        match core.resolve(&mut request, result) {
+            Ok(next) => effects = next,
+            Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         }
     }
-    core.view()
-        .outcome
-        .unwrap_or(AdmissionOutcome::DependencyUnavailable {
-            dependency: "redis".to_owned(),
-        })
+
+    match core.view().outcome {
+        Some(outcome) => render_admission(outcome),
+        None => error_response(StatusCode::INTERNAL_SERVER_ERROR, "admission never settled"),
+    }
 }
 
 async fn execute_admission(
@@ -332,59 +302,30 @@ async fn execute_admission(
             Ok(allowed) => AdmissionResult::Allowed { allowed },
             Err(_) => AdmissionResult::StoreUnavailable,
         },
-        AdmissionOperation::ReadCache { scope } => {
-            match state
-                .store
-                .cache_get(&cache_scope_key(scope), RECORD_STALE_LIMIT)
-                .await
-            {
-                Ok(CacheRead::Fresh(value)) => AdmissionResult::CacheHit { value },
-                Ok(_) => AdmissionResult::CacheMiss,
+        AdmissionOperation::FindTaskByNonce { unit_nonce } => {
+            match state.store.find_by_nonce(unit_nonce).await {
+                Ok(task) => AdmissionResult::TaskFound { task },
                 Err(_) => AdmissionResult::StoreUnavailable,
             }
         }
-        AdmissionOperation::FetchChainRecord {
-            rp_id,
-            credential_id,
-        } => match state.chain.get_record(rp_id, credential_id).await {
-            Ok(record) => AdmissionResult::ChainRecord {
-                value: record.as_ref().map(record_value),
-            },
-            Err(_) => AdmissionResult::ChainReadFailed,
-        },
-        AdmissionOperation::FetchV2RecordByWalletRef { wallet_ref } => {
-            let Ok(wallet_ref) = wallet_ref.parse() else {
+        AdmissionOperation::CheckContentRegistered { content_hash } => {
+            let Ok(content_hash) = parse_b256(content_hash) else {
                 return AdmissionResult::ChainReadFailed;
             };
-            match state.chain.get_v2_record_by_wallet_ref(wallet_ref).await {
-                Ok(record) => AdmissionResult::ChainRecord {
-                    value: record.as_ref().map(record_value),
-                },
+            match state.chain.is_content_registered(content_hash).await {
+                Ok(value) => AdmissionResult::ChainBool { value },
                 Err(_) => AdmissionResult::ChainReadFailed,
             }
         }
-        AdmissionOperation::StoreCache {
-            scope,
-            value,
-            best_effort,
-        } => {
-            let write = state
-                .store
-                .cache_set(&cache_scope_key(scope), value.clone(), false)
-                .await;
-            if *best_effort || write.is_ok() {
-                AdmissionResult::Persisted
-            } else {
-                AdmissionResult::StoreUnavailable
+        AdmissionOperation::CheckNonceUsed { unit_nonce } => {
+            let Ok(unit_nonce) = parse_b256(unit_nonce) else {
+                return AdmissionResult::ChainReadFailed;
+            };
+            match state.chain.is_nonce_used(unit_nonce).await {
+                Ok(value) => AdmissionResult::ChainBool { value },
+                Err(_) => AdmissionResult::ChainReadFailed,
             }
         }
-        AdmissionOperation::FindTaskByRecord {
-            rp_id,
-            credential_id,
-        } => match state.store.find_by_record(rp_id, credential_id).await {
-            Ok(task) => AdmissionResult::TaskFound { task },
-            Err(_) => AdmissionResult::StoreUnavailable,
-        },
         AdmissionOperation::QueueDepth => match state.store.queue_stats().await {
             Ok(stats) => AdmissionResult::Depth { depth: stats.depth },
             Err(_) => AdmissionResult::StoreUnavailable,
@@ -422,16 +363,6 @@ async fn execute_admission(
     }
 }
 
-fn cache_scope_key(scope: &CacheScope) -> String {
-    match scope {
-        CacheScope::Record {
-            rp_id,
-            credential_id,
-        } => record_cache_key(rp_id, credential_id),
-        CacheScope::Wallet { wallet_ref } => wallet_cache_key(wallet_ref),
-    }
-}
-
 fn render_admission(outcome: AdmissionOutcome) -> Response {
     match outcome {
         AdmissionOutcome::Invalid { message } => error_response(StatusCode::BAD_REQUEST, &message),
@@ -439,121 +370,116 @@ fn render_admission(outcome: AdmissionOutcome) -> Response {
             StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded, max 5 requests per minute",
         ),
-        AdmissionOutcome::AlreadyDone { record } => done_response(record),
-        AdmissionOutcome::Queued { id, status } => queued_response(&id, &status),
-        AdmissionOutcome::WalletConflict {
-            wallet_ref,
-            message,
-        } => wallet_conflict(&wallet_ref, &message),
-        AdmissionOutcome::Busy => busy_response(),
-        AdmissionOutcome::DependencyUnavailable { dependency } => {
-            retryable_service_unavailable(&dependency)
+        AdmissionOutcome::Queued { id, status } => {
+            let code = match status {
+                TaskStatus::Done => StatusCode::OK,
+                _ => StatusCode::ACCEPTED,
+            };
+            json_response(code, json!({ "id": id, "status": status }))
         }
+        AdmissionOutcome::AlreadyRegistered { content_hash } => json_response(
+            StatusCode::OK,
+            json!({ "status": "done", "contentHash": content_hash }),
+        ),
+        AdmissionOutcome::NonceConflict { message } => {
+            json_response(StatusCode::CONFLICT, json!({ "error": message }))
+        }
+        AdmissionOutcome::Busy => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service is busy, please retry later",
+        ),
+        AdmissionOutcome::DependencyUnavailable { dependency } => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("{dependency} temporarily unavailable, please retry"),
+        ),
     }
 }
 
-async fn create_status(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn missing_task_id() -> Response {
+    error_response(StatusCode::BAD_REQUEST, "task id is required")
+}
+
+async fn task_status(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.store.get_task(&id).await {
-        // Disclosure (which fields may be shown before Done) is commit-reveal
-        // policy and lives in the registrar.
         Ok(Some(task)) => json_response(StatusCode::OK, task_status_body(&task)),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "not found"),
-        Err(_) => dependency_error("redis"),
+        Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "redis temporarily unavailable, please retry",
+        ),
     }
 }
 
-async fn create_status_missing() -> Response {
-    error_response(StatusCode::BAD_REQUEST, "id is required")
-}
-
-async fn query_record(
+async fn query(
     State(state): State<AppState>,
-    Query(params): Query<QueryParams>,
-    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<LookupParams>,
 ) -> Response {
-    run_lookup(
-        &state,
-        &headers,
-        LookupEndpoint::Query,
-        lookup_params(params),
-    )
-    .await
+    run_lookup(&state, peer, LookupEndpoint::Query { params }).await
 }
 
-async fn total_credentials(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    run_lookup(
-        &state,
-        &headers,
-        LookupEndpoint::Total,
-        LookupParams::default(),
-    )
-    .await
-}
-
-async fn list_sites(
+async fn stats_total(
     State(state): State<AppState>,
-    Query(params): Query<QueryParams>,
-    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    run_lookup(
-        &state,
-        &headers,
-        LookupEndpoint::Sites,
-        lookup_params(params),
-    )
-    .await
+    run_lookup(&state, peer, LookupEndpoint::StatsTotal).await
 }
 
-async fn list_keys(
+async fn stats_sites(
     State(state): State<AppState>,
-    Query(params): Query<QueryParams>,
-    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<LookupParams>,
 ) -> Response {
-    run_lookup(
-        &state,
-        &headers,
-        LookupEndpoint::Keys,
-        lookup_params(params),
-    )
-    .await
+    run_lookup(&state, peer, LookupEndpoint::StatsSites { params }).await
 }
 
-fn lookup_params(params: QueryParams) -> LookupParams {
-    LookupParams {
-        rp_id: params.rp_id,
-        credential_id: params.credential_id,
-        wallet_ref: params.wallet_ref,
-        page: params.page,
-        page_size: params.page_size,
-        order: params.order,
-    }
-}
-
-/// Drive one query through the lookup Core and render its outcome; every
-/// read-through decision lives in `p256_registrar::lookup`.
-async fn run_lookup(
-    state: &AppState,
-    headers: &HeaderMap,
-    endpoint: LookupEndpoint,
+#[derive(serde::Deserialize)]
+struct KeysParams {
+    #[serde(rename = "rpId")]
+    rp_id: Option<String>,
+    #[serde(flatten)]
     params: LookupParams,
+}
+
+async fn stats_keys(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(keys): Query<KeysParams>,
 ) -> Response {
-    let ip_hash = hash_ip(&state.ip_hash_salt, &client_ip(headers));
-    let core: crux_core::Core<LookupApp> = crux_core::Core::new();
-    let mut effects: VecDeque<LookupEffect> = core
-        .process_event(LookupEvent::Query { endpoint, params })
-        .into_iter()
-        .collect();
-    while let Some(effect) = effects.pop_front() {
+    let Some(rp_id) = keys.rp_id else {
+        return error_response(StatusCode::BAD_REQUEST, "rpId is required");
+    };
+    run_lookup(
+        &state,
+        peer,
+        LookupEndpoint::StatsKeys {
+            rp_id,
+            params: keys.params,
+        },
+    )
+    .await
+}
+
+async fn run_lookup(state: &AppState, peer: SocketAddr, endpoint: LookupEndpoint) -> Response {
+    let ip_hash = hash_ip(&state.ip_salt, &peer.ip().to_string());
+    let core: Core<LookupApp> = Core::new();
+    let mut effects = core.process_event(LookupEvent::Start { endpoint });
+
+    loop {
+        let Some(effect) = effects.pop() else {
+            break;
+        };
         let LookupEffect::Work(mut request) = effect;
-        let output = execute_lookup(state, &ip_hash, &request.operation).await;
-        match core.resolve(&mut request, output) {
-            Ok(next) => effects.extend(next),
-            Err(_) => return dependency_error("redis"),
+        let result = execute_lookup(state, &ip_hash, &request.operation).await;
+        match core.resolve(&mut request, result) {
+            Ok(next) => effects = next,
+            Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         }
     }
+
     match core.view().outcome {
         Some(outcome) => render_lookup(outcome),
-        None => dependency_error("redis"),
+        None => error_response(StatusCode::INTERNAL_SERVER_ERROR, "lookup never settled"),
     }
 }
 
@@ -563,12 +489,16 @@ async fn execute_lookup(
     operation: &LookupOperation,
 ) -> LookupResult {
     match operation {
-        LookupOperation::ReadCache { key, ttl } => {
-            let limit = match ttl {
+        LookupOperation::ReadCache { key } => {
+            let stale_limit = match key.ttl_class() {
                 TtlClass::Record => RECORD_STALE_LIMIT,
                 TtlClass::Stats => STATS_STALE_LIMIT,
             };
-            match state.store.cache_get(&lookup_cache_key(key), limit).await {
+            match state
+                .store
+                .cache_get(&cache_key_string(key), stale_limit)
+                .await
+            {
                 Ok(CacheRead::Fresh(value)) => LookupResult::CacheFresh { value },
                 Ok(CacheRead::Negative) => LookupResult::CacheNegative,
                 Ok(CacheRead::Stale { value, age_ms }) => {
@@ -578,91 +508,29 @@ async fn execute_lookup(
                 Err(_) => LookupResult::StoreUnavailable,
             }
         }
+        LookupOperation::WriteCache {
+            key,
+            value,
+            negative,
+        } => {
+            let key = cache_key_string(key);
+            let write = if *negative {
+                state.store.cache_set_negative(&key).await
+            } else {
+                state.store.cache_set(&key, value.clone(), false).await
+            };
+            match write {
+                Ok(()) => LookupResult::Persisted,
+                Err(_) => LookupResult::StoreUnavailable,
+            }
+        }
         LookupOperation::AllowRead => match state.store.allow_read(ip_hash).await {
             Ok(allowed) => LookupResult::Allowed { allowed },
             Err(_) => LookupResult::StoreUnavailable,
         },
-        LookupOperation::FetchRecord {
-            rp_id,
-            credential_id,
-        } => match state.chain.get_record(rp_id, credential_id).await {
-            Ok(record) => LookupResult::Fetched {
-                value: record.as_ref().map(record_value),
-            },
-            Err(_) => LookupResult::ChainReadFailed,
-        },
-        LookupOperation::FetchRecordByWalletRef { wallet_ref } => {
-            let Ok(wallet_ref) = wallet_ref.parse() else {
-                return LookupResult::ChainReadFailed;
-            };
-            match state.chain.get_record_by_wallet_ref(wallet_ref).await {
-                Ok(record) => LookupResult::Fetched {
-                    value: record.as_ref().map(record_value),
-                },
-                Err(_) => LookupResult::ChainReadFailed,
-            }
-        }
-        LookupOperation::FetchTotal => match state.chain.total_credentials().await {
-            Ok(total) => LookupResult::Total {
-                total,
-                wallets: state.chain.total_wallets().await.ok().flatten(),
-            },
-            Err(_) => LookupResult::ChainReadFailed,
-        },
-        LookupOperation::FetchSites {
-            page,
-            page_size,
-            descending,
-        } => match state.chain.list_sites(*page, *page_size, *descending).await {
-            Ok(page) => LookupResult::Data {
-                value: serde_json::to_value(page).expect("serializable sites page"),
-            },
-            Err(_) => LookupResult::ChainReadFailed,
-        },
-        LookupOperation::FetchKeys {
-            rp_id,
-            page,
-            page_size,
-            descending,
-        } => match state
-            .chain
-            .list_keys(rp_id, *page, *page_size, *descending)
-            .await
-        {
-            Ok(page) => LookupResult::Data {
-                value: serde_json::to_value(page).expect("serializable keys page"),
-            },
-            Err(_) => LookupResult::ChainReadFailed,
-        },
-        LookupOperation::StoreCache {
-            key,
-            value,
-            allow_stale,
-        } => {
-            match state
-                .store
-                .cache_set(&lookup_cache_key(key), value.clone(), *allow_stale)
-                .await
-            {
-                Ok(()) => LookupResult::Persisted,
-                Err(_) => LookupResult::StoreUnavailable,
-            }
-        }
-        LookupOperation::StoreNegative { key } => {
-            match state.store.cache_set_negative(&lookup_cache_key(key)).await {
-                Ok(()) => LookupResult::Persisted,
-                Err(_) => LookupResult::StoreUnavailable,
-            }
-        }
-        LookupOperation::FindTaskByRecord {
-            rp_id,
-            credential_id,
-        } => match state.store.find_by_record(rp_id, credential_id).await {
-            Ok(task) => LookupResult::TaskFound { task },
-            Err(_) => LookupResult::StoreUnavailable,
-        },
-        LookupOperation::FindTaskByWalletRef { wallet_ref } => {
-            match state.store.find_by_wallet_ref(wallet_ref).await {
+        LookupOperation::FetchChain { fetch } => execute_fetch(state, fetch).await,
+        LookupOperation::FindTaskByKey { key_hash } => {
+            match state.store.find_by_public_key(key_hash).await {
                 Ok(task) => LookupResult::TaskFound { task },
                 Err(_) => LookupResult::StoreUnavailable,
             }
@@ -670,20 +538,113 @@ async fn execute_lookup(
     }
 }
 
-fn lookup_cache_key(key: &LookupCacheKey) -> String {
-    match key {
-        LookupCacheKey::Record {
+async fn execute_fetch(state: &AppState, fetch: &ChainFetch) -> LookupResult {
+    match fetch {
+        ChainFetch::EntriesByKey {
+            public_key,
+            offset,
+            limit,
+            descending,
+        } => {
+            let page = offset / limit + 1;
+            match state
+                .chain
+                .entries_by_key(public_key, page, *limit, *descending)
+                .await
+            {
+                Ok(page) => LookupResult::Chain {
+                    value: serde_json::to_value(&page).unwrap_or(Value::Null),
+                },
+                Err(_) => LookupResult::ChainFailed,
+            }
+        }
+        ChainFetch::Entry { entry_id } => match state.chain.entry(*entry_id).await {
+            Ok(Some(entry)) => LookupResult::Chain {
+                value: serde_json::to_value(&entry).unwrap_or(Value::Null),
+            },
+            Ok(None) => LookupResult::ChainNotFound,
+            Err(_) => LookupResult::ChainFailed,
+        },
+        ChainFetch::Totals => match state.chain.totals().await {
+            Ok((entries, units, rp_ids)) => LookupResult::Chain {
+                value: json!({
+                    "totalEntries": entries,
+                    "totalUnits": units,
+                    "totalRpIds": rp_ids,
+                }),
+            },
+            Err(_) => LookupResult::ChainFailed,
+        },
+        ChainFetch::Sites {
+            offset,
+            limit,
+            descending,
+        } => {
+            let page = offset / limit + 1;
+            match state.chain.rp_ids(page, *limit, *descending).await {
+                Ok(page) => LookupResult::Chain {
+                    value: serde_json::to_value(&page).unwrap_or(Value::Null),
+                },
+                Err(_) => LookupResult::ChainFailed,
+            }
+        }
+        ChainFetch::Keys {
             rp_id,
-            credential_id,
-        } => record_cache_key(rp_id, credential_id),
-        LookupCacheKey::Wallet { wallet_ref } => wallet_cache_key(wallet_ref),
-        LookupCacheKey::StatsTotal => "stats:totalCredentials".to_owned(),
-        LookupCacheKey::StatsSites {
+            offset,
+            limit,
+            descending,
+        } => {
+            let page = offset / limit + 1;
+            match state
+                .chain
+                .entries_by_rp_id(rp_id, page, *limit, *descending)
+                .await
+            {
+                Ok(page) => LookupResult::Chain {
+                    value: serde_json::to_value(&page).unwrap_or(Value::Null),
+                },
+                Err(_) => LookupResult::ChainFailed,
+            }
+        }
+    }
+}
+
+fn render_lookup(outcome: LookupOutcome) -> Response {
+    match outcome {
+        LookupOutcome::CachedOk { value } => cached_response(value),
+        LookupOutcome::Ok { value } | LookupOutcome::QueuePending { value } => {
+            json_response(StatusCode::OK, value)
+        }
+        LookupOutcome::StaleOk { value, age_ms } => stale_response(value, age_ms),
+        LookupOutcome::Invalid { message } => error_response(StatusCode::BAD_REQUEST, &message),
+        LookupOutcome::NotFound => error_response(StatusCode::NOT_FOUND, "not found"),
+        LookupOutcome::ReadLimited => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded, please retry later",
+        ),
+        LookupOutcome::DependencyUnavailable { dependency } => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("{dependency} temporarily unavailable, please retry"),
+        ),
+    }
+}
+
+fn cache_key_string(key: &LookupCacheKey) -> String {
+    match key {
+        LookupCacheKey::EntriesByKey {
+            key_hash,
+            page,
+            page_size,
+            descending,
+        } => format!("query:key:{key_hash}:{page}:{page_size}:{descending}"),
+        LookupCacheKey::Entry { entry_id } => format!("query:entry:{entry_id}"),
+        LookupCacheKey::StatsTotal => "stats:total".into(),
+        LookupCacheKey::Sites {
             page,
             page_size,
             descending,
         } => format!("stats:rpIds:{page}:{page_size}:{descending}"),
-        LookupCacheKey::StatsKeys {
+        LookupCacheKey::Keys {
             rp_id,
             page,
             page_size,
@@ -692,56 +653,6 @@ fn lookup_cache_key(key: &LookupCacheKey) -> String {
     }
 }
 
-fn render_lookup(outcome: LookupOutcome) -> Response {
-    match outcome {
-        LookupOutcome::Invalid { message } => error_response(StatusCode::BAD_REQUEST, &message),
-        LookupOutcome::CachedOk { value } => cached_response(value),
-        LookupOutcome::EmptyPage { page, page_size } => json_response(
-            StatusCode::OK,
-            json!({ "total": 0, "page": page, "pageSize": page_size, "items": [] }),
-        ),
-        LookupOutcome::ReadLimited => read_limited(),
-        LookupOutcome::ServedStale { value } => served_stale_response(value),
-        LookupOutcome::QueueFallback { body } => json_response(StatusCode::OK, body),
-        LookupOutcome::NotFound => error_response(StatusCode::NOT_FOUND, "not found"),
-        LookupOutcome::DependencyUnavailable { dependency } => {
-            retryable_service_unavailable(&dependency)
-        }
-    }
-}
-
-async fn not_found() -> Response {
-    error_response(StatusCode::NOT_FOUND, "not found")
-}
-
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("cf-connecting-ip")
-        .or_else(|| headers.get("x-forwarded-for"))
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .next()
-                .unwrap_or("unknown")
-                .trim()
-                .to_owned()
-        })
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".into())
-}
-
-fn record_cache_key(rp_id: &str, credential_id: &str) -> String {
-    format!("query:{rp_id}:{credential_id}")
-}
-fn wallet_cache_key(wallet_ref: &str) -> String {
-    format!("query:walletRef:{wallet_ref}")
-}
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -749,27 +660,12 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn record_value(record: &Record) -> Value {
-    serde_json::to_value(record).expect("record is serializable")
+fn json_response(status: StatusCode, body: Value) -> Response {
+    (status, axum::Json(body)).into_response()
 }
 
-fn queued_response(id: &str, status: &TaskStatus) -> Response {
-    json_response(StatusCode::ACCEPTED, json!({ "id": id, "status": status }))
-}
-
-fn done_response(value: Value) -> Response {
-    let mut body = value;
-    if let Some(object) = body.as_object_mut() {
-        object.insert("status".into(), Value::String("done".into()));
-    }
-    json_response(StatusCode::CREATED, body)
-}
-
-fn wallet_conflict(wallet_ref: &str, error: &str) -> Response {
-    json_response(
-        StatusCode::CONFLICT,
-        json!({ "error": error, "walletRef": wallet_ref }),
-    )
+fn error_response(status: StatusCode, message: &str) -> Response {
+    json_response(status, json!({ "error": message }))
 }
 
 fn cached_response(value: Value) -> Response {
@@ -781,110 +677,50 @@ fn cached_response(value: Value) -> Response {
     response
 }
 
-fn served_stale_response(value: Value) -> Response {
-    // The `_stale`/`_staleAgeMs` markers are already in the value (Core).
-    let mut response = json_response(StatusCode::OK, value);
-    response
-        .headers_mut()
-        .insert("x-served-stale", HeaderValue::from_static("true"));
+fn stale_response(value: Value, age_ms: u64) -> Response {
+    let mut body = value;
+    if let Some(object) = body.as_object_mut() {
+        object.insert("_stale".into(), Value::Bool(true));
+        object.insert("_staleAgeMs".into(), json!(age_ms));
+    }
+    let mut response = json_response(StatusCode::OK, body);
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     response
-}
-
-fn read_limited() -> Response {
-    let mut response = json_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        json!({
-            "error": "too many uncached reads, slow down",
-            "retryable": true,
-        }),
-    );
-    response
         .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("10"));
+        .insert("x-served-stale", HeaderValue::from_static("true"));
     response
-}
-
-fn busy_response() -> Response {
-    let mut response = json_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        json!({
-            "error": "service busy, please retry shortly",
-            "retryable": true,
-        }),
-    );
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
-    response
-}
-
-fn retryable_service_unavailable(dependency: &str) -> Response {
-    let mut response = json_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        json!({
-            "error": "upstream dependency temporarily unavailable, please retry",
-            "retryable": true,
-            "dependency": dependency,
-        }),
-    );
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
-    response
-}
-
-fn dependency_error(dependency: &str) -> Response {
-    retryable_service_unavailable(dependency)
-}
-fn error_response(status: StatusCode, error: &str) -> Response {
-    json_response(status, json!({ "error": error }))
-}
-fn json_response(status: StatusCode, body: Value) -> Response {
-    (status, axum::Json(body)).into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        net::SocketAddr,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use axum::{
-        Router,
-        body::{Body, to_bytes},
-        http::{Request, StatusCode},
-    };
-    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
-    use serde_json::{Value, json};
+    use axum::body::to_bytes;
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::elliptic_curve::Generate as _;
+    use p256_registrar::lookup::{Entry, Page, SiteItem};
+    use p256_registrar::task::RegisterTask;
+    use p256_registrar::verify::base64url_32;
+    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
-    use super::{AppState, record_cache_key, router, wallet_cache_key};
-    use crate::{
-        chain::{ChainError, ReadChain},
-        config::Config,
-        queue::{CreateTaskQueue, QueueError},
-        store::RedisStore,
-    };
-    use p256_registrar::{
-        lookup::{Page, Record, SiteItem},
-        task::CreateTask,
-    };
+    use super::*;
+    use crate::chain::ChainError;
+    use crate::queue::QueueError;
+
+    const REGISTRY: &str = "0x1111111111111111111111111111111111111111";
 
     #[derive(Default)]
     struct FakeQueue {
-        tasks: Mutex<Vec<CreateTask>>,
+        tasks: Mutex<Vec<RegisterTask>>,
     }
 
     #[async_trait]
-    impl CreateTaskQueue for FakeQueue {
-        async fn enqueue(&self, task: &CreateTask) -> Result<(), QueueError> {
+    impl RegisterTaskQueue for FakeQueue {
+        async fn enqueue(&self, task: &RegisterTask) -> Result<(), QueueError> {
             self.tasks
                 .lock()
                 .expect("test queue lock")
@@ -893,6 +729,8 @@ mod tests {
         }
     }
 
+    /// A chain with no entries and closed circuit: enough for the HTTP
+    /// contract, which never needs a live RPC.
     struct OfflineChain;
 
     #[async_trait]
@@ -901,58 +739,65 @@ mod tests {
             "open"
         }
 
-        fn index_address(&self) -> String {
-            p256_registrar::protocol::CONTRACT_ADDRESS.to_ascii_lowercase()
+        fn registry_address(&self) -> String {
+            REGISTRY.into()
         }
 
-        async fn get_record(&self, _: &str, _: &str) -> Result<Option<Record>, ChainError> {
+        async fn entry(&self, _: u64) -> Result<Option<Entry>, ChainError> {
             Err(ChainError::Unavailable)
         }
 
-        async fn get_record_by_wallet_ref(
+        async fn entries_by_key(
             &self,
-            _: alloy::primitives::B256,
-        ) -> Result<Option<Record>, ChainError> {
-            Err(ChainError::Unavailable)
+            _: &str,
+            page: u64,
+            page_size: u64,
+            _: bool,
+        ) -> Result<Page<Entry>, ChainError> {
+            Ok(Page {
+                total: 0,
+                page,
+                page_size,
+                items: Vec::new(),
+            })
         }
 
-        async fn get_v2_record_by_wallet_ref(
-            &self,
-            _: alloy::primitives::B256,
-        ) -> Result<Option<Record>, ChainError> {
-            Err(ChainError::Unavailable)
-        }
-
-        async fn total_credentials(&self) -> Result<u64, ChainError> {
-            Err(ChainError::Unavailable)
-        }
-
-        async fn total_wallets(&self) -> Result<Option<u64>, ChainError> {
-            Err(ChainError::Unavailable)
-        }
-
-        async fn list_sites(&self, _: u64, _: u64, _: bool) -> Result<Page<SiteItem>, ChainError> {
-            Err(ChainError::Unavailable)
-        }
-
-        async fn list_keys(
+        async fn entries_by_rp_id(
             &self,
             _: &str,
             _: u64,
             _: u64,
             _: bool,
-        ) -> Result<Page<Record>, ChainError> {
+        ) -> Result<Page<Entry>, ChainError> {
+            Err(ChainError::Unavailable)
+        }
+
+        async fn rp_ids(&self, _: u64, _: u64, _: bool) -> Result<Page<SiteItem>, ChainError> {
+            Err(ChainError::Unavailable)
+        }
+
+        async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
+            Err(ChainError::Unavailable)
+        }
+
+        async fn is_nonce_used(&self, _: alloy::primitives::B256) -> Result<bool, ChainError> {
+            Err(ChainError::Unavailable)
+        }
+
+        async fn is_content_registered(
+            &self,
+            _: alloy::primitives::B256,
+        ) -> Result<bool, ChainError> {
             Err(ChainError::Unavailable)
         }
     }
 
     fn test_config() -> Config {
         Config {
-            listen_addr: "127.0.0.1:0".parse::<SocketAddr>().expect("test address"),
+            listen_addr: "127.0.0.1:0".parse().expect("test address"),
             // This test-only salt keeps rate-limit keys isolated across repeated runs against
             // the same Redis instance; no chain writer is constructed from this config.
             private_key: Some(format!("test-ip-salt-{}", uuid::Uuid::new_v4())),
-            commit_private_key: None,
             alchemy_api_key: None,
             iggy_url: "iggy+tcp://unused".into(),
             iggy_consumer_url: "iggy+tcp://unused".into(),
@@ -963,24 +808,20 @@ mod tests {
             telegram_chat_id: None,
             max_gas_price_wei: p256_registrar::gas::DEFAULT_MAX_FEE_WEI,
             global_write_limit: 10_000,
-            iggy_enqueue_timeout: Duration::from_secs(1),
+            iggy_enqueue_timeout: std::time::Duration::from_secs(1),
             iggy_consumer_group: "test".into(),
-            contract_address: None,
+            contract_address: REGISTRY.into(),
         }
     }
 
-    async fn request(
-        app: &Router,
-        method: &str,
-        uri: &str,
-        body: &str,
-    ) -> axum::response::Response {
+    async fn request(app: &Router, method: &str, uri: &str, body: &str) -> Response {
         app.clone()
             .oneshot(
                 Request::builder()
                     .method(method)
                     .uri(uri)
                     .header("content-type", "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4000))))
                     .body(Body::from(body.to_owned()))
                     .expect("test request"),
             )
@@ -988,48 +829,77 @@ mod tests {
             .expect("router response")
     }
 
-    async fn response_json(response: axum::response::Response) -> Value {
-        let body = to_bytes(response.into_body(), 64 * 1024)
+    async fn response_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("response body");
-        serde_json::from_slice(&body).expect("JSON response")
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
     }
 
+    /// One member with a REAL possession proof over its storage challenge.
+    fn signed_member_json(rp_id: &str, nonce_hex: &str) -> (Value, String) {
+        let signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+        let public = hex::encode(signing.verifying_key().to_sec1_point(false).as_bytes());
+        let nonce = parse_b256(nonce_hex).unwrap();
+        let challenge = challenge_for(
+            p256_registrar::protocol::CHAIN_ID,
+            REGISTRY.parse().unwrap(),
+            rp_id,
+            &hex::decode(&public).unwrap(),
+            nonce,
+        );
+        let client_data = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
+            base64url_32(&challenge)
+        );
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        auth_data.push(0x05);
+        auth_data.extend_from_slice(&[0, 0, 0, 0]);
+        let client_hash: [u8; 32] = Sha256::digest(client_data.as_bytes()).into();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&client_hash);
+        let digest: [u8; 32] = Sha256::digest(&signed).into();
+        let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let bytes = signature.to_bytes();
+        (
+            json!({
+                "publicKey": public,
+                "proof": {
+                    "authenticatorData": hex::encode(auth_data),
+                    "clientDataJSON": client_data,
+                    "challengeIndex": 23,
+                    "typeIndex": 1,
+                    "r": format!("0x{}", hex::encode(&bytes[..32])),
+                    "s": format!("0x{}", hex::encode(&bytes[32..])),
+                }
+            }),
+            public,
+        )
+    }
+
+    /// The full HTTP contract over real Redis (Iggy is faked; the chain is
+    /// offline). Gated because CI has no infrastructure.
     #[tokio::test]
     #[ignore = "requires P256_INDEX_TEST_REDIS_URL"]
-    async fn http_contract_is_preserved_with_real_redis() {
-        let redis_url = env::var("P256_INDEX_TEST_REDIS_URL")
-            .expect("P256_INDEX_TEST_REDIS_URL is required for this integration test");
-        let store = RedisStore::connect(&redis_url).await.expect("test Redis");
-        let initial_queue_depth = store
-            .queue_stats()
+    async fn http_contract_over_real_redis() {
+        let Some(redis_url) = std::env::var("P256_INDEX_TEST_REDIS_URL").ok() else {
+            return;
+        };
+        let store = crate::store::RedisStore::connect(&redis_url)
             .await
-            .expect("initial queue stats")
-            .depth;
+            .expect("test Redis");
+        let initial_queue_depth = store.queue_stats().await.expect("stats").depth;
         let queue = Arc::new(FakeQueue::default());
-        let state = AppState::with_clients(
+        let state = AppState::new(
             store.clone(),
             queue.clone(),
             Arc::new(OfflineChain),
             &test_config(),
         );
         let app = router(state);
-        let suffix = uuid::Uuid::new_v4();
-        let signing_key = p256::SecretKey::generate();
-        let public_key = hex::encode(signing_key.public_key().to_sec1_point(false).as_bytes());
-        let wallet_ref =
-            p256_registrar::wallet::build_wallet_ref(&public_key).expect("valid P-256 key");
-        let rp_id = format!("http-contract-{suffix}.invalid");
-        let credential_id = format!("credential-{suffix}");
-        let create_body = json!({
-            "rpId": rp_id,
-            "credentialId": credential_id,
-            "publicKey": public_key,
-            "name": "Contract verification key",
-        })
-        .to_string();
 
-        let options = request(&app, "OPTIONS", "/api/create", "").await;
+        let options = request(&app, "OPTIONS", "/api/register", "").await;
         assert_eq!(options.status(), StatusCode::NO_CONTENT);
         assert_eq!(
             options
@@ -1039,113 +909,91 @@ mod tests {
             Some("*")
         );
 
-        let invalid = request(&app, "POST", "/api/create", "not-json").await;
+        let invalid = request(&app, "POST", "/api/register", "not-json").await;
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
-        let invalid_length = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/create")
-                    .header("content-type", "application/json")
-                    .header("content-length", "not-a-number")
-                    .body(Body::from("{}"))
-                    .expect("test request"),
-            )
-            .await
-            .expect("router response");
-        assert_eq!(invalid_length.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Nonce suggestion from the empty-body challenge endpoint.
+        let suggestion = request(&app, "POST", "/api/challenge", "").await;
+        assert_eq!(suggestion.status(), StatusCode::OK);
+        let nonce_hex = response_json(suggestion).await["unitNonce"]
+            .as_str()
+            .expect("nonce")
+            .to_owned();
 
-        let missing_id = request(&app, "GET", "/api/create/", "").await;
-        assert_eq!(missing_id.status(), StatusCode::BAD_REQUEST);
+        // A fully-proven single-member registration.
+        let (member, public_key) = signed_member_json("http.example", &nonce_hex);
+        let body = json!({
+            "rpId": "http.example",
+            "metadata": "0xaabb",
+            "unitNonce": nonce_hex,
+            "members": [member],
+        })
+        .to_string();
 
-        let challenge = request(&app, "GET", "/api/challenge", "").await;
-        assert_eq!(challenge.status(), StatusCode::OK);
-        let challenge = response_json(challenge).await;
-        assert!(challenge["challenge"].as_str().is_some_and(|value| {
-            value.len() == 43
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        }));
-
-        let created = request(&app, "POST", "/api/create", &create_body).await;
+        let created = request(&app, "POST", "/api/register", &body).await;
         assert_eq!(created.status(), StatusCode::ACCEPTED);
         let created = response_json(created).await;
         assert_eq!(created["status"], "pending");
-        let id = created["id"].as_str().expect("create id").to_owned();
+        let id = created["id"].as_str().expect("task id").to_owned();
+        assert_eq!(queue.tasks.lock().expect("lock").len(), 1);
 
-        let duplicate = request(&app, "POST", "/api/create", &create_body).await;
+        // Same unit resubmitted → the same task (idempotency by nonce).
+        let duplicate = request(&app, "POST", "/api/register", &body).await;
         assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
         assert_eq!(response_json(duplicate).await["id"], id);
-        assert_eq!(queue.tasks.lock().expect("test queue lock").len(), 1);
+        assert_eq!(queue.tasks.lock().expect("lock").len(), 1);
 
-        let status = request(&app, "GET", &format!("/api/create/{id}"), "").await;
+        // A DIFFERENT unit on the same nonce → 409.
+        let (other_member, _) = signed_member_json("http.example", &nonce_hex);
+        let conflicting = json!({
+            "rpId": "http.example",
+            "metadata": "0xcc",
+            "unitNonce": nonce_hex,
+            "members": [other_member],
+        })
+        .to_string();
+        let conflict = request(&app, "POST", "/api/register", &conflicting).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        // An invalid proof never reaches Redis or the queue.
+        let mut tampered: Value = serde_json::from_str(&body).unwrap();
+        tampered["members"][0]["proof"]["typeIndex"] = json!(2);
+        let rejected = request(&app, "POST", "/api/register", &tampered.to_string()).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(queue.tasks.lock().expect("lock").len(), 1);
+
+        // Task status disclosure.
+        let status = request(&app, "GET", &format!("/api/task/{id}"), "").await;
         assert_eq!(status.status(), StatusCode::OK);
         let status = response_json(status).await;
         assert_eq!(status["status"], "pending");
-        assert!(status.get("credentialId").is_none());
-        assert!(status.get("walletRef").is_none());
+        assert_eq!(status["members"][0]["publicKey"], public_key);
+        assert!(status["members"][0].get("proof").is_none());
 
-        // Under V3 a second credential sharing the same publicKey/walletRef is
-        // the normal multi-passkey case: admitted, never a 409.
-        let sibling_body = json!({
-            "rpId": format!("other-{suffix}.invalid"),
-            "credentialId": format!("other-{suffix}"),
-            "publicKey": public_key,
-            "name": "Sibling key",
-        })
-        .to_string();
-        let sibling = request(&app, "POST", "/api/create", &sibling_body).await;
-        assert_eq!(sibling.status(), StatusCode::ACCEPTED);
-        let sibling = response_json(sibling).await;
-        let sibling_id = sibling["id"].as_str().expect("sibling id").to_owned();
-        assert_ne!(sibling_id, id);
-        assert_eq!(queue.tasks.lock().expect("test queue lock").len(), 2);
-
-        store
-            .cache_set_negative(&record_cache_key(&rp_id, &credential_id))
-            .await
-            .expect("negative record cache");
-        let record_query = request(
+        // Pre-chain visibility: the member key answers with a queue marker.
+        let pending = request(
             &app,
             "GET",
-            &format!("/api/query?rpId={rp_id}&credentialId={credential_id}"),
+            &format!("/api/query?publicKey={public_key}"),
             "",
         )
         .await;
-        assert_eq!(record_query.status(), StatusCode::OK);
-        let record_query = response_json(record_query).await;
-        assert_eq!(record_query["_queue"]["id"], id);
-        assert!(record_query.get("credentialId").is_none());
-        assert!(record_query.get("walletRef").is_none());
+        assert_eq!(pending.status(), StatusCode::OK);
+        let pending = response_json(pending).await;
+        assert_eq!(pending["total"], 0);
+        assert_eq!(pending["_queue"]["id"], id);
 
-        store
-            .cache_set_negative(&wallet_cache_key(&wallet_ref))
-            .await
-            .expect("negative wallet cache");
-        let wallet_query = request(
-            &app,
-            "GET",
-            &format!("/api/query?walletRef={wallet_ref}"),
-            "",
-        )
-        .await;
-        assert_eq!(wallet_query.status(), StatusCode::OK);
-        // The wallet pointer tracks the most recent sibling task.
-        assert_eq!(
-            response_json(wallet_query).await["_queue"]["id"],
-            sibling_id
-        );
+        // Param validation.
+        let bad = request(&app, "GET", "/api/query?publicKey=02ab", "").await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let none = request(&app, "GET", "/api/query", "").await;
+        assert_eq!(none.status(), StatusCode::BAD_REQUEST);
 
-        let invalid_wallet = request(&app, "GET", "/api/query?walletRef=abc", "").await;
-        assert_eq!(invalid_wallet.status(), StatusCode::BAD_REQUEST);
-
+        // Health names the registry and the queue depth.
         let health = request(&app, "GET", "/api/health", "").await;
         assert_eq!(health.status(), StatusCode::OK);
         let health = response_json(health).await;
-        assert_eq!(health["status"], "ok");
-        assert_eq!(health["queue"]["depth"], initial_queue_depth + 2);
+        assert_eq!(health["registry"], REGISTRY);
+        assert_eq!(health["queue"]["depth"], initial_queue_depth + 1);
     }
 }

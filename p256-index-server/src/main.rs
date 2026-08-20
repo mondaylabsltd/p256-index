@@ -39,7 +39,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    let state = AppState::new(store.clone(), queue.clone(), chain.clone(), &config);
+    let state = AppState::new(
+        store.clone(),
+        std::sync::Arc::new(queue.clone()),
+        std::sync::Arc::new(chain.clone()),
+        &config,
+    );
     let app = router(state);
     let listener = TcpListener::bind(config.listen_addr).await?;
     tracing::info!(listen_addr = %config.listen_addr, "HTTP server listening");
@@ -67,7 +72,7 @@ fn start_maintenance_if_enabled(
     chain: Chain,
     telegram: Option<Telegram>,
 ) -> Option<MaintenanceHandle> {
-    if !config.queue_worker_enabled || !chain.has_signers() {
+    if !config.queue_worker_enabled || !chain.has_signer() {
         return None;
     }
     let release = std::env::var("RELEASE")
@@ -85,7 +90,7 @@ fn start_worker_if_enabled(
         tracing::warn!("QUEUE_WORKER=0: background Iggy consumer is disabled");
         return None;
     }
-    if !chain.has_signers() {
+    if !chain.has_signer() {
         tracing::warn!(
             "PRIVATE_KEY is unset: background Iggy consumer is disabled; read APIs remain available"
         );

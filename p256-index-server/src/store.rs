@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use p256_registrar::task::{CreateTask, TaskStatus};
+use p256_registrar::task::{RegisterTask, TaskStatus};
 
 const TASK_DONE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const TASK_FAILED_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -117,21 +117,21 @@ impl RedisStore {
     /// record when Iggy has an ambiguous delivery outcome: a later identical request safely
     /// re-appends it, while the worker treats duplicate task IDs idempotently.
     ///
-    /// A wallet task writes one placeholder per member credential (KEYS[5..]);
-    /// idempotency keys off the first member's placeholder. The wallet key is
-    /// a convenience pointer for queue-fallback display, never a uniqueness gate.
-    pub async fn admit(&self, task: &CreateTask) -> Result<Admission, StoreError> {
+    /// Atomically establishes the Redis half of Iggy admission, keyed by the
+    /// unitNonce (KEYS[4]): a resubmission finds its task. Per-member
+    /// public-key placeholders (KEYS[5..]) feed the lookup queue-fallback so
+    /// a unit is visible before it lands on-chain.
+    pub async fn admit(&self, task: &RegisterTask) -> Result<Admission, StoreError> {
         let payload = serde_json::to_string(task)
-            .map_err(|_| StoreError("could not serialize create task"))?;
+            .map_err(|_| StoreError("could not serialize register task"))?;
         let script = Script::new(
             r#"
-            local existing = redis.call('GET', KEYS[5])
+            local existing = redis.call('GET', KEYS[4])
             if existing then return 'existing|' .. existing end
             redis.call('SET', KEYS[1], ARGV[2])
             redis.call('SADD', KEYS[2], ARGV[1])
             redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
-            redis.call('SET', KEYS[4], ARGV[1])
-            for i = 5, #KEYS do redis.call('SET', KEYS[i], ARGV[1]) end
+            for i = 4, #KEYS do redis.call('SET', KEYS[i], ARGV[1]) end
             return 'new|' .. ARGV[1]
         "#,
         );
@@ -140,8 +140,8 @@ impl RedisStore {
             .key(task_key(&task.id))
             .key(active_set_key())
             .key(active_age_key())
-            .key(wallet_active_key(&task.wallet_ref));
-        for key in member_record_keys(task) {
+            .key(nonce_active_key(&task.unit_nonce));
+        for key in member_key_placeholders(task) {
             invocation.key(key);
         }
         invocation.arg(&task.id).arg(payload).arg(task.created_at);
@@ -156,7 +156,7 @@ impl RedisStore {
         }
     }
 
-    pub async fn get_task(&self, id: &str) -> Result<Option<CreateTask>, StoreError> {
+    pub async fn get_task(&self, id: &str) -> Result<Option<RegisterTask>, StoreError> {
         let mut command = redis::cmd("GET");
         command.arg(task_key(id));
         let payload: Option<String> = self.query(command).await?;
@@ -168,23 +168,21 @@ impl RedisStore {
             .transpose()
     }
 
-    pub async fn find_by_record(
+    pub async fn find_by_nonce(
         &self,
-        rp_id: &str,
-        credential_id: &str,
-    ) -> Result<Option<CreateTask>, StoreError> {
-        self.find_by_index(record_active_key(rp_id, credential_id))
-            .await
+        unit_nonce: &str,
+    ) -> Result<Option<RegisterTask>, StoreError> {
+        self.find_by_index(nonce_active_key(unit_nonce)).await
     }
 
-    pub async fn find_by_wallet_ref(
+    pub async fn find_by_public_key(
         &self,
-        wallet_ref: &str,
-    ) -> Result<Option<CreateTask>, StoreError> {
-        self.find_by_index(wallet_active_key(wallet_ref)).await
+        public_key: &str,
+    ) -> Result<Option<RegisterTask>, StoreError> {
+        self.find_by_index(key_active_key(public_key)).await
     }
 
-    async fn find_by_index(&self, key: String) -> Result<Option<CreateTask>, StoreError> {
+    async fn find_by_index(&self, key: String) -> Result<Option<RegisterTask>, StoreError> {
         let mut command = redis::cmd("GET");
         command.arg(key);
         let id: Option<String> = self.query(command).await?;
@@ -194,7 +192,7 @@ impl RedisStore {
         }
     }
 
-    pub async fn mark_admitted(&self, id: &str) -> Result<Option<CreateTask>, StoreError> {
+    pub async fn mark_admitted(&self, id: &str) -> Result<Option<RegisterTask>, StoreError> {
         let Some(mut task) = self.get_task(id).await? else {
             return Ok(None);
         };
@@ -203,44 +201,18 @@ impl RedisStore {
         Ok(Some(task))
     }
 
-    pub async fn mark_committed(&self, id: &str) -> Result<Option<CreateTask>, StoreError> {
-        let Some(mut task) = self.get_task(id).await? else {
-            return Ok(None);
-        };
-        if task.status == TaskStatus::Pending {
-            task.status = TaskStatus::Committed;
-            task.error = None;
-            self.write_active_task(&task).await?;
-        }
-        Ok(Some(task))
-    }
-
-    pub async fn mark_pending(
-        &self,
-        id: &str,
-        message: Option<&str>,
-    ) -> Result<Option<CreateTask>, StoreError> {
-        let Some(mut task) = self.get_task(id).await? else {
-            return Ok(None);
-        };
-        if !task.status.is_terminal() {
-            task.status = TaskStatus::Pending;
-            task.error = message.map(redact_error);
-            self.write_active_task(&task).await?;
-        }
-        Ok(Some(task))
-    }
-
     pub async fn mark_done(
         &self,
         id: &str,
         tx_hash: Option<String>,
-    ) -> Result<Option<CreateTask>, StoreError> {
+        first_entry_id: Option<u64>,
+    ) -> Result<Option<RegisterTask>, StoreError> {
         let Some(mut task) = self.get_task(id).await? else {
             return Ok(None);
         };
         task.status = TaskStatus::Done;
         task.tx_hash = tx_hash.or(task.tx_hash);
+        task.first_entry_id = first_entry_id.or(task.first_entry_id);
         task.error = None;
         task.admitted = true;
         self.transition_done(&task).await?;
@@ -251,7 +223,7 @@ impl RedisStore {
         &self,
         id: &str,
         message: &str,
-    ) -> Result<Option<CreateTask>, StoreError> {
+    ) -> Result<Option<RegisterTask>, StoreError> {
         let Some(mut task) = self.get_task(id).await? else {
             return Ok(None);
         };
@@ -278,7 +250,7 @@ impl RedisStore {
         id: &str,
         prefix: &str,
         message: &str,
-    ) -> Result<Option<CreateTask>, StoreError> {
+    ) -> Result<Option<RegisterTask>, StoreError> {
         let Some(mut task) = self.get_task(id).await? else {
             return Ok(None);
         };
@@ -492,23 +464,24 @@ impl RedisStore {
         Ok(count)
     }
 
-    async fn write_active_task(&self, task: &CreateTask) -> Result<(), StoreError> {
+    async fn write_active_task(&self, task: &RegisterTask) -> Result<(), StoreError> {
         self.set_task(task, None).await
     }
 
-    async fn transition_done(&self, task: &CreateTask) -> Result<(), StoreError> {
+    async fn transition_done(&self, task: &RegisterTask) -> Result<(), StoreError> {
         let payload = serde_json::to_string(task)
             .map_err(|_| StoreError("could not serialize create task"))?;
-        // The wallet pointer may belong to a sibling task under the same
-        // walletRef; only expire it when it still points at this task.
-        // KEYS[5..] are the member record placeholders (one per credential).
+        // The nonce key and the member public-key placeholders (KEYS[4..])
+        // could have been claimed by another task after ours went terminal
+        // elsewhere; only expire the ones still pointing at this task.
         let script = Script::new(
             r#"
             redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
             redis.call('SREM', KEYS[2], ARGV[3])
             redis.call('ZREM', KEYS[3], ARGV[3])
-            if redis.call('GET', KEYS[4]) == ARGV[3] then redis.call('PEXPIRE', KEYS[4], ARGV[2]) end
-            for i = 5, #KEYS do redis.call('PEXPIRE', KEYS[i], ARGV[2]) end
+            for i = 4, #KEYS do
+                if redis.call('GET', KEYS[i]) == ARGV[3] then redis.call('PEXPIRE', KEYS[i], ARGV[2]) end
+            end
             return 1
         "#,
         );
@@ -517,8 +490,8 @@ impl RedisStore {
             .key(task_key(&task.id))
             .key(active_set_key())
             .key(active_age_key())
-            .key(wallet_active_key(&task.wallet_ref));
-        for key in member_record_keys(task) {
+            .key(nonce_active_key(&task.unit_nonce));
+        for key in member_key_placeholders(task) {
             invocation.key(key);
         }
         invocation
@@ -529,7 +502,7 @@ impl RedisStore {
         Ok(())
     }
 
-    async fn transition_failed(&self, task: &CreateTask) -> Result<(), StoreError> {
+    async fn transition_failed(&self, task: &RegisterTask) -> Result<(), StoreError> {
         let payload = serde_json::to_string(task)
             .map_err(|_| StoreError("could not serialize create task"))?;
         let script = Script::new(
@@ -551,8 +524,8 @@ impl RedisStore {
             .key(active_set_key())
             .key(active_age_key())
             .key(dlq_set_key())
-            .key(wallet_active_key(&task.wallet_ref));
-        for key in member_record_keys(task) {
+            .key(nonce_active_key(&task.unit_nonce));
+        for key in member_key_placeholders(task) {
             invocation.key(key);
         }
         invocation
@@ -563,7 +536,7 @@ impl RedisStore {
         Ok(())
     }
 
-    async fn set_task(&self, task: &CreateTask, ttl: Option<Duration>) -> Result<(), StoreError> {
+    async fn set_task(&self, task: &RegisterTask, ttl: Option<Duration>) -> Result<(), StoreError> {
         let payload = serde_json::to_string(task)
             .map_err(|_| StoreError("could not serialize create task"))?;
         let mut command = redis::cmd("SET");
@@ -622,30 +595,19 @@ fn escaped_hash(input: &str) -> String {
 fn task_key(id: &str) -> String {
     format!("p256-index:task:{id}")
 }
-fn record_active_key(rp_id: &str, credential_id: &str) -> String {
-    format!(
-        "p256-index:active:record:{}",
-        escaped_hash(&format!("{rp_id}\0{credential_id}"))
-    )
-}
-/// One in-flight placeholder key per credential the task will register: the
-/// members for a wallet task, the single flat credential otherwise.
-fn member_record_keys(task: &CreateTask) -> Vec<String> {
-    if task.is_wallet() {
-        task.members
-            .iter()
-            .map(|member| record_active_key(&task.rp_id, &member.credential_id))
-            .collect()
-    } else {
-        vec![record_active_key(&task.rp_id, &task.credential_id)]
-    }
+fn nonce_active_key(unit_nonce: &str) -> String {
+    format!("p256-index:task-nonce:{}", unit_nonce.to_ascii_lowercase())
 }
 
-fn wallet_active_key(wallet_ref: &str) -> String {
-    format!(
-        "p256-index:active:wallet:{}",
-        wallet_ref.to_ascii_lowercase()
-    )
+fn key_active_key(public_key: &str) -> String {
+    format!("p256-index:task-key:{}", public_key.to_ascii_lowercase())
+}
+
+fn member_key_placeholders(task: &RegisterTask) -> Vec<String> {
+    task.members
+        .iter()
+        .map(|member| key_active_key(&member.public_key))
+        .collect()
 }
 fn active_set_key() -> &'static str {
     "p256-index:active-tasks"

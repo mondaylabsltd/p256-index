@@ -1,146 +1,108 @@
-//! Registration admission: the decision half of the create endpoint.
+//! Registration admission: the decision half of the register endpoint.
 //!
-//! One [`AdmissionApp`] instance drives one create request from a parsed
-//! [`CreateRequest`] to an [`AdmissionOutcome`]. Every rule the server's
-//! `http.rs` used to interleave across ~12 awaits lives here as a pure
-//! program over serializable [`AdmissionOperation`]s:
+//! One [`AdmissionApp`] instance drives one request from a parsed
+//! [`RegisterRequest`] to an [`AdmissionOutcome`]:
 //!
-//! - validation with defaults (initialCredentialId ← credentialId, metadata ←
-//!   derived) and walletRef derivation/consistency: metadata must follow the
-//!   packed V3 convention and contain this credential's publicKey; a
-//!   single-key wallet's ref is derived, a multi-key wallet's ref is taken
-//!   as supplied (the pubkey-set derivation is verified off-chain);
-//! - idempotent "already done" pre-checks: fresh record cache, then the
-//!   chain, with chain prechecks deliberately fail-open (legacy behaviour);
-//! - "a non-Failed in-flight task is a valid placeholder" — the rule finally
-//!   has a named home, [`is_active_placeholder`];
-//! - the only remaining walletRef conflict is cross-version: a ref already
-//!   living in the frozen V2 index can never be re-bound in V3 (multiple V3
-//!   credentials sharing one walletRef is the normal multi-passkey case);
-//! - write gates: active queue depth and the global create rate;
-//! - the two-phase admission protocol: Redis admit (atomic three-way) →
-//!   Iggy enqueue → mark admitted. A failed enqueue keeps the Redis
-//!   placeholder so a retry reuses the task id — note that the operation
-//!   vocabulary below contains no "delete admission" at all, so the
-//!   "never roll back phase one" invariant is unrepresentable, not merely
-//!   commented.
+//! - validation is TOTAL: shapes, bounds, and every member's possession
+//!   proof are verified (pure P-256, mirroring the contract) before anything
+//!   touches Redis — an invalid proof can never reach the chain or burn gas;
+//! - the unitNonce is the idempotency key: a resubmission of the same unit
+//!   returns its existing task, a different unit reusing an in-flight nonce
+//!   is a 409;
+//! - chain pre-checks are fail-open: content already registered answers
+//!   "done" retroactively, a consumed nonce (with our content absent) is a
+//!   terminal 409 — the proofs died with it, the client must re-enroll;
+//! - write gates: active queue depth and the global create budget;
+//! - the two-phase admission protocol: Redis admit → Iggy enqueue → mark
+//!   admitted. A failed enqueue keeps the placeholder so a retry reuses the
+//!   task id; the operation vocabulary has no "delete admission" at all.
 //!
 //! The shell owns transport (body limits, JSON, IP extraction — the raw IP
-//! never crosses into this module; the shell answers rate-limit questions
-//! against its salted hash), key naming, and executes each operation against
-//! Redis / the chain / Iggy. Task identity and time enter through the Submit
-//! event so the program stays deterministic.
+//! never crosses into this module), key naming, and executes each operation
+//! against Redis / the chain / Iggy. Task identity, wall-clock time, chain id
+//! and registry address enter through the Submit event so the program stays
+//! deterministic.
 
+use alloy::primitives::Address;
 use crux_core::{App, Command, command::CommandContext, macros::effect};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::protocol::{parse_b256, parse_hex_bytes};
-use crate::task::{CreateTask, TaskStatus, WalletMember};
-use crate::wallet::{build_wallet_ref, default_metadata, packed_metadata, parse_metadata_keys};
+use crate::protocol::{challenge_for, content_hash_for, parse_b256, parse_hex_bytes};
+use crate::task::{Member, Proof, RegisterTask, TaskStatus};
+use crate::verify::verify_proof;
 
-/// New creates are rejected while the active queue is at least this deep.
+/// New registrations are rejected while the active queue is at least this deep.
 pub const MAX_ACTIVE_QUEUE_DEPTH: u64 = 10_000;
 
-/// Gas ceiling for the atomic createWallet reveal: 7 members measure ~4.8M
-/// gas (metadata duplication makes the curve quadratic — 8 already costs
-/// ~5.9M, 13 exceeds the server's 12M signing cap). The contract itself
-/// allows up to 21, which physically cannot fit a Gnosis block (~27.5M).
-pub const MAX_WALLET_MEMBERS: usize = 7;
+/// Mirrors the contract's MAX_MEMBERS.
+pub const MAX_MEMBERS: usize = 7;
+/// Mirrors the contract's MAX_METADATA_LENGTH (bytes).
+pub const MAX_METADATA_BYTES: usize = 1024;
+/// Mirrors the contract's ATTESTATION_LENGTH / ATTESTATION_VERSION.
+pub const ATTESTATION_BYTES: usize = 20;
+pub const ATTESTATION_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateRequest {
-    pub rp_id: Option<String>,
-    pub credential_id: Option<String>,
-    pub wallet_ref: Option<String>,
+pub struct ProofRequest {
+    pub authenticator_data: Option<String>,
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: Option<String>,
+    pub challenge_index: Option<u64>,
+    pub type_index: Option<u64>,
+    pub r: Option<String>,
+    pub s: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberRequest {
     pub public_key: Option<String>,
-    pub name: Option<String>,
-    pub initial_credential_id: Option<String>,
+    pub attestation: Option<String>,
+    pub proof: Option<ProofRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterRequest {
+    pub rp_id: Option<String>,
     pub metadata: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WalletMemberRequest {
-    pub credential_id: Option<String>,
-    pub public_key: Option<String>,
-    pub name: Option<String>,
-}
-
-/// A multi-key wallet registration: N credentials land atomically through the
-/// contract's createWallet, under one commitment.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateWalletRequest {
-    pub rp_id: Option<String>,
-    pub wallet_ref: Option<String>,
-    pub members: Option<Vec<WalletMemberRequest>>,
-}
-
-/// "A non-Failed in-flight task is a valid placeholder." This rule used to be
-/// copy-pasted five times across `http.rs`; admission uses it twice and the
-/// lookup domain will adopt it for its queue-fallback checks.
-pub fn is_active_placeholder(task: &CreateTask) -> bool {
-    task.status != TaskStatus::Failed
+    pub unit_nonce: Option<String>,
+    pub members: Option<Vec<MemberRequest>>,
 }
 
 // ── Shell protocol ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum CacheScope {
-    Record {
-        rp_id: String,
-        credential_id: String,
-    },
-    Wallet {
-        wallet_ref: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdmissionOperation {
-    /// May this client create right now? The shell resolves this against its
-    /// salted per-IP counter; the raw IP never enters the Core.
+    /// May this client register right now? The shell resolves this against
+    /// its salted per-IP counter; the raw IP never enters the Core.
     AllowIpCreate,
-    ReadCache {
-        scope: CacheScope,
+    /// The in-flight/terminal task holding this unitNonce, if any.
+    FindTaskByNonce {
+        unit_nonce: String,
     },
-    FetchChainRecord {
-        rp_id: String,
-        credential_id: String,
+    /// isContentRegistered(contentHash) on the registry (fail-open).
+    CheckContentRegistered {
+        content_hash: String,
     },
-    /// Probe the FROZEN V2 index directly. A hit under a different
-    /// (rpId, credentialId) is the cross-version wallet conflict — the only
-    /// walletRef conflict that still exists under V3's one-to-many model.
-    FetchV2RecordByWalletRef {
-        wallet_ref: String,
-    },
-    /// Cache a record value. `best_effort` writes may fail silently (the
-    /// original `let _ =` backfill); others surface a dependency error.
-    StoreCache {
-        scope: CacheScope,
-        value: Value,
-        best_effort: bool,
-    },
-    FindTaskByRecord {
-        rp_id: String,
-        credential_id: String,
+    /// isNonceUsed(unitNonce) on the registry (fail-open).
+    CheckNonceUsed {
+        unit_nonce: String,
     },
     QueueDepth,
     AllowGlobalCreate,
-    /// Phase one: the store's atomic three-way admission.
+    /// Phase one: the store's atomic admission keyed by the unitNonce.
     Admit {
-        task: CreateTask,
+        task: RegisterTask,
     },
     LoadTask {
         id: String,
     },
     /// Phase two: append to the durable queue.
     Enqueue {
-        task: CreateTask,
+        task: RegisterTask,
     },
     MarkAdmitted {
         id: String,
@@ -158,31 +120,14 @@ pub enum AdmitOutcome {
     Existing { id: String },
 }
 
-// One result value exists per request at a time and lives microseconds;
-// boxing the task-bearing variants would complicate the protocol for nothing.
-#[expect(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdmissionResult {
-    Allowed {
-        allowed: bool,
-    },
-    CacheHit {
-        value: Value,
-    },
-    /// Negative, stale and missing cache entries are all "no usable hit" for
-    /// admission purposes, exactly like the original `Ok(_) => {}` arm.
-    CacheMiss,
-    ChainRecord {
-        value: Option<Value>,
-    },
+    Allowed { allowed: bool },
+    TaskFound { task: Option<RegisterTask> },
+    ChainBool { value: bool },
     ChainReadFailed,
-    TaskFound {
-        task: Option<CreateTask>,
-    },
-    Depth {
-        depth: u64,
-    },
+    Depth { depth: u64 },
     Admitted(AdmitOutcome),
     Enqueued,
     QueueUnavailable,
@@ -197,8 +142,7 @@ pub enum AdmissionEffect {
 
 // ── App ────────────────────────────────────────────────────────────────────
 
-/// The admission verdict. The shell renders these into the exact HTTP
-/// responses the endpoint has always produced.
+/// The admission verdict. The shell renders these into HTTP responses.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdmissionOutcome {
@@ -206,12 +150,12 @@ pub enum AdmissionOutcome {
     Invalid { message: String },
     /// 429, fixed message.
     RateLimited,
-    /// 201: the record already exists; `record` is the serialized record.
-    AlreadyDone { record: Value },
-    /// 202 with the task's id and current status.
+    /// 202 (or 200 for a terminal Done task) with the task's id and status.
     Queued { id: String, status: TaskStatus },
-    /// 409 with the wallet ref and the originating site's exact message.
-    WalletConflict { wallet_ref: String, message: String },
+    /// 200: identical content is already on-chain.
+    AlreadyRegistered { content_hash: String },
+    /// 409: the unitNonce cannot be used.
+    NonceConflict { message: String },
     /// 503 busy (depth or global rate gate).
     Busy,
     /// 503 retryable, naming the failed dependency ("redis" / "queue").
@@ -221,18 +165,14 @@ pub enum AdmissionOutcome {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdmissionEvent {
-    /// The shell supplies task identity and wall-clock time so the program
-    /// stays deterministic.
+    /// The shell supplies task identity, wall-clock time and the chain
+    /// context so the program stays deterministic.
     Submit {
-        request: CreateRequest,
+        request: RegisterRequest,
         new_task_id: String,
         now_ms: u64,
-    },
-    /// The multi-key wallet flavor of Submit (POST /api/create-wallet).
-    SubmitWallet {
-        request: CreateWalletRequest,
-        new_task_id: String,
-        now_ms: u64,
+        chain_id: u64,
+        registry: String,
     },
     Settled(AdmissionOutcome),
 }
@@ -266,21 +206,15 @@ impl App for AdmissionApp {
                 request,
                 new_task_id,
                 now_ms,
+                chain_id,
+                registry,
             } => Command::new(|ctx| async move {
-                let outcome = match drive_admission(&ctx, request, new_task_id, now_ms).await {
-                    Ok(outcome) | Err(outcome) => outcome,
-                };
-                ctx.send_event(AdmissionEvent::Settled(outcome));
-            }),
-            AdmissionEvent::SubmitWallet {
-                request,
-                new_task_id,
-                now_ms,
-            } => Command::new(|ctx| async move {
-                let outcome = match drive_wallet_admission(&ctx, request, new_task_id, now_ms).await
-                {
-                    Ok(outcome) | Err(outcome) => outcome,
-                };
+                let outcome =
+                    match drive_admission(&ctx, request, new_task_id, now_ms, chain_id, &registry)
+                        .await
+                    {
+                        Ok(outcome) | Err(outcome) => outcome,
+                    };
                 ctx.send_event(AdmissionEvent::Settled(outcome));
             }),
             AdmissionEvent::Settled(outcome) => {
@@ -298,9 +232,6 @@ impl App for AdmissionApp {
 }
 
 // ── The admission program ──────────────────────────────────────────────────
-//
-// `Flow` short-circuits to a terminal outcome exactly where the original
-// handler returned a response. The step order matches `http.rs` line by line.
 
 type Ctx = CommandContext<AdmissionEffect, AdmissionEvent>;
 type Flow<T> = Result<T, AdmissionOutcome>;
@@ -311,8 +242,9 @@ fn redis_down() -> AdmissionOutcome {
     }
 }
 
-const CONFLICT_LEGACY_V2: &str =
-    "this walletRef is already registered in the legacy V2 index under a different credential";
+pub const CONFLICT_NONCE_IN_FLIGHT: &str =
+    "this unitNonce is already carrying a different unit; every unit needs a fresh nonce";
+pub const CONFLICT_NONCE_CONSUMED: &str = "this unitNonce was already consumed on-chain; the proofs are void — re-enroll with a fresh nonce";
 
 async fn request(ctx: &Ctx, operation: AdmissionOperation) -> AdmissionResult {
     ctx.request_from_shell(operation).await
@@ -320,14 +252,17 @@ async fn request(ctx: &Ctx, operation: AdmissionOperation) -> AdmissionResult {
 
 async fn drive_admission(
     ctx: &Ctx,
-    create: CreateRequest,
+    register: RegisterRequest,
     new_task_id: String,
     now_ms: u64,
+    chain_id: u64,
+    registry: &str,
 ) -> Flow<AdmissionOutcome> {
-    let input = match validate_create(create) {
-        Ok(input) => input,
-        Err(message) => return Ok(AdmissionOutcome::Invalid { message }),
-    };
+    let (task, content_hash) =
+        match validate_register(register, new_task_id, now_ms, chain_id, registry) {
+            Ok(valid) => valid,
+            Err(message) => return Ok(AdmissionOutcome::Invalid { message }),
+        };
 
     match request(ctx, AdmissionOperation::AllowIpCreate).await {
         AdmissionResult::Allowed { allowed: true } => {}
@@ -335,127 +270,66 @@ async fn drive_admission(
         _ => return Err(redis_down()),
     }
 
-    // Idempotent pre-checks: a fresh cached record or an existing on-chain
-    // record answers "done" without queueing anything.
+    // Idempotency by unitNonce: the same unit resubmitted returns its task,
+    // a different unit on an in-flight nonce is a conflict.
     match request(
         ctx,
-        AdmissionOperation::ReadCache {
-            scope: CacheScope::Record {
-                rp_id: input.rp_id.clone(),
-                credential_id: input.credential_id.clone(),
-            },
+        AdmissionOperation::FindTaskByNonce {
+            unit_nonce: task.unit_nonce.clone(),
         },
     )
     .await
     {
-        AdmissionResult::CacheHit { value } => {
-            return Ok(AdmissionOutcome::AlreadyDone { record: value });
+        AdmissionResult::TaskFound {
+            task: Some(existing),
+        } => {
+            let same_unit = crate::protocol::content_hash_for(&existing)
+                .map(|hash| format!("{hash:#x}") == content_hash)
+                .unwrap_or(false);
+            if same_unit {
+                return Ok(AdmissionOutcome::Queued {
+                    id: existing.id,
+                    status: existing.status,
+                });
+            }
+            return Ok(AdmissionOutcome::NonceConflict {
+                message: CONFLICT_NONCE_IN_FLIGHT.to_owned(),
+            });
         }
-        AdmissionResult::CacheMiss => {}
-        _ => return Err(redis_down()),
-    }
-    match request(
-        ctx,
-        AdmissionOperation::FetchChainRecord {
-            rp_id: input.rp_id.clone(),
-            credential_id: input.credential_id.clone(),
-        },
-    )
-    .await
-    {
-        AdmissionResult::ChainRecord { value: Some(value) } => {
-            must_cache(
-                ctx,
-                CacheScope::Record {
-                    rp_id: input.rp_id.clone(),
-                    credential_id: input.credential_id.clone(),
-                },
-                value.clone(),
-            )
-            .await?;
-            return Ok(AdmissionOutcome::AlreadyDone { record: value });
-        }
-        AdmissionResult::ChainRecord { value: None } => {}
-        // Existing Deno behavior is fail-open for chain prechecks.
-        AdmissionResult::ChainReadFailed => {}
+        AdmissionResult::TaskFound { task: None } => {}
         _ => return Err(redis_down()),
     }
 
-    // In-flight placeholder for the same credential. Sibling credentials
-    // sharing a walletRef are the normal multi-passkey case in V3 — there is
-    // no in-flight walletRef conflict anymore.
+    // Chain pre-checks, fail-open: an RPC outage never blocks admission —
+    // the worker reconciles against the chain anyway.
     match request(
         ctx,
-        AdmissionOperation::FindTaskByRecord {
-            rp_id: input.rp_id.clone(),
-            credential_id: input.credential_id.clone(),
+        AdmissionOperation::CheckContentRegistered {
+            content_hash: content_hash.clone(),
         },
     )
     .await
     {
-        AdmissionResult::TaskFound { task: Some(task) } if is_active_placeholder(&task) => {
-            return Ok(AdmissionOutcome::Queued {
-                id: task.id,
-                status: task.status,
-            });
+        AdmissionResult::ChainBool { value: true } => {
+            return Ok(AdmissionOutcome::AlreadyRegistered { content_hash });
         }
-        AdmissionResult::TaskFound { .. } => {}
+        AdmissionResult::ChainBool { value: false } | AdmissionResult::ChainReadFailed => {}
         _ => return Err(redis_down()),
     }
-    // Wallet-keyed cache: only a hit for this exact credential short-circuits;
-    // a sibling credential's record is not a conflict.
     match request(
         ctx,
-        AdmissionOperation::ReadCache {
-            scope: CacheScope::Wallet {
-                wallet_ref: input.wallet_ref.clone(),
-            },
+        AdmissionOperation::CheckNonceUsed {
+            unit_nonce: task.unit_nonce.clone(),
         },
     )
     .await
     {
-        AdmissionResult::CacheHit { value } => {
-            if same_record(&value, &input.rp_id, &input.credential_id) {
-                return Ok(AdmissionOutcome::AlreadyDone { record: value });
-            }
-        }
-        AdmissionResult::CacheMiss => {}
-        _ => return Err(redis_down()),
-    }
-    // Cross-version conflict: a walletRef living in the frozen V2 index can
-    // never be re-bound in V3 (the contract would revert WalletRefAlreadyExists).
-    match request(
-        ctx,
-        AdmissionOperation::FetchV2RecordByWalletRef {
-            wallet_ref: input.wallet_ref.clone(),
-        },
-    )
-    .await
-    {
-        AdmissionResult::ChainRecord { value: Some(value) } => {
-            if same_record(&value, &input.rp_id, &input.credential_id) {
-                // Best-effort backfill of the record-keyed cache entry.
-                let _ = request(
-                    ctx,
-                    AdmissionOperation::StoreCache {
-                        scope: CacheScope::Record {
-                            rp_id: input.rp_id.clone(),
-                            credential_id: input.credential_id.clone(),
-                        },
-                        value: value.clone(),
-                        best_effort: true,
-                    },
-                )
-                .await;
-                return Ok(AdmissionOutcome::AlreadyDone { record: value });
-            }
-            return Ok(AdmissionOutcome::WalletConflict {
-                wallet_ref: input.wallet_ref,
-                message: CONFLICT_LEGACY_V2.to_owned(),
+        AdmissionResult::ChainBool { value: true } => {
+            return Ok(AdmissionOutcome::NonceConflict {
+                message: CONFLICT_NONCE_CONSUMED.to_owned(),
             });
         }
-        AdmissionResult::ChainRecord { value: None } => {}
-        AdmissionResult::ChainReadFailed => {}
+        AdmissionResult::ChainBool { value: false } | AdmissionResult::ChainReadFailed => {}
         _ => return Err(redis_down()),
     }
 
@@ -474,23 +348,6 @@ async fn drive_admission(
     }
 
     // Two-phase admission.
-    let task = CreateTask {
-        id: new_task_id,
-        status: TaskStatus::Pending,
-        rp_id: input.rp_id,
-        credential_id: input.credential_id,
-        wallet_ref: input.wallet_ref,
-        public_key: input.public_key,
-        name: input.name,
-        initial_credential_id: input.initial_credential_id,
-        metadata: input.metadata,
-        members: Vec::new(),
-        tx_hash: None,
-        error: None,
-        retries: 0,
-        created_at: now_ms as i64,
-        admitted: false,
-    };
     match request(ctx, AdmissionOperation::Admit { task: task.clone() }).await {
         AdmissionResult::Admitted(AdmitOutcome::Existing { id }) => {
             match request(ctx, AdmissionOperation::LoadTask { id }).await {
@@ -508,180 +365,13 @@ async fn drive_admission(
         }
         AdmissionResult::Admitted(AdmitOutcome::New) => enqueue(ctx, task).await,
         _ => Err(redis_down()),
-    }
-}
-
-const CONFLICT_MEMBER_TAKEN: &str =
-    "a member credentialId is already registered under a different wallet";
-
-/// The multi-key wallet flavor of [`drive_admission`]: same operation
-/// vocabulary, per-member pre-checks, one task carrying the whole bundle.
-async fn drive_wallet_admission(
-    ctx: &Ctx,
-    create: CreateWalletRequest,
-    new_task_id: String,
-    now_ms: u64,
-) -> Flow<AdmissionOutcome> {
-    let input = match validate_create_wallet(create) {
-        Ok(input) => input,
-        Err(message) => return Ok(AdmissionOutcome::Invalid { message }),
-    };
-
-    match request(ctx, AdmissionOperation::AllowIpCreate).await {
-        AdmissionResult::Allowed { allowed: true } => {}
-        AdmissionResult::Allowed { allowed: false } => return Ok(AdmissionOutcome::RateLimited),
-        _ => return Err(redis_down()),
-    }
-
-    // Idempotent pre-checks, per member: a registered member under OUR
-    // walletRef means the wallet already exists (createWallet is atomic);
-    // under a different walletRef it is a terminal conflict. An active
-    // in-flight placeholder answers Queued (idempotent resubmit).
-    for member in &input.members {
-        match request(
-            ctx,
-            AdmissionOperation::ReadCache {
-                scope: CacheScope::Record {
-                    rp_id: input.rp_id.clone(),
-                    credential_id: member.credential_id.clone(),
-                },
-            },
-        )
-        .await
-        {
-            AdmissionResult::CacheHit { value } => return Ok(wallet_member_verdict(&input, value)),
-            AdmissionResult::CacheMiss => {}
-            _ => return Err(redis_down()),
-        }
-        match request(
-            ctx,
-            AdmissionOperation::FetchChainRecord {
-                rp_id: input.rp_id.clone(),
-                credential_id: member.credential_id.clone(),
-            },
-        )
-        .await
-        {
-            AdmissionResult::ChainRecord { value: Some(value) } => {
-                return Ok(wallet_member_verdict(&input, value));
-            }
-            AdmissionResult::ChainRecord { value: None } => {}
-            AdmissionResult::ChainReadFailed => {}
-            _ => return Err(redis_down()),
-        }
-        match request(
-            ctx,
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: input.rp_id.clone(),
-                credential_id: member.credential_id.clone(),
-            },
-        )
-        .await
-        {
-            AdmissionResult::TaskFound { task: Some(task) } if is_active_placeholder(&task) => {
-                return Ok(AdmissionOutcome::Queued {
-                    id: task.id,
-                    status: task.status,
-                });
-            }
-            AdmissionResult::TaskFound { .. } => {}
-            _ => return Err(redis_down()),
-        }
-    }
-
-    // Cross-version conflict: a walletRef living in the frozen V2 index can
-    // never be claimed by V3's createWallet.
-    match request(
-        ctx,
-        AdmissionOperation::FetchV2RecordByWalletRef {
-            wallet_ref: input.wallet_ref.clone(),
-        },
-    )
-    .await
-    {
-        AdmissionResult::ChainRecord { value: Some(_) } => {
-            return Ok(AdmissionOutcome::WalletConflict {
-                wallet_ref: input.wallet_ref,
-                message: CONFLICT_LEGACY_V2.to_owned(),
-            });
-        }
-        AdmissionResult::ChainRecord { value: None } => {}
-        AdmissionResult::ChainReadFailed => {}
-        _ => return Err(redis_down()),
-    }
-
-    // Write gates.
-    match request(ctx, AdmissionOperation::QueueDepth).await {
-        AdmissionResult::Depth { depth } if depth >= MAX_ACTIVE_QUEUE_DEPTH => {
-            return Ok(AdmissionOutcome::Busy);
-        }
-        AdmissionResult::Depth { .. } => {}
-        _ => return Err(redis_down()),
-    }
-    match request(ctx, AdmissionOperation::AllowGlobalCreate).await {
-        AdmissionResult::Allowed { allowed: true } => {}
-        AdmissionResult::Allowed { allowed: false } => return Ok(AdmissionOutcome::Busy),
-        _ => return Err(redis_down()),
-    }
-
-    // Two-phase admission: the flat fields mirror members[0] so single-record
-    // paths (placeholders, reconciliation, disclosure) keep working.
-    let first = input.members[0].clone();
-    let task = CreateTask {
-        id: new_task_id,
-        status: TaskStatus::Pending,
-        rp_id: input.rp_id,
-        credential_id: first.credential_id.clone(),
-        wallet_ref: input.wallet_ref,
-        public_key: first.public_key,
-        name: first.name,
-        initial_credential_id: first.credential_id,
-        metadata: input.metadata,
-        members: input.members,
-        tx_hash: None,
-        error: None,
-        retries: 0,
-        created_at: now_ms as i64,
-        admitted: false,
-    };
-    match request(ctx, AdmissionOperation::Admit { task: task.clone() }).await {
-        AdmissionResult::Admitted(AdmitOutcome::Existing { id }) => {
-            match request(ctx, AdmissionOperation::LoadTask { id }).await {
-                AdmissionResult::TaskFound {
-                    task: Some(existing),
-                } if existing.admitted => Ok(AdmissionOutcome::Queued {
-                    id: existing.id,
-                    status: existing.status,
-                }),
-                AdmissionResult::TaskFound {
-                    task: Some(existing),
-                } => enqueue(ctx, existing).await,
-                _ => Err(redis_down()),
-            }
-        }
-        AdmissionResult::Admitted(AdmitOutcome::New) => enqueue(ctx, task).await,
-        _ => Err(redis_down()),
-    }
-}
-
-/// The verdict for a wallet request when one of its members already has a
-/// record: same walletRef means the wallet exists (createWallet is atomic),
-/// anything else is a terminal conflict.
-fn wallet_member_verdict(input: &ValidWallet, value: Value) -> AdmissionOutcome {
-    if value.get("walletRef").and_then(Value::as_str) == Some(input.wallet_ref.as_str()) {
-        AdmissionOutcome::AlreadyDone { record: value }
-    } else {
-        AdmissionOutcome::WalletConflict {
-            wallet_ref: input.wallet_ref.clone(),
-            message: CONFLICT_MEMBER_TAKEN.to_owned(),
-        }
     }
 }
 
 /// Phase two of admission. On queue failure the Redis admission is kept — a
 /// retry of the same request reuses the task id and the consumer is
 /// idempotent. There is deliberately no operation that could delete it.
-async fn enqueue(ctx: &Ctx, task: CreateTask) -> Flow<AdmissionOutcome> {
+async fn enqueue(ctx: &Ctx, task: RegisterTask) -> Flow<AdmissionOutcome> {
     let id = task.id.clone();
     match request(ctx, AdmissionOperation::Enqueue { task }).await {
         AdmissionResult::Enqueued => {
@@ -700,259 +390,314 @@ async fn enqueue(ctx: &Ctx, task: CreateTask) -> Flow<AdmissionOutcome> {
     }
 }
 
-/// A cache write that must succeed; failure is a Redis dependency error, as
-/// in the original handler.
-async fn must_cache(ctx: &Ctx, scope: CacheScope, value: Value) -> Flow<()> {
-    match request(
-        ctx,
-        AdmissionOperation::StoreCache {
-            scope,
-            value,
-            best_effort: false,
-        },
-    )
-    .await
-    {
-        AdmissionResult::Persisted => Ok(()),
-        _ => Err(redis_down()),
-    }
-}
-
-fn same_record(value: &Value, rp_id: &str, credential_id: &str) -> bool {
-    value.get("rpId").and_then(Value::as_str) == Some(rp_id)
-        && value.get("credentialId").and_then(Value::as_str) == Some(credential_id)
-}
-
 // ── Validation ─────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
-pub struct ValidCreate {
-    pub rp_id: String,
-    pub credential_id: String,
-    pub wallet_ref: String,
-    pub public_key: String,
-    pub name: String,
-    pub initial_credential_id: String,
-    pub metadata: String,
-}
+/// Total validation: shapes, bounds and every member's possession proof.
+/// Returns the canonical task plus the unit's content hash (0x-hex).
+pub fn validate_register(
+    request: RegisterRequest,
+    new_task_id: String,
+    now_ms: u64,
+    chain_id: u64,
+    registry: &str,
+) -> Result<(RegisterTask, String), String> {
+    let registry: Address = registry
+        .parse()
+        .map_err(|_| "service misconfigured: invalid registry address".to_owned())?;
 
-pub fn validate_create(request: CreateRequest) -> Result<ValidCreate, String> {
-    let (Some(rp_id), Some(credential_id), Some(public_key), Some(name)) = (
-        request.rp_id,
-        request.credential_id,
-        request.public_key,
-        request.name,
-    ) else {
-        return Err("rpId, credentialId, publicKey, and name are required".into());
+    let Some(rp_id) = request.rp_id.filter(|value| !value.is_empty()) else {
+        return Err("rpId is required".into());
     };
-    if rp_id.is_empty() || credential_id.is_empty() || public_key.is_empty() || name.is_empty() {
-        return Err("rpId, credentialId, publicKey, and name are required".into());
+    if rp_id.len() > 253 {
+        return Err("rpId exceeds max length (253)".into());
     }
-    validate_strings(&[
-        ("rpId", &rp_id, 253),
-        ("credentialId", &credential_id, 1024),
-        ("publicKey", &public_key, 130),
-        ("name", &name, 256),
-    ])?;
-    validate_public_key(&public_key)?;
-    if let Some(wallet_ref) = request.wallet_ref.as_deref() {
-        validate_wallet_ref(wallet_ref)?;
-    }
-    if let Some(initial) = request.initial_credential_id.as_deref() {
-        validate_strings(&[("initialCredentialId", initial, 1024)])?;
-    }
-    if let Some(metadata) = request.metadata.as_deref() {
-        validate_metadata(metadata)?;
-    }
-    let metadata = match request.metadata {
-        Some(metadata) => metadata,
-        None => default_metadata(&public_key).map_err(|error| error.to_string())?,
-    };
-    // createRecord is the SINGLE-key path: metadata must be exactly the prefix
-    // word plus this credential's own key — the V3 contract enforces the same
-    // rule on-chain. Multi-key wallets register atomically via createWallet.
-    let metadata_keys = parse_metadata_keys(&metadata).map_err(|error| error.to_string())?;
-    let own_key = parse_hex_bytes(&public_key).map_err(|error| error.to_string())?;
-    if metadata_keys.len() != 1 || metadata_keys[0] != own_key {
-        return Err(
-            "metadata must carry exactly this credential's publicKey; multi-key wallets register via createWallet"
-                .into(),
-        );
-    }
-    let wallet_ref = build_wallet_ref(&public_key).map_err(|error| error.to_string())?;
-    if let Some(supplied) = request.wallet_ref
-        && supplied.to_ascii_lowercase() != wallet_ref
-    {
-        return Err("walletRef does not match publicKey".into());
-    }
-    let initial_credential_id = request
-        .initial_credential_id
-        .unwrap_or_else(|| credential_id.clone());
-    Ok(ValidCreate {
-        rp_id,
-        credential_id,
-        wallet_ref,
-        public_key,
-        name,
-        initial_credential_id,
-        metadata,
-    })
-}
 
-#[derive(Debug)]
-pub struct ValidWallet {
-    pub rp_id: String,
-    pub wallet_ref: String,
-    pub members: Vec<WalletMember>,
-    pub metadata: String,
-}
-
-pub fn validate_create_wallet(request: CreateWalletRequest) -> Result<ValidWallet, String> {
-    let (Some(rp_id), Some(wallet_ref), Some(members)) =
-        (request.rp_id, request.wallet_ref, request.members)
-    else {
-        return Err("rpId, walletRef, and members are required".into());
+    let Some(unit_nonce) = request.unit_nonce.as_deref() else {
+        return Err("unitNonce is required (32-byte hex)".into());
     };
-    if rp_id.is_empty() {
-        return Err("rpId, walletRef, and members are required".into());
-    }
-    validate_strings(&[("rpId", &rp_id, 253)])?;
-    if members.is_empty() || members.len() > MAX_WALLET_MEMBERS {
+    let nonce = parse_b256(unit_nonce).map_err(|_| "unitNonce must be 32-byte hex".to_owned())?;
+    let unit_nonce = format!("{nonce:#x}");
+
+    let metadata = request.metadata.unwrap_or_default();
+    let metadata_bytes =
+        parse_hex_bytes(&metadata).map_err(|_| "metadata must be a valid hex string".to_owned())?;
+    if metadata_bytes.len() > MAX_METADATA_BYTES {
         return Err(format!(
-            "members must contain 1 to {MAX_WALLET_MEMBERS} entries"
+            "metadata exceeds max length ({MAX_METADATA_BYTES} bytes)"
         ));
     }
-    validate_wallet_ref(&wallet_ref)?;
-    let raw_ref = wallet_ref.strip_prefix("0x").unwrap_or(&wallet_ref);
-    if raw_ref.bytes().all(|byte| byte == b'0') {
-        return Err("walletRef must not be zero".into());
+    let metadata = if metadata_bytes.is_empty() {
+        String::new()
+    } else {
+        format!("0x{}", hex::encode(&metadata_bytes))
+    };
+
+    let Some(members) = request.members.filter(|members| !members.is_empty()) else {
+        return Err("members is required (1 to 7 entries)".into());
+    };
+    if members.len() > MAX_MEMBERS {
+        return Err(format!("members must contain 1 to {MAX_MEMBERS} entries"));
     }
-    // Normalized to 0x + lowercase so Redis keys and caches never fragment.
-    let wallet_ref = format!("0x{}", raw_ref.to_ascii_lowercase());
 
     let mut parsed = Vec::with_capacity(members.len());
-    let mut seen = std::collections::HashSet::new();
-    for member in members {
-        let (Some(credential_id), Some(public_key), Some(name)) =
-            (member.credential_id, member.public_key, member.name)
-        else {
-            return Err("every member needs credentialId, publicKey, and name".into());
-        };
-        if credential_id.is_empty() || public_key.is_empty() || name.is_empty() {
-            return Err("every member needs credentialId, publicKey, and name".into());
-        }
-        validate_strings(&[
-            ("credentialId", &credential_id, 1024),
-            ("publicKey", &public_key, 130),
-            ("name", &name, 256),
-        ])?;
-        validate_public_key(&public_key)?;
-        if !seen.insert(credential_id.clone()) {
-            return Err("members must not repeat a credentialId".into());
-        }
-        parsed.push(WalletMember {
-            credential_id,
-            public_key,
-            name,
-        });
+    for (index, member) in members.into_iter().enumerate() {
+        parsed.push(
+            validate_member(member, &rp_id, nonce, chain_id, registry)
+                .map_err(|message| format!("members[{index}]: {message}"))?,
+        );
     }
-    let keys = parsed
-        .iter()
-        .map(|member| parse_hex_bytes(&member.public_key))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let metadata = packed_metadata(&keys);
-    Ok(ValidWallet {
+
+    let task = RegisterTask {
+        id: new_task_id,
+        status: TaskStatus::Pending,
         rp_id,
-        wallet_ref,
-        members: parsed,
         metadata,
-    })
+        unit_nonce,
+        members: parsed,
+        tx_hash: None,
+        first_entry_id: None,
+        error: None,
+        retries: 0,
+        created_at: now_ms as i64,
+        admitted: false,
+    };
+    let content_hash = content_hash_for(&task).map_err(|error| error.to_string())?;
+    Ok((task, format!("{content_hash:#x}")))
 }
 
-fn validate_public_key(value: &str) -> Result<(), String> {
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("publicKey must be a valid hex string".into());
+fn validate_member(
+    member: MemberRequest,
+    rp_id: &str,
+    nonce: alloy::primitives::B256,
+    chain_id: u64,
+    registry: Address,
+) -> Result<Member, String> {
+    let Some(public_key) = member.public_key.as_deref() else {
+        return Err("publicKey is required".into());
+    };
+    let raw = public_key.strip_prefix("0x").unwrap_or(public_key);
+    if raw.len() != 130 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("publicKey must be an uncompressed P-256 point (04 + 128 hex chars)".into());
     }
-    if raw.len() != 130 || !raw.starts_with("04") {
-        return Err("publicKey must be an uncompressed P-256 point (04 + 64-byte X/Y)".into());
+    if !raw.starts_with("04") {
+        return Err("publicKey must start with the uncompressed prefix 04".into());
     }
-    // Check the point itself here so the field-specific message fires before
-    // any metadata-level validation of the same key.
-    let bytes = hex::decode(raw).map_err(|_| "publicKey must be a valid hex string".to_owned())?;
-    p256::PublicKey::from_sec1_bytes(&bytes)
+    let public_key = raw.to_ascii_lowercase();
+    let key_bytes = hex::decode(&public_key).expect("validated hex");
+    p256::PublicKey::from_sec1_bytes(&key_bytes)
         .map_err(|_| "publicKey must be a valid point on the P-256 curve".to_owned())?;
-    Ok(())
-}
 
-pub fn validate_strings(values: &[(&str, &str, usize)]) -> Result<(), String> {
-    for (name, value, maximum) in values {
-        if value.len() > *maximum {
-            return Err(format!("{name} exceeds max length ({maximum})"));
+    let attestation = member.attestation.unwrap_or_default();
+    let attestation_bytes = parse_hex_bytes(&attestation)
+        .map_err(|_| "attestation must be a valid hex string".to_owned())?;
+    if !attestation_bytes.is_empty() {
+        if attestation_bytes.len() != ATTESTATION_BYTES {
+            return Err(format!("attestation must be {ATTESTATION_BYTES} bytes"));
+        }
+        if attestation_bytes[0] != ATTESTATION_VERSION {
+            return Err(format!(
+                "attestation must start with version byte 0x{ATTESTATION_VERSION:02x}"
+            ));
         }
     }
-    Ok(())
-}
-
-pub fn validate_wallet_ref(value: &str) -> Result<(), String> {
-    if value.len() > 66 {
-        return Err("walletRef exceeds max length (66)".into());
-    }
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if raw.len() != 64 {
-        return Err("walletRef must be a 32-byte hex string (64 hex chars)".into());
-    }
-    let normalized = if value.starts_with("0x") {
-        value.to_owned()
+    let attestation = if attestation_bytes.is_empty() {
+        String::new()
     } else {
-        format!("0x{value}")
+        format!("0x{}", hex::encode(&attestation_bytes))
     };
-    parse_b256(&normalized).map_err(|_| "walletRef must be a valid hex string".to_owned())?;
-    Ok(())
-}
 
-fn validate_metadata(value: &str) -> Result<(), String> {
-    // 1397 metadata bytes (the V3 on-chain cap: 32-byte prefix + 21 keys)
-    // = 2794 hex chars, plus an optional 0x.
-    if value.len() > 2796 {
-        return Err("metadata exceeds max length (2796)".into());
-    }
-    let raw = value.strip_prefix("0x").unwrap_or(value);
-    if !raw.len().is_multiple_of(2) {
-        return Err("metadata must be byte-aligned hex (even number of hex chars)".into());
-    }
-    if !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("metadata must be a valid hex string".into());
-    }
-    Ok(())
+    let Some(proof) = member.proof else {
+        return Err("proof is required".into());
+    };
+    let proof = Proof {
+        authenticator_data: proof
+            .authenticator_data
+            .ok_or("proof.authenticatorData is required")?,
+        client_data_json: proof
+            .client_data_json
+            .ok_or("proof.clientDataJSON is required")?,
+        challenge_index: proof
+            .challenge_index
+            .ok_or("proof.challengeIndex is required")?,
+        type_index: proof.type_index.ok_or("proof.typeIndex is required")?,
+        r: proof.r.ok_or("proof.r is required")?,
+        s: proof.s.ok_or("proof.s is required")?,
+    };
+
+    // The pure mirror of the contract's verification: an invalid proof never
+    // reaches the chain.
+    let challenge = challenge_for(chain_id, registry, rp_id, &key_bytes, nonce);
+    verify_proof(&proof, challenge, rp_id, &key_bytes)
+        .map_err(|error| format!("proof rejected: {error}"))?;
+
+    Ok(Member {
+        public_key,
+        attestation,
+        proof,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
+    use alloy::primitives::B256;
     use crux_core::{Core, Request};
-    use serde_json::json;
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::verify::base64url_32;
 
-    // A valid uncompressed P-256 generator point, as used by the wallet tests.
-    const KEY: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
-    // A second valid P-256 point (borrowed from the contract test fixtures).
-    const KEY2: &str = "04550f471003f3df97c3df506ac797f6721fb1a1fb7b8f6f83d224498a65c88e24136093d7012e509a73715cbd0b00a3cc0ff4b5c01b3ffa196ab1fb327036b8e6";
+    const CHAIN: u64 = 100;
+    const REGISTRY: &str = "0x1111111111111111111111111111111111111111";
 
-    /// The pre-V3 abi.encode("VelaWalletV1", pk) metadata encoding.
-    fn legacy_metadata() -> String {
-        use alloy::sol_types::SolValue;
-        let key: alloy::primitives::Bytes = parse_hex_bytes(KEY).unwrap().into();
-        format!(
-            "0x{}",
-            hex::encode(("VelaWalletV1".to_owned(), key).abi_encode_params())
-        )
+    fn keypair() -> (p256::ecdsa::SigningKey, String) {
+        let secret = [
+            0xba, 0xb2, 0x6f, 0x1a, 0xb9, 0x4e, 0x84, 0xa2, 0x31, 0x99, 0xc4, 0x6e, 0xc2, 0xdd,
+            0x44, 0x89, 0x50, 0x7c, 0x27, 0x8d, 0xd3, 0xdd, 0xf2, 0xba, 0x0a, 0x47, 0xec, 0x20,
+            0x12, 0x05, 0xfe, 0x7a,
+        ];
+        let key = p256::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
+        let public = hex::encode(key.verifying_key().to_sec1_point(false).as_bytes());
+        (key, public)
     }
 
-    // ── Test driver (same shape as commit_reveal's) ────────────────────────
+    fn nonce_hex() -> String {
+        format!("0x{}", "11".repeat(32))
+    }
+
+    fn signed_member(rp_id: &str) -> MemberRequest {
+        let (signing, public) = keypair();
+        let nonce = B256::repeat_byte(0x11);
+        let challenge = challenge_for(
+            CHAIN,
+            REGISTRY.parse().unwrap(),
+            rp_id,
+            &hex::decode(&public).unwrap(),
+            nonce,
+        );
+        let client_data = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
+            base64url_32(&challenge)
+        );
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        auth_data.push(0x05);
+        auth_data.extend_from_slice(&[0, 0, 0, 0]);
+        let client_hash: [u8; 32] = Sha256::digest(client_data.as_bytes()).into();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&client_hash);
+        let digest: [u8; 32] = Sha256::digest(&signed).into();
+        let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let bytes = signature.to_bytes();
+        MemberRequest {
+            public_key: Some(public),
+            attestation: None,
+            proof: Some(ProofRequest {
+                authenticator_data: Some(hex::encode(auth_data)),
+                client_data_json: Some(client_data),
+                challenge_index: Some(23),
+                type_index: Some(1),
+                r: Some(format!("0x{}", hex::encode(&bytes[..32]))),
+                s: Some(format!("0x{}", hex::encode(&bytes[32..]))),
+            }),
+        }
+    }
+
+    fn valid_request() -> RegisterRequest {
+        RegisterRequest {
+            rp_id: Some("example.com".into()),
+            metadata: Some("0xaa".into()),
+            unit_nonce: Some(nonce_hex()),
+            members: Some(vec![signed_member("example.com")]),
+        }
+    }
+
+    fn validated() -> (RegisterTask, String) {
+        validate_register(valid_request(), "task-new".into(), 1_000, CHAIN, REGISTRY)
+            .expect("valid request")
+    }
+
+    // ── Validation ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_fully_proven_request_validates() {
+        let (task, content_hash) = validated();
+        assert_eq!(task.rp_id, "example.com");
+        assert_eq!(task.metadata, "0xaa");
+        assert_eq!(task.members.len(), 1);
+        assert!(content_hash.starts_with("0x"));
+    }
+
+    #[test]
+    fn a_bad_proof_is_rejected_before_any_io() {
+        let mut request = valid_request();
+        // Flip one signature byte.
+        let member = &mut request.members.as_mut().unwrap()[0];
+        let r = member.proof.as_mut().unwrap().r.as_mut().unwrap();
+        let flipped = if r.ends_with('0') { "1" } else { "0" };
+        r.truncate(r.len() - 1);
+        r.push_str(flipped);
+        let error = validate_register(request, "t".into(), 0, CHAIN, REGISTRY).unwrap_err();
+        assert!(error.starts_with("members[0]: proof rejected"), "{error}");
+
+        // And the driver settles Invalid without a single operation.
+        let mut bad = valid_request();
+        bad.members.as_mut().unwrap()[0]
+            .proof
+            .as_mut()
+            .unwrap()
+            .type_index = Some(2);
+        let driver = Driver::submit(bad);
+        match driver.core.view().outcome {
+            Some(AdmissionOutcome::Invalid { message }) => {
+                assert!(message.contains("webauthn.get"), "{message}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validation_bounds() {
+        let mut no_rp = valid_request();
+        no_rp.rp_id = None;
+        assert_eq!(
+            validate_register(no_rp, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
+            "rpId is required"
+        );
+
+        let mut bad_nonce = valid_request();
+        bad_nonce.unit_nonce = Some("0x1234".into());
+        assert_eq!(
+            validate_register(bad_nonce, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
+            "unitNonce must be 32-byte hex"
+        );
+
+        let mut fat_metadata = valid_request();
+        fat_metadata.metadata = Some(format!("0x{}", "00".repeat(1025)));
+        assert_eq!(
+            validate_register(fat_metadata, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
+            "metadata exceeds max length (1024 bytes)"
+        );
+
+        let mut too_many = valid_request();
+        too_many.members = Some(vec![signed_member("example.com"); 8]);
+        assert_eq!(
+            validate_register(too_many, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
+            "members must contain 1 to 7 entries"
+        );
+
+        let mut bad_attestation = valid_request();
+        bad_attestation.members.as_mut().unwrap()[0].attestation = Some("0x00".into());
+        assert!(
+            validate_register(bad_attestation, "t".into(), 0, CHAIN, REGISTRY)
+                .unwrap_err()
+                .contains("attestation must be 20 bytes")
+        );
+    }
+
+    // ── Driver ─────────────────────────────────────────────────────────────
 
     struct Driver {
         core: Core<AdmissionApp>,
@@ -960,12 +705,14 @@ mod tests {
     }
 
     impl Driver {
-        fn submit(request_body: CreateRequest) -> Self {
+        fn submit(request_body: RegisterRequest) -> Self {
             let core = Core::new();
             let effects = core.process_event(AdmissionEvent::Submit {
                 request: request_body,
                 new_task_id: "task-new".into(),
                 now_ms: 1_000,
+                chain_id: CHAIN,
+                registry: REGISTRY.into(),
             });
             let mut driver = Self {
                 core,
@@ -1005,507 +752,43 @@ mod tests {
         }
     }
 
-    fn valid_request() -> CreateRequest {
-        CreateRequest {
-            rp_id: Some("example.com".into()),
-            credential_id: Some("cred-1".into()),
-            wallet_ref: None,
-            public_key: Some(KEY.into()),
-            name: Some("n".into()),
-            initial_credential_id: None,
-            metadata: None,
-        }
+    fn expected_task() -> RegisterTask {
+        validated().0
     }
 
-    fn derived_wallet_ref() -> String {
-        build_wallet_ref(KEY).unwrap()
+    fn expected_content_hash() -> String {
+        validated().1
     }
 
-    fn record_scope() -> CacheScope {
-        CacheScope::Record {
-            rp_id: "example.com".into(),
-            credential_id: "cred-1".into(),
-        }
-    }
-
-    fn wallet_scope() -> CacheScope {
-        CacheScope::Wallet {
-            wallet_ref: derived_wallet_ref(),
-        }
-    }
-
-    fn record_value() -> Value {
-        json!({ "rpId": "example.com", "credentialId": "cred-1", "name": "n" })
-    }
-
-    fn other_record_value() -> Value {
-        json!({ "rpId": "other.example", "credentialId": "cred-x" })
-    }
-
-    fn in_flight(id: &str, status: TaskStatus) -> CreateTask {
-        CreateTask {
-            id: id.to_owned(),
-            status,
-            rp_id: "example.com".into(),
-            credential_id: "cred-1".into(),
-            wallet_ref: derived_wallet_ref(),
-            public_key: KEY.into(),
-            name: "n".into(),
-            initial_credential_id: "cred-1".into(),
-            metadata: "0x00".into(),
-            members: Vec::new(),
-            tx_hash: None,
-            error: None,
-            retries: 0,
-            created_at: 0,
-            admitted: true,
-        }
-    }
-
-    /// Walk the request up to (and including) the pre-checks that find
-    /// nothing: rate limit ok, cache miss, chain empty, no in-flight task for
-    /// this credential, wallet cache miss, no legacy V2 record.
     fn walk_clean_prechecks(driver: &mut Driver) {
         driver.step(
             AdmissionOperation::AllowIpCreate,
             AdmissionResult::Allowed { allowed: true },
         );
         driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
+            AdmissionOperation::FindTaskByNonce {
+                unit_nonce: nonce_hex(),
             },
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
+            AdmissionOperation::CheckContentRegistered {
+                content_hash: expected_content_hash(),
             },
-            AdmissionResult::CacheMiss,
+            AdmissionResult::ChainBool { value: false },
         );
         driver.step(
-            AdmissionOperation::FetchV2RecordByWalletRef {
-                wallet_ref: derived_wallet_ref(),
+            AdmissionOperation::CheckNonceUsed {
+                unit_nonce: nonce_hex(),
             },
-            AdmissionResult::ChainRecord { value: None },
-        );
-    }
-
-    fn expected_new_task() -> CreateTask {
-        CreateTask {
-            id: "task-new".into(),
-            status: TaskStatus::Pending,
-            rp_id: "example.com".into(),
-            credential_id: "cred-1".into(),
-            wallet_ref: derived_wallet_ref(),
-            public_key: KEY.into(),
-            name: "n".into(),
-            initial_credential_id: "cred-1".into(),
-            metadata: default_metadata(KEY).unwrap(),
-            members: Vec::new(),
-            tx_hash: None,
-            error: None,
-            retries: 0,
-            created_at: 1_000,
-            admitted: false,
-        }
-    }
-
-    // ── Validation ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn validation_derives_wallet_ref_and_metadata() {
-        let input = validate_create(valid_request()).expect("valid");
-        assert_eq!(input.wallet_ref, derived_wallet_ref());
-        assert_eq!(input.initial_credential_id, "cred-1");
-        assert_eq!(input.metadata, default_metadata(KEY).unwrap());
-    }
-
-    #[test]
-    fn validate_wallet_requests() {
-        let base = CreateWalletRequest {
-            rp_id: Some("example.com".into()),
-            wallet_ref: Some(format!("0x{}", "AB".repeat(32))),
-            members: Some(vec![
-                WalletMemberRequest {
-                    credential_id: Some("cred-1".into()),
-                    public_key: Some(KEY.into()),
-                    name: Some("A".into()),
-                },
-                WalletMemberRequest {
-                    credential_id: Some("cred-2".into()),
-                    public_key: Some(KEY2.into()),
-                    name: Some("B".into()),
-                },
-            ]),
-        };
-
-        let input = validate_create_wallet(base.clone()).expect("valid wallet request");
-        assert_eq!(input.wallet_ref, format!("0x{}", "ab".repeat(32)));
-        assert_eq!(input.members.len(), 2);
-        // Packed derivation preimage: prefix word + both keys, in order.
-        assert!(input.metadata.starts_with("0x56656c6157616c6c65745631"));
-        assert_eq!(input.metadata.len(), 2 + 64 + 130 * 2);
-        assert!(input.metadata.ends_with(KEY2));
-
-        let mut duplicate = base.clone();
-        duplicate.members.as_mut().unwrap()[1].credential_id = Some("cred-1".into());
-        assert_eq!(
-            validate_create_wallet(duplicate).unwrap_err(),
-            "members must not repeat a credentialId"
-        );
-
-        let mut zero_ref = base.clone();
-        zero_ref.wallet_ref = Some(format!("0x{}", "0".repeat(64)));
-        assert_eq!(
-            validate_create_wallet(zero_ref).unwrap_err(),
-            "walletRef must not be zero"
-        );
-
-        let mut too_many = base.clone();
-        too_many.members = Some(
-            (0..MAX_WALLET_MEMBERS + 1)
-                .map(|i| WalletMemberRequest {
-                    credential_id: Some(format!("cred-{i}")),
-                    public_key: Some(KEY.into()),
-                    name: Some("K".into()),
-                })
-                .collect(),
-        );
-        assert!(
-            validate_create_wallet(too_many)
-                .unwrap_err()
-                .starts_with("members must contain 1 to")
-        );
-
-        let mut missing_field = base.clone();
-        missing_field.members.as_mut().unwrap()[0].name = None;
-        assert_eq!(
-            validate_create_wallet(missing_field).unwrap_err(),
-            "every member needs credentialId, publicKey, and name"
-        );
-
-        let mut off_curve = base;
-        off_curve.members.as_mut().unwrap()[0].public_key = Some(format!("04aa{}", &KEY[4..]));
-        assert_eq!(
-            validate_create_wallet(off_curve).unwrap_err(),
-            "publicKey must be a valid point on the P-256 curve"
+            AdmissionResult::ChainBool { value: false },
         );
     }
 
     #[test]
-    fn validation_single_key_path_rejects_foreign_or_multi_key_metadata() {
-        const SINGLE_PATH_ERROR: &str = "metadata must carry exactly this credential's publicKey; multi-key wallets register via createWallet";
-
-        // Two keys: the single-key path refuses, even with a supplied walletRef.
-        let two_keys = format!("{}{KEY}", default_metadata(KEY).unwrap());
-        let multi = CreateRequest {
-            metadata: Some(two_keys),
-            wallet_ref: Some(format!("0x{}", "ab".repeat(32))),
-            ..valid_request()
-        };
-        assert_eq!(validate_create(multi).unwrap_err(), SINGLE_PATH_ERROR);
-
-        // A single key that is not this credential's own key.
-        let foreign = CreateRequest {
-            metadata: Some(default_metadata(KEY).unwrap()),
-            public_key: Some(KEY2.into()),
-            ..valid_request()
-        };
-        assert_eq!(validate_create(foreign).unwrap_err(), SINGLE_PATH_ERROR);
-
-        // The legacy abi.encode metadata is rejected outright (structure error).
-        let legacy = CreateRequest {
-            metadata: Some(legacy_metadata()),
-            ..valid_request()
-        };
-        assert!(
-            validate_create(legacy)
-                .unwrap_err()
-                .starts_with("metadata must be")
-        );
-    }
-
-    #[test]
-    fn validation_rejects_missing_empty_and_mismatched_inputs() {
-        let missing = CreateRequest {
-            rp_id: None,
-            ..valid_request()
-        };
-        assert_eq!(
-            validate_create(missing).unwrap_err(),
-            "rpId, credentialId, publicKey, and name are required"
-        );
-        let empty = CreateRequest {
-            name: Some(String::new()),
-            ..valid_request()
-        };
-        assert_eq!(
-            validate_create(empty).unwrap_err(),
-            "rpId, credentialId, publicKey, and name are required"
-        );
-        // A 0x-prefixed key is 132 chars: the length gate fires before the
-        // point check, exactly like the original ordering.
-        let prefixed = CreateRequest {
-            public_key: Some(format!("0x{KEY}")),
-            ..valid_request()
-        };
-        assert_eq!(
-            validate_create(prefixed).unwrap_err(),
-            "publicKey exceeds max length (130)"
-        );
-        let not_a_point = CreateRequest {
-            public_key: Some("04".repeat(65)),
-            ..valid_request()
-        };
-        assert_eq!(
-            validate_create(not_a_point).unwrap_err(),
-            "publicKey must be a valid point on the P-256 curve"
-        );
-        let mismatched = CreateRequest {
-            wallet_ref: Some(
-                "0x00000000000000000000000000000000000000000000000000000000000000ff".into(),
-            ),
-            ..valid_request()
-        };
-        assert_eq!(
-            validate_create(mismatched).unwrap_err(),
-            "walletRef does not match publicKey"
-        );
-        // A supplied wallet ref matches case-insensitively.
-        let uppercase = CreateRequest {
-            wallet_ref: Some(derived_wallet_ref().to_uppercase().replace("0X", "0x")),
-            ..valid_request()
-        };
-        assert!(validate_create(uppercase).is_ok());
-        let odd_metadata = CreateRequest {
-            metadata: Some("0x123".into()),
-            ..valid_request()
-        };
-        assert_eq!(
-            validate_create(odd_metadata).unwrap_err(),
-            "metadata must be byte-aligned hex (even number of hex chars)"
-        );
-    }
-
-    #[test]
-    fn invalid_request_settles_without_any_operation() {
-        let driver = Driver::submit(CreateRequest {
-            rp_id: None,
-            ..valid_request()
-        });
-        driver.assert_settled(AdmissionOutcome::Invalid {
-            message: "rpId, credentialId, publicKey, and name are required".into(),
-        });
-    }
-
-    // ── Gates and pre-checks ───────────────────────────────────────────────
-
-    #[test]
-    fn ip_rate_limit_rejects_before_any_other_io() {
+    fn clean_walk_admits_enqueues_and_returns_queued() {
         let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: false },
-        );
-        driver.assert_settled(AdmissionOutcome::RateLimited);
-    }
-
-    #[test]
-    fn rate_limit_store_failure_is_a_redis_dependency_error() {
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::StoreUnavailable,
-        );
-        driver.assert_settled(AdmissionOutcome::DependencyUnavailable {
-            dependency: "redis".into(),
-        });
-    }
-
-    #[test]
-    fn fresh_record_cache_answers_done_immediately() {
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheHit {
-                value: record_value(),
-            },
-        );
-        driver.assert_settled(AdmissionOutcome::AlreadyDone {
-            record: record_value(),
-        });
-    }
-
-    #[test]
-    fn chain_record_hit_backfills_cache_then_answers_done() {
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord {
-                value: Some(record_value()),
-            },
-        );
-        // This cache write must succeed (not best-effort).
-        driver.step(
-            AdmissionOperation::StoreCache {
-                scope: record_scope(),
-                value: record_value(),
-                best_effort: false,
-            },
-            AdmissionResult::Persisted,
-        );
-        driver.assert_settled(AdmissionOutcome::AlreadyDone {
-            record: record_value(),
-        });
-    }
-
-    #[test]
-    fn record_cache_write_failure_is_a_dependency_error() {
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord {
-                value: Some(record_value()),
-            },
-        );
-        driver.step(
-            AdmissionOperation::StoreCache {
-                scope: record_scope(),
-                value: record_value(),
-                best_effort: false,
-            },
-            AdmissionResult::StoreUnavailable,
-        );
-        driver.assert_settled(AdmissionOutcome::DependencyUnavailable {
-            dependency: "redis".into(),
-        });
-    }
-
-    #[test]
-    fn in_flight_placeholder_returns_its_id_as_queued() {
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound {
-                task: Some(in_flight("existing", TaskStatus::Committed)),
-            },
-        );
-        driver.assert_settled(AdmissionOutcome::Queued {
-            id: "existing".into(),
-            status: TaskStatus::Committed,
-        });
-    }
-
-    #[test]
-    fn failed_in_flight_task_is_not_a_placeholder() {
-        // A Failed task must not block re-registration: the flow continues
-        // past both task lookups.
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound {
-                task: Some(in_flight("failed", TaskStatus::Failed)),
-            },
-        );
-        // Continues to the wallet lookup instead of returning Queued.
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchV2RecordByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
+        walk_clean_prechecks(&mut driver);
         driver.step(
             AdmissionOperation::QueueDepth,
             AdmissionResult::Depth { depth: 0 },
@@ -1516,17 +799,17 @@ mod tests {
         );
         driver.step(
             AdmissionOperation::Admit {
-                task: expected_new_task(),
+                task: expected_task(),
             },
             AdmissionResult::Admitted(AdmitOutcome::New),
         );
         driver.step(
             AdmissionOperation::Enqueue {
-                task: expected_new_task(),
+                task: expected_task(),
             },
             AdmissionResult::Enqueued,
         );
-        let mut admitted = expected_new_task();
+        let mut admitted = expected_task();
         admitted.admitted = true;
         driver.step(
             AdmissionOperation::MarkAdmitted {
@@ -1543,238 +826,137 @@ mod tests {
     }
 
     #[test]
-    fn wallet_cache_hit_for_the_same_credential_answers_done() {
+    fn ip_rate_limit_rejects_before_other_io() {
+        let mut driver = Driver::submit(valid_request());
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: false },
+        );
+        driver.assert_settled(AdmissionOutcome::RateLimited);
+    }
+
+    #[test]
+    fn same_unit_resubmission_is_idempotent() {
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
             AdmissionResult::Allowed { allowed: true },
         );
+        let mut existing = expected_task();
+        existing.id = "earlier".into();
         driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
+            AdmissionOperation::FindTaskByNonce {
+                unit_nonce: nonce_hex(),
             },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
-            },
-            AdmissionResult::CacheHit {
-                value: record_value(),
+            AdmissionResult::TaskFound {
+                task: Some(existing),
             },
         );
-        driver.assert_settled(AdmissionOutcome::AlreadyDone {
-            record: record_value(),
+        driver.assert_settled(AdmissionOutcome::Queued {
+            id: "earlier".into(),
+            status: TaskStatus::Pending,
         });
     }
 
     #[test]
-    fn wallet_cache_hit_for_a_sibling_credential_falls_through() {
-        // Under V3 a wallet legitimately spans several credentials: a cached
-        // sibling record is NOT a conflict — the request proceeds to the V2
-        // probe and the write gates.
+    fn different_unit_on_an_in_flight_nonce_conflicts() {
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
             AdmissionResult::Allowed { allowed: true },
         );
+        let mut foreign = expected_task();
+        foreign.id = "earlier".into();
+        foreign.metadata = "0xbb".into(); // different content, same nonce
         driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
+            AdmissionOperation::FindTaskByNonce {
+                unit_nonce: nonce_hex(),
             },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
-            },
-            AdmissionResult::CacheHit {
-                value: other_record_value(),
+            AdmissionResult::TaskFound {
+                task: Some(foreign),
             },
         );
-        driver.step(
-            AdmissionOperation::FetchV2RecordByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth { depth: 0 },
-        );
-        // Reaching the depth gate proves the sibling record did not conflict.
-    }
-
-    #[test]
-    fn legacy_v2_record_under_a_different_credential_conflicts() {
-        // The one surviving walletRef conflict: the ref already lives in the
-        // frozen V2 index bound to another credential.
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchV2RecordByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::ChainRecord {
-                value: Some(other_record_value()),
-            },
-        );
-        driver.assert_settled(AdmissionOutcome::WalletConflict {
-            wallet_ref: derived_wallet_ref(),
-            message: CONFLICT_LEGACY_V2.into(),
+        driver.assert_settled(AdmissionOutcome::NonceConflict {
+            message: CONFLICT_NONCE_IN_FLIGHT.into(),
         });
     }
 
     #[test]
-    fn wallet_chain_hit_same_record_backfills_best_effort_and_answers_done() {
+    fn content_already_on_chain_answers_done_retroactively() {
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
             AdmissionResult::Allowed { allowed: true },
         );
         driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
+            AdmissionOperation::FindTaskByNonce {
+                unit_nonce: nonce_hex(),
             },
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
+            AdmissionOperation::CheckContentRegistered {
+                content_hash: expected_content_hash(),
             },
-            AdmissionResult::CacheMiss,
+            AdmissionResult::ChainBool { value: true },
         );
-        driver.step(
-            AdmissionOperation::FetchV2RecordByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::ChainRecord {
-                value: Some(record_value()),
-            },
-        );
-        // The record-cache backfill is best-effort: its failure must not
-        // change the outcome.
-        driver.step(
-            AdmissionOperation::StoreCache {
-                scope: record_scope(),
-                value: record_value(),
-                best_effort: true,
-            },
-            AdmissionResult::StoreUnavailable,
-        );
-        driver.assert_settled(AdmissionOutcome::AlreadyDone {
-            record: record_value(),
+        driver.assert_settled(AdmissionOutcome::AlreadyRegistered {
+            content_hash: expected_content_hash(),
         });
     }
 
     #[test]
-    fn chain_prechecks_fail_open_all_the_way_to_admission() {
-        // Both chain prechecks fail; the request still reaches the gates.
+    fn consumed_nonce_with_absent_content_is_terminal() {
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
             AdmissionResult::Allowed { allowed: true },
         );
         driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
+            AdmissionOperation::FindTaskByNonce {
+                unit_nonce: nonce_hex(),
             },
-            AdmissionResult::CacheMiss,
+            AdmissionResult::TaskFound { task: None },
         );
         driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
+            AdmissionOperation::CheckContentRegistered {
+                content_hash: expected_content_hash(),
+            },
+            AdmissionResult::ChainBool { value: false },
+        );
+        driver.step(
+            AdmissionOperation::CheckNonceUsed {
+                unit_nonce: nonce_hex(),
+            },
+            AdmissionResult::ChainBool { value: true },
+        );
+        driver.assert_settled(AdmissionOutcome::NonceConflict {
+            message: CONFLICT_NONCE_CONSUMED.into(),
+        });
+    }
+
+    #[test]
+    fn chain_prechecks_fail_open_to_the_gates() {
+        let mut driver = Driver::submit(valid_request());
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::FindTaskByNonce {
+                unit_nonce: nonce_hex(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+        driver.step(
+            AdmissionOperation::CheckContentRegistered {
+                content_hash: expected_content_hash(),
             },
             AdmissionResult::ChainReadFailed,
         );
         driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchV2RecordByWalletRef {
-                wallet_ref: derived_wallet_ref(),
+            AdmissionOperation::CheckNonceUsed {
+                unit_nonce: nonce_hex(),
             },
             AdmissionResult::ChainReadFailed,
         );
@@ -1799,135 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_depth_below_the_limit_passes() {
-        let mut driver = Driver::submit(valid_request());
-        walk_clean_prechecks(&mut driver);
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth {
-                depth: MAX_ACTIVE_QUEUE_DEPTH - 1,
-            },
-        );
-        driver.step(
-            AdmissionOperation::AllowGlobalCreate,
-            AdmissionResult::Allowed { allowed: false },
-        );
-        driver.assert_settled(AdmissionOutcome::Busy);
-    }
-
-    // ── Two-phase admission ────────────────────────────────────────────────
-
-    #[test]
-    fn new_admission_enqueues_marks_and_returns_queued() {
-        let mut driver = Driver::submit(valid_request());
-        walk_clean_prechecks(&mut driver);
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth { depth: 0 },
-        );
-        driver.step(
-            AdmissionOperation::AllowGlobalCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        // The task the Core builds is fully pinned: shell-supplied id and
-        // time, derived wallet ref and metadata, admitted=false.
-        driver.step(
-            AdmissionOperation::Admit {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Admitted(AdmitOutcome::New),
-        );
-        driver.step(
-            AdmissionOperation::Enqueue {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Enqueued,
-        );
-        let mut admitted = expected_new_task();
-        admitted.admitted = true;
-        driver.step(
-            AdmissionOperation::MarkAdmitted {
-                id: "task-new".into(),
-            },
-            AdmissionResult::TaskFound {
-                task: Some(admitted),
-            },
-        );
-        driver.assert_settled(AdmissionOutcome::Queued {
-            id: "task-new".into(),
-            status: TaskStatus::Pending,
-        });
-    }
-
-    #[test]
-    fn enqueue_failure_keeps_the_admission_and_reports_the_queue() {
-        // Phase two fails: the outcome names the queue, and no operation to
-        // delete the Redis admission is ever issued (none exists).
-        let mut driver = Driver::submit(valid_request());
-        walk_clean_prechecks(&mut driver);
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth { depth: 0 },
-        );
-        driver.step(
-            AdmissionOperation::AllowGlobalCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::Admit {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Admitted(AdmitOutcome::New),
-        );
-        driver.step(
-            AdmissionOperation::Enqueue {
-                task: expected_new_task(),
-            },
-            AdmissionResult::QueueUnavailable,
-        );
-        driver.assert_settled(AdmissionOutcome::DependencyUnavailable {
-            dependency: "queue".into(),
-        });
-    }
-
-    #[test]
-    fn existing_admitted_task_returns_queued_without_re_enqueueing() {
-        let mut driver = Driver::submit(valid_request());
-        walk_clean_prechecks(&mut driver);
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth { depth: 0 },
-        );
-        driver.step(
-            AdmissionOperation::AllowGlobalCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::Admit {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Admitted(AdmitOutcome::Existing {
-                id: "earlier".into(),
-            }),
-        );
-        driver.step(
-            AdmissionOperation::LoadTask {
-                id: "earlier".into(),
-            },
-            AdmissionResult::TaskFound {
-                task: Some(in_flight("earlier", TaskStatus::Pending)),
-            },
-        );
-        driver.assert_settled(AdmissionOutcome::Queued {
-            id: "earlier".into(),
-            status: TaskStatus::Pending,
-        });
-    }
-
-    #[test]
     fn existing_unadmitted_task_repairs_phase_two() {
-        // The earlier request lost its enqueue: this request re-enqueues the
-        // same task id and completes the mark, never creating a second task.
         let mut driver = Driver::submit(valid_request());
         walk_clean_prechecks(&mut driver);
         driver.step(
@@ -1940,14 +994,14 @@ mod tests {
         );
         driver.step(
             AdmissionOperation::Admit {
-                task: expected_new_task(),
+                task: expected_task(),
             },
             AdmissionResult::Admitted(AdmitOutcome::Existing {
                 id: "earlier".into(),
             }),
         );
-        let mut unadmitted = in_flight("earlier", TaskStatus::Pending);
-        unadmitted.admitted = false;
+        let mut unadmitted = expected_task();
+        unadmitted.id = "earlier".into();
         driver.step(
             AdmissionOperation::LoadTask {
                 id: "earlier".into(),
@@ -1962,14 +1016,14 @@ mod tests {
             },
             AdmissionResult::Enqueued,
         );
-        let mut repaired = unadmitted;
-        repaired.admitted = true;
+        let mut admitted = unadmitted;
+        admitted.admitted = true;
         driver.step(
             AdmissionOperation::MarkAdmitted {
                 id: "earlier".into(),
             },
             AdmissionResult::TaskFound {
-                task: Some(repaired),
+                task: Some(admitted),
             },
         );
         driver.assert_settled(AdmissionOutcome::Queued {
@@ -1979,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_admitted_losing_the_task_is_a_redis_dependency_error() {
+    fn enqueue_failure_keeps_the_admission_and_reports_the_queue() {
         let mut driver = Driver::submit(valid_request());
         walk_clean_prechecks(&mut driver);
         driver.step(
@@ -1992,179 +1046,18 @@ mod tests {
         );
         driver.step(
             AdmissionOperation::Admit {
-                task: expected_new_task(),
+                task: expected_task(),
             },
             AdmissionResult::Admitted(AdmitOutcome::New),
         );
         driver.step(
             AdmissionOperation::Enqueue {
-                task: expected_new_task(),
+                task: expected_task(),
             },
-            AdmissionResult::Enqueued,
-        );
-        driver.step(
-            AdmissionOperation::MarkAdmitted {
-                id: "task-new".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
+            AdmissionResult::QueueUnavailable,
         );
         driver.assert_settled(AdmissionOutcome::DependencyUnavailable {
-            dependency: "redis".into(),
-        });
-    }
-
-    // ── Mutation-killing coverage ──────────────────────────────────────────
-    //
-    // Each test below pins a branch a mutation-testing pass found unguarded.
-
-    #[test]
-    fn conflict_message_is_pinned_literally() {
-        // The 409 message is a published API surface; the scenario tests
-        // assert which constant the site uses, this one asserts what the
-        // constant actually says.
-        assert_eq!(
-            CONFLICT_LEGACY_V2,
-            "this walletRef is already registered in the legacy V2 index under a different credential"
-        );
-    }
-
-    #[test]
-    fn same_rp_with_other_credential_in_v2_is_still_a_wallet_conflict() {
-        // same_record must compare BOTH fields: a legacy V2 record under the
-        // same rpId but another credential is a conflict, not an AlreadyDone.
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchV2RecordByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::ChainRecord {
-                value: Some(json!({ "rpId": "example.com", "credentialId": "cred-x" })),
-            },
-        );
-        driver.assert_settled(AdmissionOutcome::WalletConflict {
-            wallet_ref: derived_wallet_ref(),
-            message: CONFLICT_LEGACY_V2.into(),
-        });
-    }
-
-    #[test]
-    fn existing_task_vanishing_before_load_is_a_redis_dependency_error() {
-        // Admit said Existing but the task cannot be loaded (expiry race):
-        // the request must fail retryably, never mint a second task id.
-        let mut driver = Driver::submit(valid_request());
-        walk_clean_prechecks(&mut driver);
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth { depth: 0 },
-        );
-        driver.step(
-            AdmissionOperation::AllowGlobalCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::Admit {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Admitted(AdmitOutcome::Existing {
-                id: "earlier".into(),
-            }),
-        );
-        driver.step(
-            AdmissionOperation::LoadTask {
-                id: "earlier".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.assert_settled(AdmissionOutcome::DependencyUnavailable {
-            dependency: "redis".into(),
-        });
-    }
-
-    #[test]
-    fn length_gate_fires_before_the_point_check_for_doubly_invalid_keys() {
-        // 140 hex chars fail both the length gate (140 > 130) and the P-256
-        // point check; the reported message must be the length one, pinning
-        // the validation order.
-        let doubly_invalid = CreateRequest {
-            public_key: Some("ab".repeat(70)),
-            ..valid_request()
-        };
-        assert_eq!(
-            validate_create(doubly_invalid).unwrap_err(),
-            "publicKey exceeds max length (130)"
-        );
-    }
-
-    #[test]
-    fn queued_status_echoes_the_marked_task_not_a_constant() {
-        // If the consumer already advanced the task between enqueue and
-        // mark_admitted, the 202 must echo the real status.
-        let mut driver = Driver::submit(valid_request());
-        walk_clean_prechecks(&mut driver);
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth { depth: 0 },
-        );
-        driver.step(
-            AdmissionOperation::AllowGlobalCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::Admit {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Admitted(AdmitOutcome::New),
-        );
-        driver.step(
-            AdmissionOperation::Enqueue {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Enqueued,
-        );
-        let mut advanced = expected_new_task();
-        advanced.admitted = true;
-        advanced.status = TaskStatus::Committed;
-        driver.step(
-            AdmissionOperation::MarkAdmitted {
-                id: "task-new".into(),
-            },
-            AdmissionResult::TaskFound {
-                task: Some(advanced),
-            },
-        );
-        driver.assert_settled(AdmissionOutcome::Queued {
-            id: "task-new".into(),
-            status: TaskStatus::Committed,
+            dependency: "queue".into(),
         });
     }
 }
