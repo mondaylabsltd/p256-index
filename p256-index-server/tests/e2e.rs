@@ -111,6 +111,10 @@ impl ReadChain for FakeChain {
         if self.is_down() { "open" } else { "closed" }
     }
 
+    fn index_address(&self) -> String {
+        p256_registrar::protocol::CONTRACT_ADDRESS.to_ascii_lowercase()
+    }
+
     async fn get_record(&self, _: &str, _: &str) -> Result<Option<Record>, ChainError> {
         if self.is_down() {
             Err(ChainError::Unavailable)
@@ -127,11 +131,27 @@ impl ReadChain for FakeChain {
         }
     }
 
+    async fn get_v2_record_by_wallet_ref(&self, _: B256) -> Result<Option<Record>, ChainError> {
+        if self.is_down() {
+            Err(ChainError::Unavailable)
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn total_credentials(&self) -> Result<u64, ChainError> {
         if self.is_down() {
             Err(ChainError::Unavailable)
         } else {
             Ok(self.total)
+        }
+    }
+
+    async fn total_wallets(&self) -> Result<Option<u64>, ChainError> {
+        if self.is_down() {
+            Err(ChainError::Unavailable)
+        } else {
+            Ok(None)
         }
     }
 
@@ -199,9 +219,11 @@ fn test_config(redis: &str, iggy: &str) -> Config {
         queue_worker_enabled: false,
         telegram_bot_token: Some("test-token".to_owned()),
         telegram_chat_id: Some("test-chat".to_owned()),
+        max_gas_price_wei: p256_registrar::gas::DEFAULT_MAX_FEE_WEI,
         global_write_limit: 10_000,
         iggy_enqueue_timeout: Duration::from_secs(5),
         iggy_consumer_group: format!("e2e-{}", uuid::Uuid::new_v4()),
+        contract_address: None,
     }
 }
 
@@ -701,6 +723,7 @@ async fn enqueued_task_is_durably_consumable_from_iggy() {
         name: "transport probe".to_owned(),
         initial_credential_id: format!("transport-{marker}"),
         metadata: "0x".to_owned(),
+        members: Vec::new(),
         tx_hash: None,
         error: None,
         retries: 0,

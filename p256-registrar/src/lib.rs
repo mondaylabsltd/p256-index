@@ -19,6 +19,9 @@
 //!   reconciliation, commit → reveal → create orchestration, poison
 //!   isolation, error classification and the batch verdict. The server's
 //!   worker is its shell.
+//! - [`gas`] — EIP-1559 fee policy: inclusion headroom, the absolute price
+//!   cap that returns work to the queue instead of spending, and the
+//!   monotonic same-nonce replacement ladder the unstick sweep prices against.
 //! - [`protocol`] — the on-chain index protocol: calldata encoding, response
 //!   decoding, commit-reveal commitment construction, and the single home for
 //!   chain-error classification (previously four overlapping predicates in
@@ -34,6 +37,7 @@
 
 pub mod admission;
 pub mod commit_reveal;
+pub mod gas;
 pub mod lookup;
 pub mod protocol;
 pub mod rescue;

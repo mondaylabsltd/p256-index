@@ -19,8 +19,15 @@ pub struct Config {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub global_write_limit: u64,
+    /// Absolute ceiling on `max_fee_per_gas`, in wei. A write priced above
+    /// this is never signed; the batch returns to the queue instead.
+    pub max_gas_price_wei: u128,
     pub iggy_enqueue_timeout: Duration,
     pub iggy_consumer_group: String,
+    /// Active index contract override (P256_INDEX_CONTRACT_ADDRESS). Point it
+    /// at the V3 deployment at cutover; unset falls back to the compiled-in
+    /// default in `p256_registrar::protocol::CONTRACT_ADDRESS`.
+    pub contract_address: Option<String>,
 }
 
 impl Config {
@@ -53,6 +60,13 @@ impl Config {
         if global_write_limit == 0 {
             bail!("GLOBAL_WRITE_LIMIT must be greater than zero");
         }
+        let max_gas_price_wei = optional("P256_INDEX_MAX_GAS_PRICE_WEI")
+            .map(|value| value.parse::<u128>())
+            .transpose()?
+            .unwrap_or(p256_registrar::gas::DEFAULT_MAX_FEE_WEI);
+        if max_gas_price_wei == 0 {
+            bail!("P256_INDEX_MAX_GAS_PRICE_WEI must be greater than zero");
+        }
 
         Ok(Self {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], port)),
@@ -67,6 +81,8 @@ impl Config {
             telegram_bot_token: optional("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id: optional("TELEGRAM_CHAT_ID"),
             global_write_limit,
+            max_gas_price_wei,
+            contract_address: optional("P256_INDEX_CONTRACT_ADDRESS"),
             iggy_enqueue_timeout: Duration::from_secs(
                 optional("P256_INDEX_IGGY_ENQUEUE_TIMEOUT_SECS")
                     .map(|value| value.parse::<u64>())
@@ -110,6 +126,14 @@ fn derive_commit_key(private_key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{derive_commit_key, required_value};
+
+    #[test]
+    fn the_shipped_gas_cap_leaves_room_above_the_live_gnosis_base_fee() {
+        // The default must never be tight enough to throttle normal traffic:
+        // a cap below the market silently stalls every registration instead of
+        // failing loudly. Observed Gnosis base fee is ~9_000 wei.
+        const { assert!(p256_registrar::gas::DEFAULT_MAX_FEE_WEI > 9_960 * 100) };
+    }
 
     #[test]
     fn derives_a_distinct_commit_key_without_exposing_the_source() {

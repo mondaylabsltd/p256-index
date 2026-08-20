@@ -96,9 +96,11 @@ mod tests {
             queue_worker_enabled: false,
             telegram_bot_token: token.map(str::to_owned),
             telegram_chat_id: chat.map(str::to_owned),
+            max_gas_price_wei: p256_registrar::gas::DEFAULT_MAX_FEE_WEI,
             global_write_limit: 40,
             iggy_enqueue_timeout: Duration::from_secs(5),
             iggy_consumer_group: "test".into(),
+            contract_address: None,
         }
     }
 

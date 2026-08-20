@@ -36,7 +36,6 @@ impl std::error::Error for StoreError {}
 pub enum Admission {
     New(String),
     Existing(String),
-    WalletConflict(String),
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +64,18 @@ struct PendingTxEntry {
     hash: String,
     sent_at_ms: u64,
     attempts: u32,
+    /// The `max_fee_per_gas` this broadcast was signed with, as a decimal
+    /// string. A same-nonce replacement must be priced against *this*, not
+    /// against the current market, or a falling market produces a bump the
+    /// node rejects as underpriced and the nonce stays jammed forever.
+    /// Defaulted so ledger rows written before this field are still readable.
+    #[serde(default)]
+    max_fee_wei: Option<String>,
+    /// The `max_priority_fee_per_gas` of the same broadcast. Nodes require a
+    /// replacement to outbid the old transaction on *both* axes, so recording
+    /// only the ceiling would leave the tip ladder blind.
+    #[serde(default)]
+    max_priority_fee_wei: Option<String>,
 }
 
 /// A broadcast-ledger row: a `(role, nonce)` tx that was sent and not yet reconciled.
@@ -75,6 +86,9 @@ pub struct PendingTx {
     pub hash: String,
     pub sent_at_ms: u64,
     pub attempts: u32,
+    /// `None` for rows written before fee recording existed.
+    pub max_fee_wei: Option<u128>,
+    pub max_priority_fee_wei: Option<u128>,
 }
 
 impl RedisStore {
@@ -102,43 +116,42 @@ impl RedisStore {
     /// Atomically establishes the Redis half of Iggy admission. The caller must retain a new
     /// record when Iggy has an ambiguous delivery outcome: a later identical request safely
     /// re-appends it, while the worker treats duplicate task IDs idempotently.
+    ///
+    /// A wallet task writes one placeholder per member credential (KEYS[5..]);
+    /// idempotency keys off the first member's placeholder. The wallet key is
+    /// a convenience pointer for queue-fallback display, never a uniqueness gate.
     pub async fn admit(&self, task: &CreateTask) -> Result<Admission, StoreError> {
         let payload = serde_json::to_string(task)
             .map_err(|_| StoreError("could not serialize create task"))?;
         let script = Script::new(
             r#"
-            local existing = redis.call('GET', KEYS[1])
+            local existing = redis.call('GET', KEYS[5])
             if existing then return 'existing|' .. existing end
-            local wallet = redis.call('GET', KEYS[2])
-            if wallet then return 'conflict|' .. wallet end
-            redis.call('SET', KEYS[1], ARGV[1])
-            redis.call('SET', KEYS[2], ARGV[1])
-            redis.call('SET', KEYS[3], ARGV[2])
-            redis.call('SADD', KEYS[4], ARGV[1])
-            redis.call('ZADD', KEYS[5], ARGV[3], ARGV[1])
+            redis.call('SET', KEYS[1], ARGV[2])
+            redis.call('SADD', KEYS[2], ARGV[1])
+            redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
+            redis.call('SET', KEYS[4], ARGV[1])
+            for i = 5, #KEYS do redis.call('SET', KEYS[i], ARGV[1]) end
             return 'new|' .. ARGV[1]
         "#,
         );
-        let response: String = self
-            .run_script(
-                script
-                    .key(record_active_key(&task.rp_id, &task.credential_id))
-                    .key(wallet_active_key(&task.wallet_ref))
-                    .key(task_key(&task.id))
-                    .key(active_set_key())
-                    .key(active_age_key())
-                    .arg(&task.id)
-                    .arg(payload)
-                    .arg(task.created_at),
-            )
-            .await?;
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(task_key(&task.id))
+            .key(active_set_key())
+            .key(active_age_key())
+            .key(wallet_active_key(&task.wallet_ref));
+        for key in member_record_keys(task) {
+            invocation.key(key);
+        }
+        invocation.arg(&task.id).arg(payload).arg(task.created_at);
+        let response: String = self.run_script(&mut invocation).await?;
         let (kind, id) = response
             .split_once('|')
             .ok_or(StoreError("invalid Redis admission response"))?;
         match kind {
             "new" => Ok(Admission::New(id.to_owned())),
             "existing" => Ok(Admission::Existing(id.to_owned())),
-            "conflict" => Ok(Admission::WalletConflict(id.to_owned())),
             _ => Err(StoreError("invalid Redis admission response")),
         }
     }
@@ -306,11 +319,14 @@ impl RedisStore {
         hash: &str,
         sent_at_ms: u64,
         attempts: u32,
+        fees: Option<(u128, u128)>,
     ) -> Result<(), StoreError> {
         let payload = serde_json::to_string(&PendingTxEntry {
             hash: hash.to_owned(),
             sent_at_ms,
             attempts,
+            max_fee_wei: fees.map(|(max_fee, _)| max_fee.to_string()),
+            max_priority_fee_wei: fees.map(|(_, priority)| priority.to_string()),
         })
         .map_err(|_| StoreError("could not serialize broadcast ledger entry"))?;
         let mut command = redis::cmd("HSET");
@@ -358,6 +374,14 @@ impl RedisStore {
                     hash: entry.hash,
                     sent_at_ms: entry.sent_at_ms,
                     attempts: entry.attempts,
+                    max_fee_wei: entry
+                        .max_fee_wei
+                        .as_deref()
+                        .and_then(|value| value.parse::<u128>().ok()),
+                    max_priority_fee_wei: entry
+                        .max_priority_fee_wei
+                        .as_deref()
+                        .and_then(|value| value.parse::<u128>().ok()),
                 });
             }
         }
@@ -475,29 +499,33 @@ impl RedisStore {
     async fn transition_done(&self, task: &CreateTask) -> Result<(), StoreError> {
         let payload = serde_json::to_string(task)
             .map_err(|_| StoreError("could not serialize create task"))?;
+        // The wallet pointer may belong to a sibling task under the same
+        // walletRef; only expire it when it still points at this task.
+        // KEYS[5..] are the member record placeholders (one per credential).
         let script = Script::new(
             r#"
             redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
             redis.call('SREM', KEYS[2], ARGV[3])
             redis.call('ZREM', KEYS[3], ARGV[3])
-            redis.call('PEXPIRE', KEYS[4], ARGV[2])
-            redis.call('PEXPIRE', KEYS[5], ARGV[2])
+            if redis.call('GET', KEYS[4]) == ARGV[3] then redis.call('PEXPIRE', KEYS[4], ARGV[2]) end
+            for i = 5, #KEYS do redis.call('PEXPIRE', KEYS[i], ARGV[2]) end
             return 1
         "#,
         );
-        let _: i64 = self
-            .run_script(
-                script
-                    .key(task_key(&task.id))
-                    .key(active_set_key())
-                    .key(active_age_key())
-                    .key(record_active_key(&task.rp_id, &task.credential_id))
-                    .key(wallet_active_key(&task.wallet_ref))
-                    .arg(payload)
-                    .arg(TASK_DONE_TTL.as_millis() as u64)
-                    .arg(&task.id),
-            )
-            .await?;
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(task_key(&task.id))
+            .key(active_set_key())
+            .key(active_age_key())
+            .key(wallet_active_key(&task.wallet_ref));
+        for key in member_record_keys(task) {
+            invocation.key(key);
+        }
+        invocation
+            .arg(payload)
+            .arg(TASK_DONE_TTL.as_millis() as u64)
+            .arg(&task.id);
+        let _: i64 = self.run_script(&mut invocation).await?;
         Ok(())
     }
 
@@ -511,24 +539,27 @@ impl RedisStore {
             redis.call('ZREM', KEYS[3], ARGV[3])
             redis.call('SADD', KEYS[4], ARGV[3])
             if redis.call('GET', KEYS[5]) == ARGV[3] then redis.call('DEL', KEYS[5]) end
-            if redis.call('GET', KEYS[6]) == ARGV[3] then redis.call('DEL', KEYS[6]) end
+            for i = 6, #KEYS do
+                if redis.call('GET', KEYS[i]) == ARGV[3] then redis.call('DEL', KEYS[i]) end
+            end
             return 1
         "#,
         );
-        let _: i64 = self
-            .run_script(
-                script
-                    .key(task_key(&task.id))
-                    .key(active_set_key())
-                    .key(active_age_key())
-                    .key(dlq_set_key())
-                    .key(record_active_key(&task.rp_id, &task.credential_id))
-                    .key(wallet_active_key(&task.wallet_ref))
-                    .arg(payload)
-                    .arg(TASK_FAILED_TTL.as_millis() as u64)
-                    .arg(&task.id),
-            )
-            .await?;
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(task_key(&task.id))
+            .key(active_set_key())
+            .key(active_age_key())
+            .key(dlq_set_key())
+            .key(wallet_active_key(&task.wallet_ref));
+        for key in member_record_keys(task) {
+            invocation.key(key);
+        }
+        invocation
+            .arg(payload)
+            .arg(TASK_FAILED_TTL.as_millis() as u64)
+            .arg(&task.id);
+        let _: i64 = self.run_script(&mut invocation).await?;
         Ok(())
     }
 
@@ -597,6 +628,19 @@ fn record_active_key(rp_id: &str, credential_id: &str) -> String {
         escaped_hash(&format!("{rp_id}\0{credential_id}"))
     )
 }
+/// One in-flight placeholder key per credential the task will register: the
+/// members for a wallet task, the single flat credential otherwise.
+fn member_record_keys(task: &CreateTask) -> Vec<String> {
+    if task.is_wallet() {
+        task.members
+            .iter()
+            .map(|member| record_active_key(&task.rp_id, &member.credential_id))
+            .collect()
+    } else {
+        vec![record_active_key(&task.rp_id, &task.credential_id)]
+    }
+}
+
 fn wallet_active_key(wallet_ref: &str) -> String {
     format!(
         "p256-index:active:wallet:{}",

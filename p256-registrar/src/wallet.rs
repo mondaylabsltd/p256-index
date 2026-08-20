@@ -23,12 +23,65 @@ const WEBAUTHN_SIGNER: &str = "0x94a4F6affBd8975951142c3999aEAB7ecee555c2";
 const MULTI_SEND: &str = "0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526";
 const PROXY_CREATION_CODE: &str = "608060405234801561001057600080fd5b506040516101e63803806101e68339818101604052602081101561003357600080fd5b8101908080519060200190929190505050600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614156100ca576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260228152602001806101c46022913960400191505060405180910390fd5b806000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505060ab806101196000396000f3fe608060405273ffffffffffffffffffffffffffffffffffffffff600054167fa619486e0000000000000000000000000000000000000000000000000000000060003514156050578060005260206000f35b3660008037600080366000845af43d6000803e60008114156070573d6000fd5b3d6000f3fea264697066735822122003d1488ee65e08fa41e58e888a9865554c535f2c77126a82cb4c0f917f31441364736f6c63430007060033496e76616c69642073696e676c65746f6e20616464726573732070726f7669646564";
 
+/// V3 packed metadata convention: bytes32("VelaWalletV1") right-padded,
+/// followed by the wallet's ordered 65-byte uncompressed P-256 pubkeys.
+pub const METADATA_PREFIX: &[u8; 12] = b"VelaWalletV1";
+pub const MAX_METADATA_KEYS: usize = 21;
+const P256_KEY_LENGTH: usize = 65;
+
+fn metadata_prefix_word() -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[..METADATA_PREFIX.len()].copy_from_slice(METADATA_PREFIX);
+    word
+}
+
+/// Metadata for a single-key wallet: prefix word || the key itself.
 pub fn default_metadata(public_key: &str) -> Result<String> {
-    let public_key: Bytes = parse_hex_bytes(public_key)?.into();
+    let public_key = parse_hex_bytes(public_key)?;
     Ok(format!(
-        "0x{}",
-        hex::encode(("VelaWalletV1".to_owned(), public_key).abi_encode_params())
+        "0x{}{}",
+        hex::encode(metadata_prefix_word()),
+        hex::encode(public_key)
     ))
+}
+
+/// Metadata for an ordered key set: prefix word || pk1 || .. || pkN. This is
+/// exactly what the V3 contract's createWallet constructs on-chain, so the
+/// stored task metadata mirrors what every member record will carry.
+pub fn packed_metadata(public_keys: &[Vec<u8>]) -> String {
+    let mut out = format!("0x{}", hex::encode(metadata_prefix_word()));
+    for key in public_keys {
+        out.push_str(&hex::encode(key));
+    }
+    out
+}
+
+/// Parse and validate packed metadata, returning the ordered pubkey set.
+/// Mirrors the V3 contract's `_validateMetadata`: exact prefix word, length
+/// 32 + 65*N with 1 <= N <= 21, every key an uncompressed on-curve point.
+pub fn parse_metadata_keys(metadata: &str) -> Result<Vec<Vec<u8>>> {
+    let bytes = parse_hex_bytes(metadata)?;
+    if bytes.len() < 32 + P256_KEY_LENGTH || !(bytes.len() - 32).is_multiple_of(P256_KEY_LENGTH) {
+        bail!(
+            "metadata must be bytes32(\"VelaWalletV1\") followed by 1-{MAX_METADATA_KEYS} packed 65-byte public keys"
+        );
+    }
+    if bytes[..32] != metadata_prefix_word() {
+        bail!("metadata must start with bytes32(\"VelaWalletV1\")");
+    }
+    let keys: Vec<Vec<u8>> = bytes[32..]
+        .chunks(P256_KEY_LENGTH)
+        .map(<[u8]>::to_vec)
+        .collect();
+    if keys.len() > MAX_METADATA_KEYS {
+        bail!("metadata holds more than {MAX_METADATA_KEYS} public keys");
+    }
+    for key in &keys {
+        if key[0] != 4 || p256::PublicKey::from_sec1_bytes(key).is_err() {
+            bail!("every metadata public key must be a valid uncompressed P-256 point");
+        }
+    }
+    Ok(keys)
 }
 
 pub fn build_wallet_ref(public_key: &str) -> Result<String> {
@@ -129,8 +182,9 @@ fn encode_multisend_tx(to: Address, data: &[u8], operation: u8) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_wallet_ref, default_metadata};
+    use super::{build_wallet_ref, default_metadata, parse_metadata_keys};
     use crate::protocol::parse_hex_bytes;
+    use alloy::sol_types::SolValue;
 
     const GENERATOR: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
 
@@ -147,8 +201,50 @@ mod tests {
     }
 
     #[test]
-    fn encodes_the_documented_default_metadata() {
-        assert!(default_metadata(GENERATOR).unwrap().starts_with("0x"));
+    fn encodes_the_packed_default_metadata() {
+        let metadata = default_metadata(GENERATOR).unwrap();
+        // bytes32("VelaWalletV1") right-padded, then the raw 65-byte key.
+        assert!(metadata.starts_with("0x56656c6157616c6c65745631"));
+        assert_eq!(metadata.len(), 2 + 64 + 130);
+        let keys = parse_metadata_keys(&metadata).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(hex::encode(&keys[0]), GENERATOR);
         assert_eq!(parse_hex_bytes("0x00ff").unwrap(), vec![0, 255]);
+    }
+
+    #[test]
+    fn parses_multi_key_metadata_in_order() {
+        let single = default_metadata(GENERATOR).unwrap();
+        let two_keys = format!("{single}{GENERATOR}");
+        let keys = parse_metadata_keys(&two_keys).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(hex::encode(&keys[1]), GENERATOR);
+    }
+
+    #[test]
+    fn rejects_malformed_metadata() {
+        // Legacy V2 abi.encode encoding is no longer valid.
+        let key: alloy::primitives::Bytes = parse_hex_bytes(GENERATOR).unwrap().into();
+        let legacy = format!(
+            "0x{}",
+            hex::encode(("VelaWalletV1".to_owned(), key).abi_encode_params())
+        );
+        assert!(parse_metadata_keys(&legacy).is_err());
+
+        // Prefix word alone, truncated key, wrong prefix, too many keys.
+        let single = default_metadata(GENERATOR).unwrap();
+        assert!(parse_metadata_keys(&single[..2 + 64]).is_err());
+        assert!(parse_metadata_keys(&format!("{single}04aa")).is_err());
+        assert!(parse_metadata_keys(&single.replacen("56", "76", 1)).is_err());
+        let mut too_many = default_metadata(GENERATOR).unwrap();
+        for _ in 0..21 {
+            too_many.push_str(GENERATOR);
+        }
+        assert!(parse_metadata_keys(&too_many).is_err());
+
+        // Off-curve key body.
+        let mut off_curve = single.clone();
+        off_curve.replace_range(2 + 64 + 2..2 + 64 + 6, "aaaa");
+        assert!(parse_metadata_keys(&off_curve).is_err());
     }
 }

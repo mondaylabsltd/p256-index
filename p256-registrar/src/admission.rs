@@ -6,13 +6,17 @@
 //! program over serializable [`AdmissionOperation`]s:
 //!
 //! - validation with defaults (initialCredentialId ← credentialId, metadata ←
-//!   derived) and walletRef derivation/consistency;
+//!   derived) and walletRef derivation/consistency: metadata must follow the
+//!   packed V3 convention and contain this credential's publicKey; a
+//!   single-key wallet's ref is derived, a multi-key wallet's ref is taken
+//!   as supplied (the pubkey-set derivation is verified off-chain);
 //! - idempotent "already done" pre-checks: fresh record cache, then the
 //!   chain, with chain prechecks deliberately fail-open (legacy behaviour);
 //! - "a non-Failed in-flight task is a valid placeholder" — the rule finally
 //!   has a named home, [`is_active_placeholder`];
-//! - walletRef uniqueness across three sources (in-flight tasks, cache,
-//!   chain), preserving each site's exact conflict message;
+//! - the only remaining walletRef conflict is cross-version: a ref already
+//!   living in the frozen V2 index can never be re-bound in V3 (multiple V3
+//!   credentials sharing one walletRef is the normal multi-passkey case);
 //! - write gates: active queue depth and the global create rate;
 //! - the two-phase admission protocol: Redis admit (atomic three-way) →
 //!   Iggy enqueue → mark admitted. A failed enqueue keeps the Redis
@@ -31,12 +35,18 @@ use crux_core::{App, Command, command::CommandContext, macros::effect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::parse_b256;
-use crate::task::{CreateTask, TaskStatus};
-use crate::wallet::{build_wallet_ref, default_metadata};
+use crate::protocol::{parse_b256, parse_hex_bytes};
+use crate::task::{CreateTask, TaskStatus, WalletMember};
+use crate::wallet::{build_wallet_ref, default_metadata, packed_metadata, parse_metadata_keys};
 
 /// New creates are rejected while the active queue is at least this deep.
 pub const MAX_ACTIVE_QUEUE_DEPTH: u64 = 10_000;
+
+/// Gas ceiling for the atomic createWallet reveal: 7 members measure ~4.8M
+/// gas (metadata duplication makes the curve quadratic — 8 already costs
+/// ~5.9M, 13 exceeds the server's 12M signing cap). The contract itself
+/// allows up to 21, which physically cannot fit a Gnosis block (~27.5M).
+pub const MAX_WALLET_MEMBERS: usize = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +58,24 @@ pub struct CreateRequest {
     pub name: Option<String>,
     pub initial_credential_id: Option<String>,
     pub metadata: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletMemberRequest {
+    pub credential_id: Option<String>,
+    pub public_key: Option<String>,
+    pub name: Option<String>,
+}
+
+/// A multi-key wallet registration: N credentials land atomically through the
+/// contract's createWallet, under one commitment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWalletRequest {
+    pub rp_id: Option<String>,
+    pub wallet_ref: Option<String>,
+    pub members: Option<Vec<WalletMemberRequest>>,
 }
 
 /// "A non-Failed in-flight task is a valid placeholder." This rule used to be
@@ -84,7 +112,10 @@ pub enum AdmissionOperation {
         rp_id: String,
         credential_id: String,
     },
-    FetchChainRecordByWalletRef {
+    /// Probe the FROZEN V2 index directly. A hit under a different
+    /// (rpId, credentialId) is the cross-version wallet conflict — the only
+    /// walletRef conflict that still exists under V3's one-to-many model.
+    FetchV2RecordByWalletRef {
         wallet_ref: String,
     },
     /// Cache a record value. `best_effort` writes may fail silently (the
@@ -97,9 +128,6 @@ pub enum AdmissionOperation {
     FindTaskByRecord {
         rp_id: String,
         credential_id: String,
-    },
-    FindTaskByWalletRef {
-        wallet_ref: String,
     },
     QueueDepth,
     AllowGlobalCreate,
@@ -128,7 +156,6 @@ impl crux_core::capability::Operation for AdmissionOperation {
 pub enum AdmitOutcome {
     New,
     Existing { id: String },
-    WalletConflict,
 }
 
 // One result value exists per request at a time and lives microseconds;
@@ -201,6 +228,12 @@ pub enum AdmissionEvent {
         new_task_id: String,
         now_ms: u64,
     },
+    /// The multi-key wallet flavor of Submit (POST /api/create-wallet).
+    SubmitWallet {
+        request: CreateWalletRequest,
+        new_task_id: String,
+        now_ms: u64,
+    },
     Settled(AdmissionOutcome),
 }
 
@@ -239,6 +272,17 @@ impl App for AdmissionApp {
                 };
                 ctx.send_event(AdmissionEvent::Settled(outcome));
             }),
+            AdmissionEvent::SubmitWallet {
+                request,
+                new_task_id,
+                now_ms,
+            } => Command::new(|ctx| async move {
+                let outcome = match drive_wallet_admission(&ctx, request, new_task_id, now_ms).await
+                {
+                    Ok(outcome) | Err(outcome) => outcome,
+                };
+                ctx.send_event(AdmissionEvent::Settled(outcome));
+            }),
             AdmissionEvent::Settled(outcome) => {
                 model.outcome = Some(outcome);
                 Command::done()
@@ -267,10 +311,8 @@ fn redis_down() -> AdmissionOutcome {
     }
 }
 
-const CONFLICT_IN_FLIGHT: &str =
-    "this publicKey is already being registered under a different credential (walletRef conflict)";
-const CONFLICT_ON_CHAIN: &str =
-    "this publicKey is already registered under a different credential (walletRef conflict)";
+const CONFLICT_LEGACY_V2: &str =
+    "this walletRef is already registered in the legacy V2 index under a different credential";
 
 async fn request(ctx: &Ctx, operation: AdmissionOperation) -> AdmissionResult {
     ctx.request_from_shell(operation).await
@@ -339,7 +381,9 @@ async fn drive_admission(
         _ => return Err(redis_down()),
     }
 
-    // In-flight placeholders and walletRef uniqueness, three sources deep.
+    // In-flight placeholder for the same credential. Sibling credentials
+    // sharing a walletRef are the normal multi-passkey case in V3 — there is
+    // no in-flight walletRef conflict anymore.
     match request(
         ctx,
         AdmissionOperation::FindTaskByRecord {
@@ -358,26 +402,8 @@ async fn drive_admission(
         AdmissionResult::TaskFound { .. } => {}
         _ => return Err(redis_down()),
     }
-    match request(
-        ctx,
-        AdmissionOperation::FindTaskByWalletRef {
-            wallet_ref: input.wallet_ref.clone(),
-        },
-    )
-    .await
-    {
-        AdmissionResult::TaskFound { task: Some(task) }
-            if is_active_placeholder(&task)
-                && (task.rp_id != input.rp_id || task.credential_id != input.credential_id) =>
-        {
-            return Ok(AdmissionOutcome::WalletConflict {
-                wallet_ref: input.wallet_ref,
-                message: CONFLICT_IN_FLIGHT.to_owned(),
-            });
-        }
-        AdmissionResult::TaskFound { .. } => {}
-        _ => return Err(redis_down()),
-    }
+    // Wallet-keyed cache: only a hit for this exact credential short-circuits;
+    // a sibling credential's record is not a conflict.
     match request(
         ctx,
         AdmissionOperation::ReadCache {
@@ -392,31 +418,21 @@ async fn drive_admission(
             if same_record(&value, &input.rp_id, &input.credential_id) {
                 return Ok(AdmissionOutcome::AlreadyDone { record: value });
             }
-            return Ok(AdmissionOutcome::WalletConflict {
-                wallet_ref: input.wallet_ref,
-                message: CONFLICT_ON_CHAIN.to_owned(),
-            });
         }
         AdmissionResult::CacheMiss => {}
         _ => return Err(redis_down()),
     }
+    // Cross-version conflict: a walletRef living in the frozen V2 index can
+    // never be re-bound in V3 (the contract would revert WalletRefAlreadyExists).
     match request(
         ctx,
-        AdmissionOperation::FetchChainRecordByWalletRef {
+        AdmissionOperation::FetchV2RecordByWalletRef {
             wallet_ref: input.wallet_ref.clone(),
         },
     )
     .await
     {
         AdmissionResult::ChainRecord { value: Some(value) } => {
-            must_cache(
-                ctx,
-                CacheScope::Wallet {
-                    wallet_ref: input.wallet_ref.clone(),
-                },
-                value.clone(),
-            )
-            .await?;
             if same_record(&value, &input.rp_id, &input.credential_id) {
                 // Best-effort backfill of the record-keyed cache entry.
                 let _ = request(
@@ -435,7 +451,7 @@ async fn drive_admission(
             }
             return Ok(AdmissionOutcome::WalletConflict {
                 wallet_ref: input.wallet_ref,
-                message: CONFLICT_ON_CHAIN.to_owned(),
+                message: CONFLICT_LEGACY_V2.to_owned(),
             });
         }
         AdmissionResult::ChainRecord { value: None } => {}
@@ -468,6 +484,7 @@ async fn drive_admission(
         name: input.name,
         initial_credential_id: input.initial_credential_id,
         metadata: input.metadata,
+        members: Vec::new(),
         tx_hash: None,
         error: None,
         retries: 0,
@@ -475,12 +492,6 @@ async fn drive_admission(
         admitted: false,
     };
     match request(ctx, AdmissionOperation::Admit { task: task.clone() }).await {
-        AdmissionResult::Admitted(AdmitOutcome::WalletConflict) => {
-            Ok(AdmissionOutcome::WalletConflict {
-                wallet_ref: task.wallet_ref,
-                message: CONFLICT_IN_FLIGHT.to_owned(),
-            })
-        }
         AdmissionResult::Admitted(AdmitOutcome::Existing { id }) => {
             match request(ctx, AdmissionOperation::LoadTask { id }).await {
                 AdmissionResult::TaskFound {
@@ -497,6 +508,173 @@ async fn drive_admission(
         }
         AdmissionResult::Admitted(AdmitOutcome::New) => enqueue(ctx, task).await,
         _ => Err(redis_down()),
+    }
+}
+
+const CONFLICT_MEMBER_TAKEN: &str =
+    "a member credentialId is already registered under a different wallet";
+
+/// The multi-key wallet flavor of [`drive_admission`]: same operation
+/// vocabulary, per-member pre-checks, one task carrying the whole bundle.
+async fn drive_wallet_admission(
+    ctx: &Ctx,
+    create: CreateWalletRequest,
+    new_task_id: String,
+    now_ms: u64,
+) -> Flow<AdmissionOutcome> {
+    let input = match validate_create_wallet(create) {
+        Ok(input) => input,
+        Err(message) => return Ok(AdmissionOutcome::Invalid { message }),
+    };
+
+    match request(ctx, AdmissionOperation::AllowIpCreate).await {
+        AdmissionResult::Allowed { allowed: true } => {}
+        AdmissionResult::Allowed { allowed: false } => return Ok(AdmissionOutcome::RateLimited),
+        _ => return Err(redis_down()),
+    }
+
+    // Idempotent pre-checks, per member: a registered member under OUR
+    // walletRef means the wallet already exists (createWallet is atomic);
+    // under a different walletRef it is a terminal conflict. An active
+    // in-flight placeholder answers Queued (idempotent resubmit).
+    for member in &input.members {
+        match request(
+            ctx,
+            AdmissionOperation::ReadCache {
+                scope: CacheScope::Record {
+                    rp_id: input.rp_id.clone(),
+                    credential_id: member.credential_id.clone(),
+                },
+            },
+        )
+        .await
+        {
+            AdmissionResult::CacheHit { value } => return Ok(wallet_member_verdict(&input, value)),
+            AdmissionResult::CacheMiss => {}
+            _ => return Err(redis_down()),
+        }
+        match request(
+            ctx,
+            AdmissionOperation::FetchChainRecord {
+                rp_id: input.rp_id.clone(),
+                credential_id: member.credential_id.clone(),
+            },
+        )
+        .await
+        {
+            AdmissionResult::ChainRecord { value: Some(value) } => {
+                return Ok(wallet_member_verdict(&input, value));
+            }
+            AdmissionResult::ChainRecord { value: None } => {}
+            AdmissionResult::ChainReadFailed => {}
+            _ => return Err(redis_down()),
+        }
+        match request(
+            ctx,
+            AdmissionOperation::FindTaskByRecord {
+                rp_id: input.rp_id.clone(),
+                credential_id: member.credential_id.clone(),
+            },
+        )
+        .await
+        {
+            AdmissionResult::TaskFound { task: Some(task) } if is_active_placeholder(&task) => {
+                return Ok(AdmissionOutcome::Queued {
+                    id: task.id,
+                    status: task.status,
+                });
+            }
+            AdmissionResult::TaskFound { .. } => {}
+            _ => return Err(redis_down()),
+        }
+    }
+
+    // Cross-version conflict: a walletRef living in the frozen V2 index can
+    // never be claimed by V3's createWallet.
+    match request(
+        ctx,
+        AdmissionOperation::FetchV2RecordByWalletRef {
+            wallet_ref: input.wallet_ref.clone(),
+        },
+    )
+    .await
+    {
+        AdmissionResult::ChainRecord { value: Some(_) } => {
+            return Ok(AdmissionOutcome::WalletConflict {
+                wallet_ref: input.wallet_ref,
+                message: CONFLICT_LEGACY_V2.to_owned(),
+            });
+        }
+        AdmissionResult::ChainRecord { value: None } => {}
+        AdmissionResult::ChainReadFailed => {}
+        _ => return Err(redis_down()),
+    }
+
+    // Write gates.
+    match request(ctx, AdmissionOperation::QueueDepth).await {
+        AdmissionResult::Depth { depth } if depth >= MAX_ACTIVE_QUEUE_DEPTH => {
+            return Ok(AdmissionOutcome::Busy);
+        }
+        AdmissionResult::Depth { .. } => {}
+        _ => return Err(redis_down()),
+    }
+    match request(ctx, AdmissionOperation::AllowGlobalCreate).await {
+        AdmissionResult::Allowed { allowed: true } => {}
+        AdmissionResult::Allowed { allowed: false } => return Ok(AdmissionOutcome::Busy),
+        _ => return Err(redis_down()),
+    }
+
+    // Two-phase admission: the flat fields mirror members[0] so single-record
+    // paths (placeholders, reconciliation, disclosure) keep working.
+    let first = input.members[0].clone();
+    let task = CreateTask {
+        id: new_task_id,
+        status: TaskStatus::Pending,
+        rp_id: input.rp_id,
+        credential_id: first.credential_id.clone(),
+        wallet_ref: input.wallet_ref,
+        public_key: first.public_key,
+        name: first.name,
+        initial_credential_id: first.credential_id,
+        metadata: input.metadata,
+        members: input.members,
+        tx_hash: None,
+        error: None,
+        retries: 0,
+        created_at: now_ms as i64,
+        admitted: false,
+    };
+    match request(ctx, AdmissionOperation::Admit { task: task.clone() }).await {
+        AdmissionResult::Admitted(AdmitOutcome::Existing { id }) => {
+            match request(ctx, AdmissionOperation::LoadTask { id }).await {
+                AdmissionResult::TaskFound {
+                    task: Some(existing),
+                } if existing.admitted => Ok(AdmissionOutcome::Queued {
+                    id: existing.id,
+                    status: existing.status,
+                }),
+                AdmissionResult::TaskFound {
+                    task: Some(existing),
+                } => enqueue(ctx, existing).await,
+                _ => Err(redis_down()),
+            }
+        }
+        AdmissionResult::Admitted(AdmitOutcome::New) => enqueue(ctx, task).await,
+        _ => Err(redis_down()),
+    }
+}
+
+/// The verdict for a wallet request when one of its members already has a
+/// record: same walletRef means the wallet exists (createWallet is atomic),
+/// anything else is a terminal conflict.
+fn wallet_member_verdict(input: &ValidWallet, value: Value) -> AdmissionOutcome {
+    if value.get("walletRef").and_then(Value::as_str) == Some(input.wallet_ref.as_str()) {
+        AdmissionOutcome::AlreadyDone { record: value }
+    } else {
+        AdmissionOutcome::WalletConflict {
+            wallet_ref: input.wallet_ref.clone(),
+            message: CONFLICT_MEMBER_TAKEN.to_owned(),
+        }
     }
 }
 
@@ -586,6 +764,21 @@ pub fn validate_create(request: CreateRequest) -> Result<ValidCreate, String> {
     if let Some(metadata) = request.metadata.as_deref() {
         validate_metadata(metadata)?;
     }
+    let metadata = match request.metadata {
+        Some(metadata) => metadata,
+        None => default_metadata(&public_key).map_err(|error| error.to_string())?,
+    };
+    // createRecord is the SINGLE-key path: metadata must be exactly the prefix
+    // word plus this credential's own key — the V3 contract enforces the same
+    // rule on-chain. Multi-key wallets register atomically via createWallet.
+    let metadata_keys = parse_metadata_keys(&metadata).map_err(|error| error.to_string())?;
+    let own_key = parse_hex_bytes(&public_key).map_err(|error| error.to_string())?;
+    if metadata_keys.len() != 1 || metadata_keys[0] != own_key {
+        return Err(
+            "metadata must carry exactly this credential's publicKey; multi-key wallets register via createWallet"
+                .into(),
+        );
+    }
     let wallet_ref = build_wallet_ref(&public_key).map_err(|error| error.to_string())?;
     if let Some(supplied) = request.wallet_ref
         && supplied.to_ascii_lowercase() != wallet_ref
@@ -595,10 +788,6 @@ pub fn validate_create(request: CreateRequest) -> Result<ValidCreate, String> {
     let initial_credential_id = request
         .initial_credential_id
         .unwrap_or_else(|| credential_id.clone());
-    let metadata = match request.metadata {
-        Some(metadata) => metadata,
-        None => default_metadata(&public_key).map_err(|error| error.to_string())?,
-    };
     Ok(ValidCreate {
         rp_id,
         credential_id,
@@ -606,6 +795,77 @@ pub fn validate_create(request: CreateRequest) -> Result<ValidCreate, String> {
         public_key,
         name,
         initial_credential_id,
+        metadata,
+    })
+}
+
+#[derive(Debug)]
+pub struct ValidWallet {
+    pub rp_id: String,
+    pub wallet_ref: String,
+    pub members: Vec<WalletMember>,
+    pub metadata: String,
+}
+
+pub fn validate_create_wallet(request: CreateWalletRequest) -> Result<ValidWallet, String> {
+    let (Some(rp_id), Some(wallet_ref), Some(members)) =
+        (request.rp_id, request.wallet_ref, request.members)
+    else {
+        return Err("rpId, walletRef, and members are required".into());
+    };
+    if rp_id.is_empty() {
+        return Err("rpId, walletRef, and members are required".into());
+    }
+    validate_strings(&[("rpId", &rp_id, 253)])?;
+    if members.is_empty() || members.len() > MAX_WALLET_MEMBERS {
+        return Err(format!(
+            "members must contain 1 to {MAX_WALLET_MEMBERS} entries"
+        ));
+    }
+    validate_wallet_ref(&wallet_ref)?;
+    let raw_ref = wallet_ref.strip_prefix("0x").unwrap_or(&wallet_ref);
+    if raw_ref.bytes().all(|byte| byte == b'0') {
+        return Err("walletRef must not be zero".into());
+    }
+    // Normalized to 0x + lowercase so Redis keys and caches never fragment.
+    let wallet_ref = format!("0x{}", raw_ref.to_ascii_lowercase());
+
+    let mut parsed = Vec::with_capacity(members.len());
+    let mut seen = std::collections::HashSet::new();
+    for member in members {
+        let (Some(credential_id), Some(public_key), Some(name)) =
+            (member.credential_id, member.public_key, member.name)
+        else {
+            return Err("every member needs credentialId, publicKey, and name".into());
+        };
+        if credential_id.is_empty() || public_key.is_empty() || name.is_empty() {
+            return Err("every member needs credentialId, publicKey, and name".into());
+        }
+        validate_strings(&[
+            ("credentialId", &credential_id, 1024),
+            ("publicKey", &public_key, 130),
+            ("name", &name, 256),
+        ])?;
+        validate_public_key(&public_key)?;
+        if !seen.insert(credential_id.clone()) {
+            return Err("members must not repeat a credentialId".into());
+        }
+        parsed.push(WalletMember {
+            credential_id,
+            public_key,
+            name,
+        });
+    }
+    let keys = parsed
+        .iter()
+        .map(|member| parse_hex_bytes(&member.public_key))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let metadata = packed_metadata(&keys);
+    Ok(ValidWallet {
+        rp_id,
+        wallet_ref,
+        members: parsed,
         metadata,
     })
 }
@@ -618,6 +878,11 @@ fn validate_public_key(value: &str) -> Result<(), String> {
     if raw.len() != 130 || !raw.starts_with("04") {
         return Err("publicKey must be an uncompressed P-256 point (04 + 64-byte X/Y)".into());
     }
+    // Check the point itself here so the field-specific message fires before
+    // any metadata-level validation of the same key.
+    let bytes = hex::decode(raw).map_err(|_| "publicKey must be a valid hex string".to_owned())?;
+    p256::PublicKey::from_sec1_bytes(&bytes)
+        .map_err(|_| "publicKey must be a valid point on the P-256 curve".to_owned())?;
     Ok(())
 }
 
@@ -648,8 +913,10 @@ pub fn validate_wallet_ref(value: &str) -> Result<(), String> {
 }
 
 fn validate_metadata(value: &str) -> Result<(), String> {
-    if value.len() > 4096 {
-        return Err("metadata exceeds max length (4096)".into());
+    // 1397 metadata bytes (the V3 on-chain cap: 32-byte prefix + 21 keys)
+    // = 2794 hex chars, plus an optional 0x.
+    if value.len() > 2796 {
+        return Err("metadata exceeds max length (2796)".into());
     }
     let raw = value.strip_prefix("0x").unwrap_or(value);
     if !raw.len().is_multiple_of(2) {
@@ -672,6 +939,18 @@ mod tests {
 
     // A valid uncompressed P-256 generator point, as used by the wallet tests.
     const KEY: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+    // A second valid P-256 point (borrowed from the contract test fixtures).
+    const KEY2: &str = "04550f471003f3df97c3df506ac797f6721fb1a1fb7b8f6f83d224498a65c88e24136093d7012e509a73715cbd0b00a3cc0ff4b5c01b3ffa196ab1fb327036b8e6";
+
+    /// The pre-V3 abi.encode("VelaWalletV1", pk) metadata encoding.
+    fn legacy_metadata() -> String {
+        use alloy::sol_types::SolValue;
+        let key: alloy::primitives::Bytes = parse_hex_bytes(KEY).unwrap().into();
+        format!(
+            "0x{}",
+            hex::encode(("VelaWalletV1".to_owned(), key).abi_encode_params())
+        )
+    }
 
     // ── Test driver (same shape as commit_reveal's) ────────────────────────
 
@@ -774,6 +1053,7 @@ mod tests {
             name: "n".into(),
             initial_credential_id: "cred-1".into(),
             metadata: "0x00".into(),
+            members: Vec::new(),
             tx_hash: None,
             error: None,
             retries: 0,
@@ -783,8 +1063,8 @@ mod tests {
     }
 
     /// Walk the request up to (and including) the pre-checks that find
-    /// nothing: rate limit ok, cache miss, chain empty, no in-flight tasks,
-    /// wallet cache miss, wallet chain empty.
+    /// nothing: rate limit ok, cache miss, chain empty, no in-flight task for
+    /// this credential, wallet cache miss, no legacy V2 record.
     fn walk_clean_prechecks(driver: &mut Driver) {
         driver.step(
             AdmissionOperation::AllowIpCreate,
@@ -811,19 +1091,13 @@ mod tests {
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
             AdmissionOperation::ReadCache {
                 scope: wallet_scope(),
             },
             AdmissionResult::CacheMiss,
         );
         driver.step(
-            AdmissionOperation::FetchChainRecordByWalletRef {
+            AdmissionOperation::FetchV2RecordByWalletRef {
                 wallet_ref: derived_wallet_ref(),
             },
             AdmissionResult::ChainRecord { value: None },
@@ -841,6 +1115,7 @@ mod tests {
             name: "n".into(),
             initial_credential_id: "cred-1".into(),
             metadata: default_metadata(KEY).unwrap(),
+            members: Vec::new(),
             tx_hash: None,
             error: None,
             retries: 0,
@@ -857,6 +1132,111 @@ mod tests {
         assert_eq!(input.wallet_ref, derived_wallet_ref());
         assert_eq!(input.initial_credential_id, "cred-1");
         assert_eq!(input.metadata, default_metadata(KEY).unwrap());
+    }
+
+    #[test]
+    fn validate_wallet_requests() {
+        let base = CreateWalletRequest {
+            rp_id: Some("example.com".into()),
+            wallet_ref: Some(format!("0x{}", "AB".repeat(32))),
+            members: Some(vec![
+                WalletMemberRequest {
+                    credential_id: Some("cred-1".into()),
+                    public_key: Some(KEY.into()),
+                    name: Some("A".into()),
+                },
+                WalletMemberRequest {
+                    credential_id: Some("cred-2".into()),
+                    public_key: Some(KEY2.into()),
+                    name: Some("B".into()),
+                },
+            ]),
+        };
+
+        let input = validate_create_wallet(base.clone()).expect("valid wallet request");
+        assert_eq!(input.wallet_ref, format!("0x{}", "ab".repeat(32)));
+        assert_eq!(input.members.len(), 2);
+        // Packed derivation preimage: prefix word + both keys, in order.
+        assert!(input.metadata.starts_with("0x56656c6157616c6c65745631"));
+        assert_eq!(input.metadata.len(), 2 + 64 + 130 * 2);
+        assert!(input.metadata.ends_with(KEY2));
+
+        let mut duplicate = base.clone();
+        duplicate.members.as_mut().unwrap()[1].credential_id = Some("cred-1".into());
+        assert_eq!(
+            validate_create_wallet(duplicate).unwrap_err(),
+            "members must not repeat a credentialId"
+        );
+
+        let mut zero_ref = base.clone();
+        zero_ref.wallet_ref = Some(format!("0x{}", "0".repeat(64)));
+        assert_eq!(
+            validate_create_wallet(zero_ref).unwrap_err(),
+            "walletRef must not be zero"
+        );
+
+        let mut too_many = base.clone();
+        too_many.members = Some(
+            (0..MAX_WALLET_MEMBERS + 1)
+                .map(|i| WalletMemberRequest {
+                    credential_id: Some(format!("cred-{i}")),
+                    public_key: Some(KEY.into()),
+                    name: Some("K".into()),
+                })
+                .collect(),
+        );
+        assert!(
+            validate_create_wallet(too_many)
+                .unwrap_err()
+                .starts_with("members must contain 1 to")
+        );
+
+        let mut missing_field = base.clone();
+        missing_field.members.as_mut().unwrap()[0].name = None;
+        assert_eq!(
+            validate_create_wallet(missing_field).unwrap_err(),
+            "every member needs credentialId, publicKey, and name"
+        );
+
+        let mut off_curve = base;
+        off_curve.members.as_mut().unwrap()[0].public_key = Some(format!("04aa{}", &KEY[4..]));
+        assert_eq!(
+            validate_create_wallet(off_curve).unwrap_err(),
+            "publicKey must be a valid point on the P-256 curve"
+        );
+    }
+
+    #[test]
+    fn validation_single_key_path_rejects_foreign_or_multi_key_metadata() {
+        const SINGLE_PATH_ERROR: &str = "metadata must carry exactly this credential's publicKey; multi-key wallets register via createWallet";
+
+        // Two keys: the single-key path refuses, even with a supplied walletRef.
+        let two_keys = format!("{}{KEY}", default_metadata(KEY).unwrap());
+        let multi = CreateRequest {
+            metadata: Some(two_keys),
+            wallet_ref: Some(format!("0x{}", "ab".repeat(32))),
+            ..valid_request()
+        };
+        assert_eq!(validate_create(multi).unwrap_err(), SINGLE_PATH_ERROR);
+
+        // A single key that is not this credential's own key.
+        let foreign = CreateRequest {
+            metadata: Some(default_metadata(KEY).unwrap()),
+            public_key: Some(KEY2.into()),
+            ..valid_request()
+        };
+        assert_eq!(validate_create(foreign).unwrap_err(), SINGLE_PATH_ERROR);
+
+        // The legacy abi.encode metadata is rejected outright (structure error).
+        let legacy = CreateRequest {
+            metadata: Some(legacy_metadata()),
+            ..valid_request()
+        };
+        assert!(
+            validate_create(legacy)
+                .unwrap_err()
+                .starts_with("metadata must be")
+        );
     }
 
     #[test]
@@ -1115,19 +1495,13 @@ mod tests {
         );
         // Continues to the wallet lookup instead of returning Queued.
         driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
             AdmissionOperation::ReadCache {
                 scope: wallet_scope(),
             },
             AdmissionResult::CacheMiss,
         );
         driver.step(
-            AdmissionOperation::FetchChainRecordByWalletRef {
+            AdmissionOperation::FetchV2RecordByWalletRef {
                 wallet_ref: derived_wallet_ref(),
             },
             AdmissionResult::ChainRecord { value: None },
@@ -1169,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_task_conflict_uses_the_in_flight_message() {
+    fn wallet_cache_hit_for_the_same_credential_answers_done() {
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
@@ -1194,68 +1568,25 @@ mod tests {
                 credential_id: "cred-1".into(),
             },
             AdmissionResult::TaskFound { task: None },
-        );
-        let mut other = in_flight("other", TaskStatus::Pending);
-        other.credential_id = "cred-other".into();
-        driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound { task: Some(other) },
-        );
-        driver.assert_settled(AdmissionOutcome::WalletConflict {
-            wallet_ref: derived_wallet_ref(),
-            message: CONFLICT_IN_FLIGHT.into(),
-        });
-    }
-
-    #[test]
-    fn wallet_task_for_the_same_credential_is_not_a_conflict() {
-        // Same rp_id + credential_id under the wallet index: fall through.
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound {
-                task: Some(in_flight("same", TaskStatus::Pending)),
-            },
         );
         driver.step(
             AdmissionOperation::ReadCache {
                 scope: wallet_scope(),
             },
-            AdmissionResult::CacheMiss,
+            AdmissionResult::CacheHit {
+                value: record_value(),
+            },
         );
-        // Reaching the wallet-cache read proves the conflict arm was skipped.
+        driver.assert_settled(AdmissionOutcome::AlreadyDone {
+            record: record_value(),
+        });
     }
 
     #[test]
-    fn wallet_cache_hit_splits_on_same_record() {
+    fn wallet_cache_hit_for_a_sibling_credential_falls_through() {
+        // Under V3 a wallet legitimately spans several credentials: a cached
+        // sibling record is NOT a conflict — the request proceeds to the V2
+        // probe and the write gates.
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
@@ -1278,12 +1609,6 @@ mod tests {
             AdmissionOperation::FindTaskByRecord {
                 rp_id: "example.com".into(),
                 credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
             },
             AdmissionResult::TaskFound { task: None },
         );
@@ -1295,9 +1620,65 @@ mod tests {
                 value: other_record_value(),
             },
         );
+        driver.step(
+            AdmissionOperation::FetchV2RecordByWalletRef {
+                wallet_ref: derived_wallet_ref(),
+            },
+            AdmissionResult::ChainRecord { value: None },
+        );
+        driver.step(
+            AdmissionOperation::QueueDepth,
+            AdmissionResult::Depth { depth: 0 },
+        );
+        // Reaching the depth gate proves the sibling record did not conflict.
+    }
+
+    #[test]
+    fn legacy_v2_record_under_a_different_credential_conflicts() {
+        // The one surviving walletRef conflict: the ref already lives in the
+        // frozen V2 index bound to another credential.
+        let mut driver = Driver::submit(valid_request());
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::ReadCache {
+                scope: record_scope(),
+            },
+            AdmissionResult::CacheMiss,
+        );
+        driver.step(
+            AdmissionOperation::FetchChainRecord {
+                rp_id: "example.com".into(),
+                credential_id: "cred-1".into(),
+            },
+            AdmissionResult::ChainRecord { value: None },
+        );
+        driver.step(
+            AdmissionOperation::FindTaskByRecord {
+                rp_id: "example.com".into(),
+                credential_id: "cred-1".into(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+        driver.step(
+            AdmissionOperation::ReadCache {
+                scope: wallet_scope(),
+            },
+            AdmissionResult::CacheMiss,
+        );
+        driver.step(
+            AdmissionOperation::FetchV2RecordByWalletRef {
+                wallet_ref: derived_wallet_ref(),
+            },
+            AdmissionResult::ChainRecord {
+                value: Some(other_record_value()),
+            },
+        );
         driver.assert_settled(AdmissionOutcome::WalletConflict {
             wallet_ref: derived_wallet_ref(),
-            message: CONFLICT_ON_CHAIN.into(),
+            message: CONFLICT_LEGACY_V2.into(),
         });
     }
 
@@ -1329,36 +1710,21 @@ mod tests {
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
             AdmissionOperation::ReadCache {
                 scope: wallet_scope(),
             },
             AdmissionResult::CacheMiss,
         );
         driver.step(
-            AdmissionOperation::FetchChainRecordByWalletRef {
+            AdmissionOperation::FetchV2RecordByWalletRef {
                 wallet_ref: derived_wallet_ref(),
             },
             AdmissionResult::ChainRecord {
                 value: Some(record_value()),
             },
         );
-        // The wallet-cache write must succeed…
-        driver.step(
-            AdmissionOperation::StoreCache {
-                scope: wallet_scope(),
-                value: record_value(),
-                best_effort: false,
-            },
-            AdmissionResult::Persisted,
-        );
-        // …while the record-cache backfill is best-effort: its failure must
-        // not change the outcome.
+        // The record-cache backfill is best-effort: its failure must not
+        // change the outcome.
         driver.step(
             AdmissionOperation::StoreCache {
                 scope: record_scope(),
@@ -1401,19 +1767,13 @@ mod tests {
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
             AdmissionOperation::ReadCache {
                 scope: wallet_scope(),
             },
             AdmissionResult::CacheMiss,
         );
         driver.step(
-            AdmissionOperation::FetchChainRecordByWalletRef {
+            AdmissionOperation::FetchV2RecordByWalletRef {
                 wallet_ref: derived_wallet_ref(),
             },
             AdmissionResult::ChainReadFailed,
@@ -1619,30 +1979,6 @@ mod tests {
     }
 
     #[test]
-    fn admission_wallet_conflict_uses_the_in_flight_message() {
-        let mut driver = Driver::submit(valid_request());
-        walk_clean_prechecks(&mut driver);
-        driver.step(
-            AdmissionOperation::QueueDepth,
-            AdmissionResult::Depth { depth: 0 },
-        );
-        driver.step(
-            AdmissionOperation::AllowGlobalCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::Admit {
-                task: expected_new_task(),
-            },
-            AdmissionResult::Admitted(AdmitOutcome::WalletConflict),
-        );
-        driver.assert_settled(AdmissionOutcome::WalletConflict {
-            wallet_ref: derived_wallet_ref(),
-            message: CONFLICT_IN_FLIGHT.into(),
-        });
-    }
-
-    #[test]
     fn mark_admitted_losing_the_task_is_a_redis_dependency_error() {
         let mut driver = Driver::submit(valid_request());
         walk_clean_prechecks(&mut driver);
@@ -1682,24 +2018,20 @@ mod tests {
     // Each test below pins a branch a mutation-testing pass found unguarded.
 
     #[test]
-    fn conflict_messages_are_pinned_literally() {
-        // The two 409 messages are a published API surface; the scenario
-        // tests assert which constant each site uses, this one asserts what
-        // the constants actually say.
+    fn conflict_message_is_pinned_literally() {
+        // The 409 message is a published API surface; the scenario tests
+        // assert which constant the site uses, this one asserts what the
+        // constant actually says.
         assert_eq!(
-            CONFLICT_IN_FLIGHT,
-            "this publicKey is already being registered under a different credential (walletRef conflict)"
-        );
-        assert_eq!(
-            CONFLICT_ON_CHAIN,
-            "this publicKey is already registered under a different credential (walletRef conflict)"
+            CONFLICT_LEGACY_V2,
+            "this walletRef is already registered in the legacy V2 index under a different credential"
         );
     }
 
     #[test]
-    fn same_rp_with_other_credential_is_still_a_wallet_conflict() {
-        // same_record must compare BOTH fields: a record under the same rpId
-        // but another credential is a conflict, not an AlreadyDone.
+    fn same_rp_with_other_credential_in_v2_is_still_a_wallet_conflict() {
+        // same_record must compare BOTH fields: a legacy V2 record under the
+        // same rpId but another credential is a conflict, not an AlreadyDone.
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
@@ -1726,22 +2058,22 @@ mod tests {
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
             AdmissionOperation::ReadCache {
                 scope: wallet_scope(),
             },
-            AdmissionResult::CacheHit {
-                value: json!({ "rpId": "example.com", "credentialId": "cred-x" }),
+            AdmissionResult::CacheMiss,
+        );
+        driver.step(
+            AdmissionOperation::FetchV2RecordByWalletRef {
+                wallet_ref: derived_wallet_ref(),
+            },
+            AdmissionResult::ChainRecord {
+                value: Some(json!({ "rpId": "example.com", "credentialId": "cred-x" })),
             },
         );
         driver.assert_settled(AdmissionOutcome::WalletConflict {
             wallet_ref: derived_wallet_ref(),
-            message: CONFLICT_ON_CHAIN.into(),
+            message: CONFLICT_LEGACY_V2.into(),
         });
     }
 
@@ -1790,54 +2122,6 @@ mod tests {
         assert_eq!(
             validate_create(doubly_invalid).unwrap_err(),
             "publicKey exceeds max length (130)"
-        );
-    }
-
-    #[test]
-    fn failed_task_at_the_wallet_index_is_not_a_placeholder_either() {
-        // The is_active_placeholder guard applies at BOTH task lookups: a
-        // Failed task under another credential must not 409 the request.
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: record_scope(),
-            },
-            AdmissionResult::CacheMiss,
-        );
-        driver.step(
-            AdmissionOperation::FetchChainRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::ChainRecord { value: None },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByRecord {
-                rp_id: "example.com".into(),
-                credential_id: "cred-1".into(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        let mut failed_other = in_flight("failed-other", TaskStatus::Failed);
-        failed_other.credential_id = "cred-other".into();
-        driver.step(
-            AdmissionOperation::FindTaskByWalletRef {
-                wallet_ref: derived_wallet_ref(),
-            },
-            AdmissionResult::TaskFound {
-                task: Some(failed_other),
-            },
-        );
-        // Reaching the wallet-cache read proves the conflict arm was skipped.
-        driver.step(
-            AdmissionOperation::ReadCache {
-                scope: wallet_scope(),
-            },
-            AdmissionResult::CacheMiss,
         );
     }
 

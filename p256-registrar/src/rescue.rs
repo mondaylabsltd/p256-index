@@ -16,12 +16,16 @@
 //!   rows beyond the budget keep escalating but are not replaced this round;
 //! - rows are processed in ascending nonce order (the jam clears front to
 //!   back);
-//! - a replacement is a same-nonce, zero-value self-transfer at
-//!   [`bump_gas`] (150%) of the current network gas price; on success the
-//!   ledger row is rewritten with the cancel hash, a fresh timestamp and an
-//!   incremented attempt count, so the next attempt waits a full window.
-
-use alloy::primitives::U256;
+//! - a replacement is a same-nonce, zero-value self-transfer priced by
+//!   [`crate::gas::plan_replacement`] against *the stuck transaction's own
+//!   fee* (carried here as `previous_max_fee_wei`); on success the ledger row
+//!   is rewritten with the cancel hash, a fresh timestamp and an incremented
+//!   attempt count, so the next attempt waits a full window.
+//!
+//!   Pricing against the current market instead — which is what this module
+//!   used to do — makes the ladder non-monotonic: when the market falls below
+//!   the stuck transaction's price, every replacement is rejected as
+//!   `replacement transaction underpriced` and the nonce never clears.
 
 /// A broadcast older than this whose nonce is still un-mined is treated as stuck.
 pub const STUCK_TX_AGE_MS: u64 = 2 * 60 * 1_000;
@@ -29,9 +33,6 @@ pub const MAX_UNSTICK_PER_CYCLE: usize = 5;
 /// Page after this many failed replacements of one nonce, or once it has been stuck this long.
 pub const UNSTICK_ALERT_ATTEMPTS: u32 = 5;
 pub const UNSTICK_ALERT_AGE_MS: u64 = 10 * 60 * 1_000;
-/// Replacement gas price = 150% of the current network gas price.
-pub const CANCEL_GAS_NUM: u64 = 150;
-pub const CANCEL_GAS_DEN: u64 = 100;
 
 /// One broadcast-ledger row, as the store projects it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,10 @@ pub struct LedgerRow {
     pub hash: String,
     pub sent_at_ms: u64,
     pub attempts: u32,
+    /// The fee pair this broadcast was signed with (`max_fee`, `priority`).
+    /// `None` for rows written before the ledger recorded fees; the sweep then
+    /// escalates blind, by attempt count.
+    pub fees_wei: Option<(u128, u128)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,13 +55,14 @@ pub enum RescueAction {
     /// Page the operator (subject to the shell's alert throttle).
     Escalate { message: String },
     /// Replace with a same-nonce cancel; on success the ledger row is
-    /// rewritten with `attempts_after`.
-    Replace { nonce: u64, attempts_after: u32 },
-}
-
-/// The replacement gas price: 150% of the current network price.
-pub fn bump_gas(price: U256) -> U256 {
-    price.saturating_mul(U256::from(CANCEL_GAS_NUM)) / U256::from(CANCEL_GAS_DEN)
+    /// rewritten with `attempts_after`. `previous_fees_wei` is the pair the
+    /// stuck broadcast used and is what the replacement must outbid on both
+    /// axes — see [`crate::gas::plan_replacement`].
+    Replace {
+        nonce: u64,
+        attempts_after: u32,
+        previous_fees_wei: Option<(u128, u128)>,
+    },
 }
 
 /// Plan one role's sweep over the ledger. `ledger` may contain rows of any
@@ -90,6 +96,7 @@ pub fn plan_role_sweep(
         actions.push(RescueAction::Replace {
             nonce: row.nonce,
             attempts_after: row.attempts + 1,
+            previous_fees_wei: row.fees_wei,
         });
     }
     actions
@@ -118,6 +125,7 @@ mod tests {
             hash: format!("0x{nonce:x}"),
             sent_at_ms,
             attempts,
+            fees_wei: Some((20_000, 1_000)),
         }
     }
 
@@ -138,7 +146,8 @@ mod tests {
             actions,
             vec![RescueAction::Replace {
                 nonce: 5,
-                attempts_after: 1
+                attempts_after: 1,
+                previous_fees_wei: Some((20_000, 1_000))
             }]
         );
     }
@@ -158,11 +167,13 @@ mod tests {
             vec![
                 RescueAction::Replace {
                     nonce: 3,
-                    attempts_after: 1
+                    attempts_after: 1,
+                    previous_fees_wei: Some((20_000, 1_000))
                 },
                 RescueAction::Replace {
                     nonce: 7,
-                    attempts_after: 1
+                    attempts_after: 1,
+                    previous_fees_wei: Some((20_000, 1_000))
                 },
             ]
         );
@@ -185,7 +196,8 @@ mod tests {
                 },
                 RescueAction::Replace {
                     nonce: 1,
-                    attempts_after: UNSTICK_ALERT_ATTEMPTS + 1
+                    attempts_after: UNSTICK_ALERT_ATTEMPTS + 1,
+                    previous_fees_wei: Some((20_000, 1_000))
                 },
             ]
         );
@@ -197,7 +209,8 @@ mod tests {
                 RescueAction::Escalate { .. },
                 RescueAction::Replace {
                     nonce: 2,
-                    attempts_after: 2
+                    attempts_after: 2,
+                    previous_fees_wei: Some((20_000, 1_000))
                 }
             ]
         ));
@@ -212,7 +225,8 @@ mod tests {
             quiet,
             vec![RescueAction::Replace {
                 nonce: 3,
-                attempts_after: UNSTICK_ALERT_ATTEMPTS
+                attempts_after: UNSTICK_ALERT_ATTEMPTS,
+                previous_fees_wei: Some((20_000, 1_000))
             }]
         );
     }
@@ -245,13 +259,5 @@ mod tests {
             "🛑 [webauthnp256-publickey-index] stuck create nonce 42 not clearing \
              (attempts 6, stuck ~12 min). Manual intervention may be required."
         );
-    }
-
-    #[test]
-    fn bump_gas_is_one_hundred_fifty_percent() {
-        assert_eq!(bump_gas(U256::from(100u64)), U256::from(150u64));
-        assert_eq!(bump_gas(U256::from(1u64)), U256::from(1u64)); // 1*150/100 = 1 (integer div)
-        // The multiply saturates instead of overflowing.
-        assert_eq!(bump_gas(U256::MAX), U256::MAX / U256::from(100u64));
     }
 }

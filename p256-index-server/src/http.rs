@@ -18,7 +18,7 @@ use uuid::Uuid;
 use p256_registrar::{
     admission::{
         AdmissionApp, AdmissionEffect, AdmissionEvent, AdmissionOperation, AdmissionOutcome,
-        AdmissionResult, AdmitOutcome, CacheScope, CreateRequest,
+        AdmissionResult, AdmitOutcome, CacheScope, CreateRequest, CreateWalletRequest,
     },
     lookup::{
         LookupApp, LookupCacheKey, LookupEffect, LookupEndpoint, LookupEvent, LookupOperation,
@@ -91,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/challenge", get(challenge))
         .route("/api/query", get(query_record))
         .route("/api/create", post(create))
+        .route("/api/create-wallet", post(create_wallet))
         .route("/api/create/", get(create_status_missing))
         .route("/api/create/{id}", get(create_status))
         .route("/api/stats/total", get(total_credentials))
@@ -156,7 +157,7 @@ async fn health(State(state): State<AppState>) -> Response {
                 "service": "webauthn-p256-publickey-index",
                 "version": "1.0.0",
                 "chainId": CHAIN_ID,
-                "contract": p256_registrar::protocol::CONTRACT_ADDRESS,
+                "contract": state.chain.index_address(),
                 "rpcCircuit": state.chain.rpc_circuit_state(),
                 "telegramConfigured": state.telegram_configured,
                 "status": status,
@@ -177,7 +178,7 @@ async fn health(State(state): State<AppState>) -> Response {
                 "service": "webauthn-p256-publickey-index",
                 "version": "1.0.0",
                 "chainId": CHAIN_ID,
-                "contract": p256_registrar::protocol::CONTRACT_ADDRESS,
+                "contract": state.chain.index_address(),
                 "rpcCircuit": state.chain.rpc_circuit_state(),
                 "telegramConfigured": state.telegram_configured,
                 "status": "degraded",
@@ -225,6 +226,37 @@ async fn create(State(state): State<AppState>, request: Request) -> Response {
     render_admission(run_admission(&state, &ip_hash, request).await)
 }
 
+/// POST /api/create-wallet: register a multi-key wallet atomically (one
+/// commitment, one createWallet reveal). Same body limits, rate limits, and
+/// response vocabulary as /api/create.
+async fn create_wallet(State(state): State<AppState>, request: Request) -> Response {
+    let content_length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if request.headers().contains_key(header::CONTENT_LENGTH) && content_length.is_none() {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+    if content_length.is_some_and(|length| length > MAX_BODY_SIZE) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+    let ip = client_ip(request.headers());
+    let body = match to_bytes(request.into_body(), MAX_BODY_SIZE + 1).await {
+        Ok(body) if body.len() <= MAX_BODY_SIZE => body,
+        Ok(_) | Err(_) => {
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+        }
+    };
+    let request: CreateWalletRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
+    };
+
+    let ip_hash = hash_ip(&state.ip_hash_salt, &ip);
+    render_admission(run_wallet_admission(&state, &ip_hash, request).await)
+}
+
 /// Drive one create request through the admission Core. The shell supplies
 /// task identity and time, executes each operation against Redis / the chain
 /// / Iggy, and renders the outcome; every admission decision lives in
@@ -234,15 +266,43 @@ async fn run_admission(
     ip_hash: &str,
     request: CreateRequest,
 ) -> AdmissionOutcome {
-    let core: crux_core::Core<AdmissionApp> = crux_core::Core::new();
-    let mut effects: VecDeque<AdmissionEffect> = core
-        .process_event(AdmissionEvent::Submit {
+    drive_admission_event(
+        state,
+        ip_hash,
+        AdmissionEvent::Submit {
             request,
             new_task_id: Uuid::new_v4().to_string(),
             now_ms: now_ms(),
-        })
-        .into_iter()
-        .collect();
+        },
+    )
+    .await
+}
+
+/// Same Core, same operations, multi-key entry event.
+async fn run_wallet_admission(
+    state: &AppState,
+    ip_hash: &str,
+    request: CreateWalletRequest,
+) -> AdmissionOutcome {
+    drive_admission_event(
+        state,
+        ip_hash,
+        AdmissionEvent::SubmitWallet {
+            request,
+            new_task_id: Uuid::new_v4().to_string(),
+            now_ms: now_ms(),
+        },
+    )
+    .await
+}
+
+async fn drive_admission_event(
+    state: &AppState,
+    ip_hash: &str,
+    event: AdmissionEvent,
+) -> AdmissionOutcome {
+    let core: crux_core::Core<AdmissionApp> = crux_core::Core::new();
+    let mut effects: VecDeque<AdmissionEffect> = core.process_event(event).into_iter().collect();
     while let Some(effect) = effects.pop_front() {
         let AdmissionEffect::Work(mut request) = effect;
         let output = execute_admission(state, ip_hash, &request.operation).await;
@@ -292,11 +352,11 @@ async fn execute_admission(
             },
             Err(_) => AdmissionResult::ChainReadFailed,
         },
-        AdmissionOperation::FetchChainRecordByWalletRef { wallet_ref } => {
+        AdmissionOperation::FetchV2RecordByWalletRef { wallet_ref } => {
             let Ok(wallet_ref) = wallet_ref.parse() else {
                 return AdmissionResult::ChainReadFailed;
             };
-            match state.chain.get_record_by_wallet_ref(wallet_ref).await {
+            match state.chain.get_v2_record_by_wallet_ref(wallet_ref).await {
                 Ok(record) => AdmissionResult::ChainRecord {
                     value: record.as_ref().map(record_value),
                 },
@@ -325,12 +385,6 @@ async fn execute_admission(
             Ok(task) => AdmissionResult::TaskFound { task },
             Err(_) => AdmissionResult::StoreUnavailable,
         },
-        AdmissionOperation::FindTaskByWalletRef { wallet_ref } => {
-            match state.store.find_by_wallet_ref(wallet_ref).await {
-                Ok(task) => AdmissionResult::TaskFound { task },
-                Err(_) => AdmissionResult::StoreUnavailable,
-            }
-        }
         AdmissionOperation::QueueDepth => match state.store.queue_stats().await {
             Ok(stats) => AdmissionResult::Depth { depth: stats.depth },
             Err(_) => AdmissionResult::StoreUnavailable,
@@ -348,9 +402,6 @@ async fn execute_admission(
         AdmissionOperation::Admit { task } => match state.store.admit(task).await {
             Ok(Admission::New(_)) => AdmissionResult::Admitted(AdmitOutcome::New),
             Ok(Admission::Existing(id)) => AdmissionResult::Admitted(AdmitOutcome::Existing { id }),
-            Ok(Admission::WalletConflict(_)) => {
-                AdmissionResult::Admitted(AdmitOutcome::WalletConflict)
-            }
             Err(_) => AdmissionResult::StoreUnavailable,
         },
         AdmissionOperation::LoadTask { id } => match state.store.get_task(id).await {
@@ -552,7 +603,10 @@ async fn execute_lookup(
             }
         }
         LookupOperation::FetchTotal => match state.chain.total_credentials().await {
-            Ok(total) => LookupResult::Total { total },
+            Ok(total) => LookupResult::Total {
+                total,
+                wallets: state.chain.total_wallets().await.ok().flatten(),
+            },
             Err(_) => LookupResult::ChainReadFailed,
         },
         LookupOperation::FetchSites {
@@ -847,6 +901,10 @@ mod tests {
             "open"
         }
 
+        fn index_address(&self) -> String {
+            p256_registrar::protocol::CONTRACT_ADDRESS.to_ascii_lowercase()
+        }
+
         async fn get_record(&self, _: &str, _: &str) -> Result<Option<Record>, ChainError> {
             Err(ChainError::Unavailable)
         }
@@ -858,7 +916,18 @@ mod tests {
             Err(ChainError::Unavailable)
         }
 
+        async fn get_v2_record_by_wallet_ref(
+            &self,
+            _: alloy::primitives::B256,
+        ) -> Result<Option<Record>, ChainError> {
+            Err(ChainError::Unavailable)
+        }
+
         async fn total_credentials(&self) -> Result<u64, ChainError> {
+            Err(ChainError::Unavailable)
+        }
+
+        async fn total_wallets(&self) -> Result<Option<u64>, ChainError> {
             Err(ChainError::Unavailable)
         }
 
@@ -892,9 +961,11 @@ mod tests {
             queue_worker_enabled: false,
             telegram_bot_token: None,
             telegram_chat_id: None,
+            max_gas_price_wei: p256_registrar::gas::DEFAULT_MAX_FEE_WEI,
             global_write_limit: 10_000,
             iggy_enqueue_timeout: Duration::from_secs(1),
             iggy_consumer_group: "test".into(),
+            contract_address: None,
         }
     }
 
@@ -1017,16 +1088,21 @@ mod tests {
         assert!(status.get("credentialId").is_none());
         assert!(status.get("walletRef").is_none());
 
-        let conflict_body = json!({
+        // Under V3 a second credential sharing the same publicKey/walletRef is
+        // the normal multi-passkey case: admitted, never a 409.
+        let sibling_body = json!({
             "rpId": format!("other-{suffix}.invalid"),
             "credentialId": format!("other-{suffix}"),
             "publicKey": public_key,
-            "name": "Conflicting key",
+            "name": "Sibling key",
         })
         .to_string();
-        let conflict = request(&app, "POST", "/api/create", &conflict_body).await;
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-        assert!(response_json(conflict).await["walletRef"].is_string());
+        let sibling = request(&app, "POST", "/api/create", &sibling_body).await;
+        assert_eq!(sibling.status(), StatusCode::ACCEPTED);
+        let sibling = response_json(sibling).await;
+        let sibling_id = sibling["id"].as_str().expect("sibling id").to_owned();
+        assert_ne!(sibling_id, id);
+        assert_eq!(queue.tasks.lock().expect("test queue lock").len(), 2);
 
         store
             .cache_set_negative(&record_cache_key(&rp_id, &credential_id))
@@ -1057,7 +1133,11 @@ mod tests {
         )
         .await;
         assert_eq!(wallet_query.status(), StatusCode::OK);
-        assert_eq!(response_json(wallet_query).await["_queue"]["id"], id);
+        // The wallet pointer tracks the most recent sibling task.
+        assert_eq!(
+            response_json(wallet_query).await["_queue"]["id"],
+            sibling_id
+        );
 
         let invalid_wallet = request(&app, "GET", "/api/query?walletRef=abc", "").await;
         assert_eq!(invalid_wallet.status(), StatusCode::BAD_REQUEST);
@@ -1066,6 +1146,6 @@ mod tests {
         assert_eq!(health.status(), StatusCode::OK);
         let health = response_json(health).await;
         assert_eq!(health["status"], "ok");
-        assert_eq!(health["queue"]["depth"], initial_queue_depth + 1);
+        assert_eq!(health["queue"]["depth"], initial_queue_depth + 2);
     }
 }

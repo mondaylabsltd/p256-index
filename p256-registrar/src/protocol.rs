@@ -20,7 +20,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{lookup::Record, task::CreateTask};
 
+/// Default active index. Override with P256_INDEX_CONTRACT_ADDRESS to point at
+/// the V3 deployment at cutover (V3 reads fall back to V2 on-chain, so the
+/// server needs no dual-address read logic of its own).
 pub const CONTRACT_ADDRESS: &str = "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3";
+/// The frozen V2 index — same value V3 embeds as its V2_ADDRESS fallback.
+/// Admission probes it directly to detect cross-version walletRef conflicts.
+pub const V2_CONTRACT_ADDRESS: &str = "0xdd93420BD49baaBdFF4A363DdD300622Ae87E9c3";
 pub const BATCH_HELPER_ADDRESS: &str = "0xc7B0db5d4974abA3EA25780f40Bf369CC013a16E";
 pub const CHAIN_ID: u64 = 100;
 
@@ -48,7 +54,14 @@ sol! {
         bytes metadata;
     }
 
+    struct WalletMemberSol {
+        string credentialId;
+        bytes publicKey;
+        string name;
+    }
+
     interface WebAuthnP256PublicKeyIndex {
+        function createWallet(string calldata rpId, bytes32 walletRef, WalletMemberSol[] calldata members) external;
         function getRecord(string calldata rpId, string calldata credentialId)
             external view returns (PublicKeyRecord memory);
         function getRecordByWalletRef(bytes32 walletRef)
@@ -57,6 +70,7 @@ sol! {
             external view returns (bool);
         function getCommitBlock(bytes32 commitment) external view returns (uint256);
         function getTotalCredentials() external view returns (uint256);
+        function getTotalWallets() external view returns (uint256);
         function getRpIds(uint256 offset, uint256 limit, bool desc)
             external view returns (uint256 total, string[] memory rpIds, uint256[] memory counts, uint256[] memory createdAts);
         function getKeysByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
@@ -118,6 +132,23 @@ pub fn is_record_exists_error(error: &ChainError) -> bool {
 pub fn is_wallet_conflict_error(error: &ChainError) -> bool {
     matches!(error, ChainError::Reverted(value) | ChainError::Rejected(value)
         if value.contains("WalletRefAlreadyExists") || value.contains("0xc9af4506"))
+}
+
+/// Whether the node saw a same-nonce replacement and refused it on price.
+///
+/// This is the *only* evidence that a bid actually reached the mempool and was
+/// judged too low. The unstick sweep may raise its recorded bid on this and
+/// nothing else: ratcheting on a transport failure records a price the node
+/// never saw, and after enough retries the recorded bid reaches the cap and the
+/// nonce becomes permanently unrescuable even though the real stuck transaction
+/// is cheap to replace.
+pub fn is_replacement_underpriced(error: &ChainError) -> bool {
+    matches!(error, ChainError::Rejected(value) | ChainError::Reverted(value) if {
+        let value = value.to_ascii_lowercase();
+        value.contains("underpriced")
+            || value.contains("replacement transaction")
+            || value.contains("already known")
+    })
 }
 
 /// Whether the error is worth retrying. Unavailable/InvalidResponse always
@@ -192,6 +223,10 @@ pub fn index_total_calldata() -> Vec<u8> {
     WebAuthnP256PublicKeyIndex::getTotalCredentialsCall {}.abi_encode()
 }
 
+pub fn index_total_wallets_calldata() -> Vec<u8> {
+    WebAuthnP256PublicKeyIndex::getTotalWalletsCall {}.abi_encode()
+}
+
 pub fn index_sites_calldata(offset: u64, limit: u64, descending: bool) -> Vec<u8> {
     WebAuthnP256PublicKeyIndex::getRpIdsCall {
         offset: U256::from(offset),
@@ -216,6 +251,9 @@ pub fn batch_commit_calldata(index: Address, commitments: Vec<B256>) -> Vec<u8> 
 }
 
 pub fn batch_create_calldata(index: Address, tasks: &[CreateTask]) -> Result<Vec<u8>> {
+    if tasks.iter().any(CreateTask::is_wallet) {
+        bail!("wallet tasks must be revealed alone via createWallet");
+    }
     let params = tasks
         .iter()
         .map(|task| {
@@ -261,6 +299,12 @@ pub fn decode_commit_block(bytes: &[u8]) -> Result<u64> {
 pub fn decode_total(bytes: &[u8]) -> Result<u64> {
     let value = WebAuthnP256PublicKeyIndex::getTotalCredentialsCall::abi_decode_returns(bytes)
         .map_err(|_| anyhow!("invalid getTotalCredentials response"))?;
+    u64::try_from(value).map_err(|_| anyhow!("total exceeds u64"))
+}
+
+pub fn decode_total_wallets(bytes: &[u8]) -> Result<u64> {
+    let value = WebAuthnP256PublicKeyIndex::getTotalWalletsCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getTotalWallets response"))?;
     u64::try_from(value).map_err(|_| anyhow!("total exceeds u64"))
 }
 
@@ -315,7 +359,31 @@ pub fn record_from_sol(value: PublicKeyRecord) -> Result<Record> {
 
 // ── Commit-reveal commitment ───────────────────────────────────────────────
 
+/// The V3 contract's WALLET_COMMIT_TAG: bytes32("V3.createWallet"), the
+/// domain separator that keeps wallet commitments disjoint from record ones.
+pub fn wallet_commit_tag() -> B256 {
+    let mut tag = [0u8; 32];
+    tag[..15].copy_from_slice(b"V3.createWallet");
+    B256::from(tag)
+}
+
+fn sol_members(members: &[crate::task::WalletMember]) -> Result<Vec<WalletMemberSol>> {
+    members
+        .iter()
+        .map(|member| {
+            Ok(WalletMemberSol {
+                credentialId: member.credential_id.clone(),
+                publicKey: parse_hex_bytes(&member.public_key)?.into(),
+                name: member.name.clone(),
+            })
+        })
+        .collect()
+}
+
 pub fn build_commitment(task: &CreateTask) -> Result<B256> {
+    if task.is_wallet() {
+        return build_wallet_commitment(task);
+    }
     let wallet_ref = parse_b256(&task.wallet_ref)?;
     let public_key: Bytes = parse_hex_bytes(&task.public_key)?.into();
     let metadata: Bytes = parse_hex_bytes(&task.metadata)?.into();
@@ -331,6 +399,31 @@ pub fn build_commitment(task: &CreateTask) -> Result<B256> {
         )
             .abi_encode_params(),
     ))
+}
+
+/// One commitment covers the whole wallet bundle:
+/// keccak256(abi.encode(WALLET_COMMIT_TAG, rpId, walletRef, members)).
+pub fn build_wallet_commitment(task: &CreateTask) -> Result<B256> {
+    Ok(keccak256(
+        (
+            wallet_commit_tag(),
+            task.rp_id.clone(),
+            parse_b256(&task.wallet_ref)?,
+            sol_members(&task.members)?,
+        )
+            .abi_encode_params(),
+    ))
+}
+
+/// Calldata for a wallet task's atomic reveal. Unlike batchCreateRecord this
+/// targets the INDEX contract directly, so a wallet task must go out alone.
+pub fn wallet_create_calldata(task: &CreateTask) -> Result<Vec<u8>> {
+    Ok(WebAuthnP256PublicKeyIndex::createWalletCall {
+        rpId: task.rp_id.clone(),
+        walletRef: parse_b256(&task.wallet_ref)?,
+        members: sol_members(&task.members)?,
+    }
+    .abi_encode())
 }
 
 // ── Hex parsing helpers ────────────────────────────────────────────────────
@@ -444,6 +537,7 @@ mod tests {
             name: "n".into(),
             initial_credential_id: "cred-1".into(),
             metadata: "0x00".into(),
+            members: Vec::new(),
             tx_hash: None,
             error: None,
             retries: 0,
@@ -453,6 +547,72 @@ mod tests {
         assert_eq!(
             super::build_commitment(&task).unwrap().to_string(),
             "0xe7bec4938ed5410d3ede4770a739064cabd7110b918140690eb944208cfa3ff9"
+        );
+    }
+
+    #[test]
+    fn wallet_commitment_matches_the_contract_golden_value() {
+        // Pinned against the Solidity side (test_walletCommitment_goldenValue)
+        // and an independent `cast abi-encode | cast keccak` computation.
+        use crate::task::{CreateTask, TaskStatus, WalletMember};
+
+        const PK1: &str = "045ff257819a8927dc548d62eeb90a7a61a8e90afd70c9f774e7ed78d0c5bbbc0e8ed0f6a55f675f162b2e8450f79cd0e6766e56f10f762430ec15d2a4388f19fb";
+        const PK2: &str = "04550f471003f3df97c3df506ac797f6721fb1a1fb7b8f6f83d224498a65c88e24136093d7012e509a73715cbd0b00a3cc0ff4b5c01b3ffa196ab1fb327036b8e6";
+        let task = CreateTask {
+            id: "wallet-golden".into(),
+            status: TaskStatus::Pending,
+            rp_id: "rp1".into(),
+            credential_id: "cred-1".into(),
+            wallet_ref: "0x0000000000000000000000000000000000000000000000000000000000000042".into(),
+            public_key: PK1.into(),
+            name: "A".into(),
+            initial_credential_id: "cred-1".into(),
+            metadata: "0x00".into(),
+            members: vec![
+                WalletMember {
+                    credential_id: "cred-1".into(),
+                    public_key: PK1.into(),
+                    name: "A".into(),
+                },
+                WalletMember {
+                    credential_id: "cred-2".into(),
+                    public_key: PK2.into(),
+                    name: "B".into(),
+                },
+            ],
+            tx_hash: None,
+            error: None,
+            retries: 0,
+            created_at: 0,
+            admitted: true,
+        };
+        assert_eq!(
+            super::build_commitment(&task).unwrap().to_string(),
+            "0x0bcf64f774f9f6721c25a0e2a2da9288add57fbf8c3625b1c72357f3c54383f2"
+        );
+
+        // The reveal calldata targets createWallet, and the batch encoder
+        // refuses to mix a wallet task into a batchCreateRecord.
+        let data = super::wallet_create_calldata(&task).unwrap();
+        use alloy::sol_types::SolCall;
+        assert_eq!(
+            &data[..4],
+            super::WebAuthnP256PublicKeyIndex::createWalletCall::SELECTOR
+        );
+        assert!(
+            super::batch_create_calldata(
+                alloy::primitives::Address::ZERO,
+                std::slice::from_ref(&task)
+            )
+            .is_err()
+        );
+
+        // Altering any member changes the commitment.
+        let mut altered = task.clone();
+        altered.members[1].credential_id = "cred-CHANGED".into();
+        assert_ne!(
+            super::build_commitment(&altered).unwrap(),
+            super::build_commitment(&task).unwrap()
         );
     }
 

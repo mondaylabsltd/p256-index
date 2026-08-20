@@ -242,9 +242,11 @@ pub enum LookupResult {
     Data {
         value: Value,
     },
-    /// The total-credentials count.
+    /// The total-credentials count, plus the wallet count where the contract
+    /// exposes one (V3; None while still pointed at V2).
     Total {
         total: u64,
+        wallets: Option<u64>,
     },
     ChainReadFailed,
     TaskFound {
@@ -610,7 +612,13 @@ async fn stats_flow(ctx: &Ctx, key: LookupCacheKey, fetch: StatsFetch) -> Flow<L
 
     let fetched = match fetch {
         StatsFetch::Total => match request(ctx, LookupOperation::FetchTotal).await {
-            LookupResult::Total { total } => Ok(json!({ "totalCredentials": total })),
+            LookupResult::Total { total, wallets } => {
+                let mut body = json!({ "totalCredentials": total });
+                if let Some(wallets) = wallets {
+                    body["totalWallets"] = json!(wallets);
+                }
+                Ok(body)
+            }
             LookupResult::ChainReadFailed => Err(()),
             _ => return Err(dependency("rpc")),
         },
@@ -807,6 +815,7 @@ mod tests {
             name: "n".into(),
             initial_credential_id: "cred-1".into(),
             metadata: "0x00".into(),
+            members: Vec::new(),
             tx_hash: Some("0xdeadbeef".into()),
             error: Some("last error".into()),
             retries: 2,
@@ -1206,18 +1215,21 @@ mod tests {
         );
         driver.step(
             LookupOperation::FetchTotal,
-            LookupResult::Total { total: 42 },
+            LookupResult::Total {
+                total: 42,
+                wallets: Some(7),
+            },
         );
         driver.step(
             LookupOperation::StoreCache {
                 key: LookupCacheKey::StatsTotal,
-                value: json!({ "totalCredentials": 42 }),
+                value: json!({ "totalCredentials": 42, "totalWallets": 7 }),
                 allow_stale: true,
             },
             LookupResult::Persisted,
         );
         driver.assert_settled(LookupOutcome::CachedOk {
-            value: json!({ "totalCredentials": 42 }),
+            value: json!({ "totalCredentials": 42, "totalWallets": 7 }),
         });
     }
 
@@ -1354,7 +1366,10 @@ mod tests {
         );
         driver.step(
             LookupOperation::FetchTotal,
-            LookupResult::Total { total: 1 },
+            LookupResult::Total {
+                total: 1,
+                wallets: None,
+            },
         );
         driver.step(
             LookupOperation::StoreCache {

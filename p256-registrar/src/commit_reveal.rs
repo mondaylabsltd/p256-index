@@ -357,7 +357,22 @@ async fn drive_batch(ctx: &Ctx, envelope_ids: Vec<String>) -> Flow<BatchVerdict>
             false => missing.push(task),
         }
     }
-    for chunk in missing.chunks(CREATE_SUB_BATCH_SIZE) {
+    // Wallet tasks reveal alone (their calldata is one atomic createWallet on
+    // the index, not a batchCreateRecord member); single-key tasks keep
+    // batching by CREATE_SUB_BATCH_SIZE, in arrival order.
+    let mut singles: Vec<CreateTask> = Vec::new();
+    for task in missing {
+        if task.is_wallet() {
+            for chunk in singles.chunks(CREATE_SUB_BATCH_SIZE) {
+                create_stage(ctx, chunk).await?;
+            }
+            singles.clear();
+            create_stage(ctx, std::slice::from_ref(&task)).await?;
+        } else {
+            singles.push(task);
+        }
+    }
+    for chunk in singles.chunks(CREATE_SUB_BATCH_SIZE) {
         create_stage(ctx, chunk).await?;
     }
     Ok(BatchVerdict::Advance)
@@ -752,6 +767,23 @@ async fn classify_task(
 ) -> Flow<()> {
     let message = format!("{operation}: {error}");
     match classify_chain_error(error) {
+        // For a WALLET task, RecordAlreadyExists means one of its members
+        // collided with a foreign record — the atomic createWallet reverted
+        // and the wallet was NOT created. Reconciliation before the create
+        // already handled the "our own wallet landed earlier" case (member[0]
+        // was checked on-chain), so this is a terminal conflict, not a done.
+        ErrorClass::RecordExists if task.is_wallet() => {
+            persist(
+                ctx,
+                CommitRevealOperation::MarkFailed {
+                    task_id: task.id.clone(),
+                    kind: FailureKind::Conflict,
+                    message,
+                },
+                "could not persist conflict task",
+            )
+            .await
+        }
         ErrorClass::RecordExists => {
             persist(
                 ctx,
@@ -881,6 +913,7 @@ mod tests {
             name: "n".to_owned(),
             initial_credential_id: format!("cred-{id}"),
             metadata: "0x00".to_owned(),
+            members: Vec::new(),
             tx_hash: None,
             error: None,
             retries: 0,

@@ -17,6 +17,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use p256_registrar::{
+    gas::{self, FeePlan, FeeVerdict},
+    protocol,
     rescue::{self, LedgerRow, RescueAction},
     sentinel,
 };
@@ -52,6 +54,7 @@ pub struct Maintenance {
     last_rpc_alert: Option<Instant>,
     last_dlq_alert: Option<Instant>,
     last_stuck_alert: Option<Instant>,
+    last_gas_capped_alert: Option<Instant>,
 }
 
 impl Maintenance {
@@ -73,6 +76,7 @@ impl Maintenance {
             last_rpc_alert: None,
             last_dlq_alert: None,
             last_stuck_alert: None,
+            last_gas_capped_alert: None,
         };
         let task = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -112,6 +116,7 @@ impl Maintenance {
                     hash: row.hash,
                     sent_at_ms: row.sent_at_ms,
                     attempts: row.attempts,
+                    fees_wei: row.max_fee_wei.zip(row.max_priority_fee_wei),
                 })
                 .collect(),
             Err(_) => {
@@ -123,10 +128,13 @@ impl Maintenance {
             return;
         }
 
-        let gas_price = match self.chain.gas_price().await {
-            Ok(price) => rescue::bump_gas(price),
+        // Replacements are priced per row, against the fee that row was sent
+        // at. The base fee is only the floor that keeps the replacement itself
+        // includable; it must never become the basis for the bump.
+        let base_fee = match self.chain.base_fee().await {
+            Ok(base_fee) => base_fee,
             Err(_) => {
-                tracing::warn!(operation = "unstick", "gas price read failed");
+                tracing::warn!(operation = "unstick", "base fee read failed");
                 return;
             }
         };
@@ -155,8 +163,49 @@ impl Maintenance {
                     RescueAction::Replace {
                         nonce,
                         attempts_after,
+                        previous_fees_wei,
                     } => {
-                        match self.chain.cancel_stuck_nonce(role, nonce, gas_price).await {
+                        let previous = previous_fees_wei.map(|(max_fee, priority)| FeePlan {
+                            max_fee_per_gas: U256::from(max_fee),
+                            max_priority_fee_per_gas: U256::from(priority),
+                        });
+                        let fees = match gas::plan_replacement(
+                            previous,
+                            base_fee,
+                            U256::from(gas::DEFAULT_TIP_WEI),
+                            self.chain.max_gas_price_wei(),
+                            attempts_after.saturating_sub(1),
+                        ) {
+                            FeeVerdict::Send(fees) => fees,
+                            FeeVerdict::TooExpensive { required, cap } => {
+                                // Bidding past the cap to clear a nonce is the
+                                // one thing the cap exists to prevent. Page
+                                // instead: this needs a human decision.
+                                self.alert_throttled(
+                                    AlertKind::GasCapped,
+                                    &format!(
+                                        "🛑 [webauthnp256-publickey-index] stuck {} nonce {} needs \
+                                         {required} wei to replace, above the {cap} wei cap. \
+                                         Raise P256_INDEX_MAX_GAS_PRICE_WEI or intervene manually.",
+                                        role_name(role),
+                                        nonce
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        let bid = u128::try_from(fees.max_fee_per_gas)
+                            .ok()
+                            .zip(u128::try_from(fees.max_priority_fee_per_gas).ok());
+                        // Preserve the original row identity on failure: only a
+                        // confirmed broadcast may overwrite the hash/timestamp.
+                        let (row_hash, sent_at) = ledger
+                            .iter()
+                            .find(|row| row.role == role_name(role) && row.nonce == nonce)
+                            .map(|row| (row.hash.clone(), row.sent_at_ms))
+                            .unwrap_or_else(|| (String::new(), now));
+                        match self.chain.cancel_stuck_nonce(role, nonce, fees).await {
                             Ok(cancel_hash) => {
                                 tracing::warn!(
                                     operation = "unstick",
@@ -176,16 +225,49 @@ impl Maintenance {
                                         &cancel_hash,
                                         now,
                                         attempts_after,
+                                        bid,
                                     )
                                     .await;
                             }
+                            // The node saw this bid and judged it too low: the
+                            // rung was genuinely climbed, so record it and let
+                            // the next sweep ladder up from it.
+                            Err(error) if protocol::is_replacement_underpriced(&error) => {
+                                tracing::warn!(
+                                    operation = "unstick",
+                                    role = role_name(role),
+                                    nonce,
+                                    attempts = attempts_after,
+                                    %error,
+                                    "replacement refused as underpriced; raising the recorded bid"
+                                );
+                                let _ = self
+                                    .store
+                                    .record_pending_tx(
+                                        role_name(role),
+                                        nonce,
+                                        &row_hash,
+                                        sent_at,
+                                        attempts_after,
+                                        bid,
+                                    )
+                                    .await;
+                            }
+                            // Anything else — RPC 429/5xx, a timeout, an
+                            // unfunded wallet — means the bid never reached the
+                            // mempool. The ledger must not move: ratcheting on
+                            // an unsent price walks the recorded bid up to the
+                            // cap and permanently disables rescue for a nonce
+                            // that a far cheaper replacement would clear. Age
+                            // still grows (sent_at is untouched), so the
+                            // escalation alert continues to fire.
                             Err(error) => {
                                 tracing::warn!(
                                     operation = "unstick",
                                     role = role_name(role),
                                     nonce,
                                     %error,
-                                    "unstick attempt failed, will retry next cycle"
+                                    "unstick attempt did not reach the mempool; bid unchanged"
                                 );
                             }
                         }
@@ -229,6 +311,7 @@ impl Maintenance {
     async fn alert_throttled(&mut self, kind: AlertKind, message: &str) {
         let slot = match kind {
             AlertKind::Stuck => &mut self.last_stuck_alert,
+            AlertKind::GasCapped => &mut self.last_gas_capped_alert,
             AlertKind::Rpc => &mut self.last_rpc_alert,
             AlertKind::Dlq => &mut self.last_dlq_alert,
             AlertKind::LowRunway => &mut self.last_low_runway_alert,
@@ -296,6 +379,10 @@ impl Maintenance {
 
 enum AlertKind {
     Stuck,
+    /// A nonce whose replacement price has reached the configured cap. Kept
+    /// separate from `Stuck` because it shares the throttle window with it and
+    /// is the only one of the two that names an action the operator can take.
+    GasCapped,
     Rpc,
     Dlq,
     LowRunway,

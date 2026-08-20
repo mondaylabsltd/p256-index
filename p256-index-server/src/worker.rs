@@ -25,12 +25,13 @@ use p256_registrar::{
         BatchVerdict, CommitRevealApp, CommitRevealEffect, CommitRevealEvent,
         CommitRevealOperation, CommitRevealResult, TxOutcome,
     },
+    gas::FeeVerdict,
     protocol::parse_b256,
     task::CreateTask,
 };
 
 use crate::{
-    chain::{Chain, ReceiptStatus, WalletRole},
+    chain::{Broadcast, Chain, ReceiptStatus, WalletRole},
     queue::{STREAM_NAME, TOPIC_NAME},
     store::RedisStore,
 };
@@ -38,6 +39,10 @@ use crate::{
 const POLL_BATCH_SIZE: u32 = 50;
 const IGGY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait before re-checking the fee after a batch was held back for
+/// price. Short enough that a brief spike costs little latency, long enough not
+/// to poll the RPC pool pointlessly.
+const GAS_WAIT: Duration = Duration::from_secs(15);
 
 pub struct WorkerHandle {
     shutdown: CancellationToken,
@@ -170,6 +175,23 @@ impl CreateWorker {
                     }
                 })
                 .collect::<Vec<_>>();
+
+            // Pre-flight fee gate. Checked before any task work so that waiting
+            // out an expensive market costs nothing: the offset does not
+            // advance and no task's retry budget is consumed, so the batch is
+            // simply re-polled later at a price we are willing to pay.
+            if let Ok(FeeVerdict::TooExpensive { required, cap }) = self.chain.fee_plan().await {
+                tracing::warn!(
+                    required_wei = %required,
+                    cap_wei = %cap,
+                    "gas above the configured cap; batch requeued unspent"
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(GAS_WAIT) => {}
+                }
+                continue;
+            }
 
             match self.process_batch(tasks).await {
                 Ok(()) => {
@@ -330,8 +352,8 @@ impl CreateWorker {
             NonceRole::Create => self.chain.create(tasks, nonce).await,
         };
         match sent {
-            Ok(hash) => {
-                self.record_pending(role, nonce, &hash).await;
+            Ok(Broadcast { hash, fees_wei }) => {
+                self.record_pending(role, nonce, &hash, fees_wei).await;
                 match self.chain.wait_for_receipt(&hash, RECEIPT_TIMEOUT).await {
                     Ok(ReceiptStatus::Success) => {
                         self.clear_pending(role, nonce).await;
@@ -381,10 +403,16 @@ impl CreateWorker {
 
     /// Record a freshly-broadcast tx in the ledger so the unstick sweep can replace it if its
     /// receipt never arrives. Best-effort: a ledger write failure must not fail the send path.
-    async fn record_pending(&self, role: NonceRole, nonce: u64, hash: &str) {
+    async fn record_pending(
+        &self,
+        role: NonceRole,
+        nonce: u64,
+        hash: &str,
+        fees_wei: Option<(u128, u128)>,
+    ) {
         let _ = self
             .store
-            .record_pending_tx(role_name(role), nonce, hash, now_ms(), 0)
+            .record_pending_tx(role_name(role), nonce, hash, now_ms(), 0, fees_wei)
             .await;
     }
 
@@ -552,6 +580,7 @@ mod e2e_chain_tests {
             name: "on-chain e2e".to_owned(),
             initial_credential_id: format!("cred-{suffix}"),
             metadata: default_metadata(&public_key).expect("default metadata"),
+            members: Vec::new(),
             tx_hash: None,
             error: None,
             retries: 0,
