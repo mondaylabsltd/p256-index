@@ -37,7 +37,7 @@ pub const MAX_ACTIVE_QUEUE_DEPTH: u64 = 10_000;
 /// Mirrors the contract's MAX_MEMBERS.
 pub const MAX_MEMBERS: usize = 7;
 /// Mirrors the contract's MAX_METADATA_LENGTH (bytes).
-pub const MAX_METADATA_BYTES: usize = 1024;
+pub const MAX_METADATA_BYTES: usize = 2048;
 /// Mirrors the contract's ATTESTATION_LENGTH / ATTESTATION_VERSION.
 pub const ATTESTATION_BYTES: usize = 20;
 pub const ATTESTATION_VERSION: u8 = 1;
@@ -87,9 +87,11 @@ pub enum AdmissionOperation {
     CheckContentRegistered {
         content_hash: String,
     },
-    /// isNonceUsed(unitNonce) on the registry (fail-open).
+    /// isNonceUsed(publicKey, unitNonce) on the registry for each member
+    /// key (fail-open): true when any member's (key, nonce) pair is spent.
     CheckNonceUsed {
         unit_nonce: String,
+        public_keys: Vec<String>,
     },
     QueueDepth,
     AllowGlobalCreate,
@@ -320,6 +322,11 @@ async fn drive_admission(
         ctx,
         AdmissionOperation::CheckNonceUsed {
             unit_nonce: task.unit_nonce.clone(),
+            public_keys: task
+                .members
+                .iter()
+                .map(|member| member.public_key.clone())
+                .collect(),
         },
     )
     .await
@@ -441,10 +448,17 @@ pub fn validate_register(
 
     let mut parsed = Vec::with_capacity(members.len());
     for (index, member) in members.into_iter().enumerate() {
-        parsed.push(
-            validate_member(member, &rp_id, nonce, chain_id, registry)
-                .map_err(|message| format!("members[{index}]: {message}"))?,
-        );
+        let member = validate_member(member, &rp_id, nonce, chain_id, registry)
+            .map_err(|message| format!("members[{index}]: {message}"))?;
+        if parsed
+            .iter()
+            .any(|earlier: &Member| earlier.public_key == member.public_key)
+        {
+            return Err(format!(
+                "members[{index}]: duplicate public key within the unit"
+            ));
+        }
+        parsed.push(member);
     }
 
     let task = RegisterTask {
@@ -675,10 +689,17 @@ mod tests {
         );
 
         let mut fat_metadata = valid_request();
-        fat_metadata.metadata = Some(format!("0x{}", "00".repeat(1025)));
+        fat_metadata.metadata = Some(format!("0x{}", "00".repeat(2049)));
         assert_eq!(
             validate_register(fat_metadata, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
-            "metadata exceeds max length (1024 bytes)"
+            "metadata exceeds max length (2048 bytes)"
+        );
+
+        let mut duplicated = valid_request();
+        duplicated.members = Some(vec![signed_member("example.com"); 2]);
+        assert_eq!(
+            validate_register(duplicated, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
+            "members[1]: duplicate public key within the unit"
         );
 
         let mut too_many = valid_request();
@@ -780,6 +801,7 @@ mod tests {
         driver.step(
             AdmissionOperation::CheckNonceUsed {
                 unit_nonce: nonce_hex(),
+                public_keys: vec![keypair().1],
             },
             AdmissionResult::ChainBool { value: false },
         );
@@ -927,6 +949,7 @@ mod tests {
         driver.step(
             AdmissionOperation::CheckNonceUsed {
                 unit_nonce: nonce_hex(),
+                public_keys: vec![keypair().1],
             },
             AdmissionResult::ChainBool { value: true },
         );
@@ -957,6 +980,7 @@ mod tests {
         driver.step(
             AdmissionOperation::CheckNonceUsed {
                 unit_nonce: nonce_hex(),
+                public_keys: vec![keypair().1],
             },
             AdmissionResult::ChainReadFailed,
         );

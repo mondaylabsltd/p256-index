@@ -317,13 +317,30 @@ async fn execute_admission(
                 Err(_) => AdmissionResult::ChainReadFailed,
             }
         }
-        AdmissionOperation::CheckNonceUsed { unit_nonce } => {
+        AdmissionOperation::CheckNonceUsed {
+            unit_nonce,
+            public_keys,
+        } => {
             let Ok(unit_nonce) = parse_b256(unit_nonce) else {
                 return AdmissionResult::ChainReadFailed;
             };
-            match state.chain.is_nonce_used(unit_nonce).await {
-                Ok(value) => AdmissionResult::ChainBool { value },
-                Err(_) => AdmissionResult::ChainReadFailed,
+            // True as soon as any member's (key, nonce) pair is spent;
+            // a read failure without a positive stays fail-open.
+            let mut any_failed = false;
+            for public_key in public_keys {
+                let Ok(key_bytes) = parse_hex_bytes(&public_key) else {
+                    return AdmissionResult::ChainReadFailed;
+                };
+                match state.chain.is_nonce_used(key_bytes, unit_nonce).await {
+                    Ok(true) => return AdmissionResult::ChainBool { value: true },
+                    Ok(false) => {}
+                    Err(_) => any_failed = true,
+                }
+            }
+            if any_failed {
+                AdmissionResult::ChainReadFailed
+            } else {
+                AdmissionResult::ChainBool { value: false }
             }
         }
         AdmissionOperation::QueueDepth => match state.store.queue_stats().await {
@@ -780,7 +797,11 @@ mod tests {
             Err(ChainError::Unavailable)
         }
 
-        async fn is_nonce_used(&self, _: alloy::primitives::B256) -> Result<bool, ChainError> {
+        async fn is_nonce_used(
+            &self,
+            _: Vec<u8>,
+            _: alloy::primitives::B256,
+        ) -> Result<bool, ChainError> {
             Err(ChainError::Unavailable)
         }
 

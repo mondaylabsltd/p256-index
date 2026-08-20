@@ -18,11 +18,13 @@ first client, not its owner.
 - **Nothing else is exclusive or interpreted.** A key may appear in any
   number of registration units; queries return lists and readers filter by
   their own metadata schema. Credential ids, display names, wallet
-  derivation preimages all live inside `metadata` (≤1024 bytes, opaque).
+  derivation preimages all live inside `metadata` (≤2048 bytes, opaque).
 - **A registration unit** is 1..7 members sharing one rpId, one metadata
-  payload and one single-use `unitNonce`, appended atomically in one
-  `register` transaction. The nonce is consumed on-chain: every proof dies
-  with its registration, and identical content registers only once.
+  payload and one `unitNonce`, appended atomically in one `register`
+  transaction. Consumption is per (publicKey, nonce) pair: every proof dies
+  with its registration and identical content registers only once, while a
+  stranger pairing their own keys with the same nonce burns nothing of
+  anyone else's — the nonce needs no global uniqueness.
 - **Reads are list-shaped and id-stable.** Entry ids are sequential and
   immutable — clients that remember their entry ids read in O(1) forever.
   Discovery without local state: recover the two candidate keys from any

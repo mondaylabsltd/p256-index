@@ -128,7 +128,7 @@ impl ReadChain for FakeChain {
         Err(ChainError::Unavailable)
     }
 
-    async fn is_nonce_used(&self, _: B256) -> Result<bool, ChainError> {
+    async fn is_nonce_used(&self, _: Vec<u8>, _: B256) -> Result<bool, ChainError> {
         Err(ChainError::Unavailable)
     }
 

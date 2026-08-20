@@ -20,6 +20,18 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
     uint256 constant PRIV3 = 0xb6648b2469c90a65d2deda5ed97d4e1355b34d012d80ac2e3b6d0dbf322dd7bb;
     bytes constant PUB3 =
         hex"042ae594f6f136371270398d4d13b6311bed0ea7de72ee97199e94983b551d7be7774ba006a955cc5d6aa65f127d6086f162c5280382576e4851262d232bcf8c36";
+    uint256 constant PRIV4 = 0x4ff0d0d44d98cbd19b2eee65e9ce24ac64908c3463c4335f68f5bdc954728cce;
+    bytes constant PUB4 =
+        hex"04a5252179f79a05821ddb772aa3758001279f824b82a47108d7f0b082dec6582ed50039489e8eab60a37136d9e94d33687255d261d96504e11020f8ba0a3324b1";
+    uint256 constant PRIV5 = 0x8dc4bc66205dc7f28127831116bf49b7db232f7fbd613fa871732a8df39880db;
+    bytes constant PUB5 =
+        hex"0475e5c47cffda1da902a80270a07c305417d20ac28f7b02f0320d55677e7302b161a6518e70deed0f394efec311535a636be29e56d489f46bc969f2ca8882bf8a";
+    uint256 constant PRIV6 = 0x950b13e206ce1aa33ad3bb736d45811028944ee37a234f4000de5c4d3ea631af;
+    bytes constant PUB6 =
+        hex"041a2633fe4f6da20c5eadf7da55ff584fa161c58f34cd66e8e2f3a47e810ecf1c90a9382cf4f406af31232b2067ca0c70673d8b4fd3d3bac3a5ccf9023e05c952";
+    uint256 constant PRIV7 = 0x97ed1498ce6e738fa927ab86be104b85e572330fda71a264c3650a73cf37d630;
+    bytes constant PUB7 =
+        hex"04fc92700c4f14146b27098ded12688c9cdf46333a216149f97138245abd772395a2473f9813e5ff0aeb58321d740844ffc10155e68ef736e63a02e8713c3f0c5a";
 
     // v1 || AAGUID || authData flags 0x5d || platform || usb|internal
     bytes constant ATTESTATION = hex"01fbfc3007154e4ecc8c0b6e020557d7bd5d0109";
@@ -111,8 +123,23 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         assertEq(entry.unitId, 0);
         assertEq(entry.memberCount, 1);
         assertTrue(registry.hasEntries(PUB1));
-        assertTrue(registry.isNonceUsed(nonce));
+        assertTrue(registry.isNonceUsed(PUB1, nonce));
         assertTrue(registry.isContentRegistered(registry.contentHashFor("rp1", hex"aa", members)));
+    }
+
+    function test_contentHashIsTheStableUnitIdentity() public {
+        bytes32 nonce = _freshNonce();
+        WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        members[0] = _member(PRIV1, PUB1, "rp1", nonce);
+        bytes32 contentHash = registry.contentHashFor("rp1", hex"aa", members);
+
+        (bool exists, uint256 unitId) = registry.getUnitIdByContentHash(contentHash);
+        assertFalse(exists);
+
+        registry.register("rp1", hex"aa", nonce, members);
+        (exists, unitId) = registry.getUnitIdByContentHash(contentHash);
+        assertTrue(exists);
+        assertEq(unitId, 0);
     }
 
     function test_sameKey_multipleUnits_inOrder() public {
@@ -157,9 +184,10 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
     }
 
     function test_proofsDieWithTheirNonce() public {
-        // After a unit is mined its proofs are public — but the nonce is
-        // consumed, so replaying them (same nonce, any content) reverts,
-        // and a different nonce changes the challenge so they fail there too.
+        // After a unit is mined its proofs are public — but the (key, nonce)
+        // pair is consumed, so replaying them (same nonce, any content)
+        // reverts, and a different nonce changes the challenge so they fail
+        // there too.
         bytes32 nonce = _freshNonce();
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
         members[0] = _member(PRIV1, PUB1, "rp1", nonce);
@@ -259,8 +287,26 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         registry.register("rp1", hex"1234", nonce, members);
         assertEq(registry.getTotalEntries(), 0);
         assertFalse(registry.hasEntries(PUB1));
-        // Nonce not consumed (state reverted): the unit can retry.
-        assertFalse(registry.isNonceUsed(nonce));
+        // Nonce pairs not consumed (state reverted): the unit can retry.
+        assertFalse(registry.isNonceUsed(PUB1, nonce));
+    }
+
+    function test_nonceScopedPerKey_strangersCannotBurnIt() public {
+        // A third party registering their own key with someone else's nonce
+        // consumes only their own (key, nonce) pair — the victim's in-flight
+        // proofs stay valid and land afterwards unchanged.
+        bytes32 nonce = _freshNonce();
+        WebAuthnP256PublicKeyRegistry.Member[] memory victim = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        victim[0] = _member(PRIV1, PUB1, "rp1", nonce);
+
+        WebAuthnP256PublicKeyRegistry.Member[] memory griefer = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        griefer[0] = _member(PRIV2, PUB2, "rp1", nonce);
+        registry.register("rp1", hex"dead", nonce, griefer);
+
+        assertTrue(registry.isNonceUsed(PUB2, nonce));
+        assertFalse(registry.isNonceUsed(PUB1, nonce));
+        registry.register("rp1", hex"aa", nonce, victim);
+        assertEq(registry.getTotalEntriesByKey(PUB1), 1);
     }
 
     function test_memberCountBounds() public {
@@ -279,15 +325,16 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
 
     function test_sevenMembersFit() public {
         bytes32 nonce = _freshNonce();
-        uint256[3] memory privs = [PRIV1, PRIV2, PRIV3];
-        bytes[3] memory pubs = [PUB1, PUB2, PUB3];
+        uint256[7] memory privs = [PRIV1, PRIV2, PRIV3, PRIV4, PRIV5, PRIV6, PRIV7];
+        bytes[7] memory pubs = [PUB1, PUB2, PUB3, PUB4, PUB5, PUB6, PUB7];
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](7);
         for (uint256 i = 0; i < 7; i++) {
-            members[i] = _member(privs[i % 3], pubs[i % 3], "rp1", nonce);
+            members[i] = _member(privs[i], pubs[i], "rp1", nonce);
         }
         registry.register("rp1", hex"beef", nonce, members);
         assertEq(registry.getTotalEntries(), 7);
-        assertEq(registry.getTotalEntriesByKey(PUB1), 3);
+        assertEq(registry.getTotalEntriesByKey(PUB1), 1);
+        assertEq(registry.getTotalEntriesByKey(PUB7), 1);
     }
 
     // ── Validation ─────────────────────────────────────────────────────────
@@ -304,13 +351,23 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.RpIdTooLong.selector, 254));
         registry.register(longRp, "", nonce, members);
 
-        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.MetadataTooLong.selector, 1025));
-        registry.register("rp1", new bytes(1025), nonce, members);
+        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.MetadataTooLong.selector, 2049));
+        registry.register("rp1", new bytes(2049), nonce, members);
+    }
+
+    function test_duplicateMemberKeyRejected() public {
+        bytes32 nonce = _freshNonce();
+        WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](2);
+        members[0] = _member(PRIV1, PUB1, "rp1", nonce);
+        members[1] = _member(PRIV1, PUB1, "rp1", nonce);
+
+        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.DuplicateMemberKey.selector, 1));
+        registry.register("rp1", "", nonce, members);
     }
 
     function test_metadataAtCapRegisters() public {
-        _register(PRIV1, PUB1, "rp1", new bytes(1024));
-        assertEq(registry.getEntry(0).metadata.length, 1024);
+        _register(PRIV1, PUB1, "rp1", new bytes(2048));
+        assertEq(registry.getEntry(0).metadata.length, 2048);
     }
 
     function test_attestationShape() public {
@@ -350,6 +407,20 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         members[0] = WebAuthnP256PublicKeyRegistry.Member(offCurve, "", dummy);
         vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidPublicKeyPoint.selector);
         registry.register("rp1", "", nonce, members);
+
+        bytes memory outOfField = bytes.concat(hex"04", bytes32(type(uint256).max), bytes32(uint256(1)));
+        members[0] = WebAuthnP256PublicKeyRegistry.Member(outOfField, "", dummy);
+        vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidPublicKeyCoordinate.selector);
+        registry.register("rp1", "", nonce, members);
+    }
+
+    function test_challengeIndexBeyondClientData_reverts() public {
+        bytes32 nonce = _freshNonce();
+        WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        members[0] = _member(PRIV1, PUB1, "rp1", nonce);
+        members[0].proof.challengeIndex = 10_000; // far past the JSON's end
+        vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
+        registry.register("rp1", "", nonce, members);
     }
 
     // ── Reads, pagination, enumeration ─────────────────────────────────────
@@ -379,12 +450,19 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         _register(PRIV3, PUB3, "rp2", hex"03");
 
         assertEq(registry.getTotalRpIds(), 2);
+        assertEq(registry.getTotalEntriesByRpId("rp1"), 2);
+        assertEq(registry.getTotalEntriesByRpId("rp2"), 1);
         (uint256 total, string[] memory rpIds, uint256[] memory counts,) = registry.getRpIds(0, 10, false);
         assertEq(total, 2);
         assertEq(rpIds[0], "rp1");
         assertEq(counts[0], 2);
         assertEq(rpIds[1], "rp2");
         assertEq(counts[1], 1);
+
+        // Past-the-end page: totals stay, slices are empty.
+        (total, rpIds, counts,) = registry.getRpIds(5, 10, false);
+        assertEq(total, 2);
+        assertEq(rpIds.length, 0);
 
         (, WebAuthnP256PublicKeyRegistry.EntryView[] memory records) = registry.getEntriesByRpId("rp1", 0, 10, true);
         assertEq(records[0].metadata, hex"02");

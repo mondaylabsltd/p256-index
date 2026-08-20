@@ -24,18 +24,25 @@ import {Base64Url} from "./Base64Url.sol";
 ///         precompile at 0x100. The signature authorizes THE ACT OF STORING
 ///         for that key — deliberately not the unit's content, so each
 ///         device can create and sign its passkey independently, in any
-///         order, before the rest of the unit exists. The shared unitNonce
-///         is consumed on registration: every on-chain proof is dead
-///         forever, and a fresh registration for a key always needs a fresh
-///         assertion. (Consequence, by design: unit content is bound by the
-///         submitting transaction, not by the signatures — in the mempool
-///         window a front-runner could pair in-flight proofs with other
-///         content. Once mined, everything is immutable and unreplayable.)
+///         order, before the rest of the unit exists. Consumption is scoped
+///         to the (publicKey, unitNonce) PAIR: registering a member burns
+///         keccak256(key, nonce), so every on-chain proof is dead forever
+///         and a fresh registration for a key always needs a fresh
+///         assertion — while a stranger reusing the same nonce with their
+///         own keys burns nothing of anyone else's. The nonce therefore
+///         needs no global uniqueness: any client-chosen 32 bytes (a uuid,
+///         a random value) works. (Residual mempool window, by design: unit
+///         content is bound by the submitting transaction, not by the
+///         signatures, so a front-runner could re-pair a victim's own
+///         in-flight proofs with other content — killing those proofs and
+///         forcing every device to re-sign under a fresh nonce. No theft is
+///         possible; submitters who care should use a private mempool. Once
+///         mined, everything is immutable and unreplayable.)
 ///
 ///         Nothing else is exclusive or interpreted:
 ///         - a public key may appear in any number of units (readers get
 ///           lists and filter by their own schema);
-///         - `metadata` (≤1024 bytes) is opaque: credential ids, display
+///         - `metadata` (≤2048 bytes) is opaque: credential ids, display
 ///           names, wallet derivation preimages — all caller-defined;
 ///         - `attestation` per member (when present) is shape-checked: 20
 ///           versioned bytes of registration-time WebAuthn signals (AAGUID,
@@ -43,24 +50,30 @@ import {Base64Url} from "./Base64Url.sol";
 ///           storer's claim;
 ///         - rpId is checked against every proof's authenticatorData
 ///           rpIdHash;
-///         - a unitNonce is consumed once, and identical unit content
-///           registers once: no duplicates, no replay.
+///         - a (publicKey, unitNonce) pair is consumed once, identical unit
+///           content registers once, and a unit's member keys are distinct:
+///           no duplicates, no replay.
 ///
 ///         Readers locate data by public key: recover candidate keys from a
 ///         live assertion signature (one signature yields two; only a held
 ///         key can have entries, so at most one candidate's bucket is
 ///         non-empty), then read that bucket. Entry and unit ids are
-///         sequential and immutable — remember them for O(1) reads.
+///         sequential and immutable — remember them for O(1) reads. A
+///         unit's STABLE identity, computable offline before submission, is
+///         its content hash (contentHashFor / getUnitIdByContentHash);
+///         derive from that, never from the sequential unitId, which is
+///         assigned only at mining time and can be shifted by concurrent
+///         registrations.
 ///
 ///         Deployment requires a chain with the P256VERIFY precompile
 ///         (EIP-7951 / RIP-7212) at address 0x100.
 contract WebAuthnP256PublicKeyRegistry {
-    uint8 public constant VERSION = 5;
+    uint8 public constant VERSION = 6;
 
     uint256 public constant MAX_RPID_LENGTH = 253;
     uint256 public constant UNCOMPRESSED_P256_KEY_LENGTH = 65; // 04 || x(32) || y(32)
     /// Opaque caller-defined bytes; the registry never reads them.
-    uint256 public constant MAX_METADATA_LENGTH = 1024;
+    uint256 public constant MAX_METADATA_LENGTH = 2048;
     /// version(1) || AAGUID(16) || authData flags(1) || attachment(1) || transports(1)
     uint256 public constant ATTESTATION_LENGTH = 20;
     uint8 public constant ATTESTATION_VERSION = 1;
@@ -130,10 +143,14 @@ contract WebAuthnP256PublicKeyRegistry {
     mapping(bytes32 => uint256[]) private _entriesByKey;
     mapping(string => uint256[]) private _entriesByRpId;
 
-    /// Consumed unit nonces: every proof dies with its registration.
-    mapping(bytes32 => bool) private _usedNonces;
-    /// Consumed content hashes: identical unit content registers once.
-    mapping(bytes32 => bool) private _seenContent;
+    /// Consumed (publicKey, unitNonce) pairs, keyed by
+    /// keccak256(abi.encode(publicKey, unitNonce)): every proof dies with
+    /// its registration, and only the key holder can burn its own pairs.
+    mapping(bytes32 => bool) private _usedNoncePairs;
+    /// Registered unit content, contentHash => unitId + 1 (0 = absent):
+    /// identical unit content registers once, and the content hash doubles
+    /// as the unit's stable, offline-computable identity.
+    mapping(bytes32 => uint256) private _unitIdPlusOneByContent;
 
     // Enumeration support.
     string[] private _rpIds;
@@ -154,6 +171,7 @@ contract WebAuthnP256PublicKeyRegistry {
     error MetadataTooLong(uint256 length);
     error InvalidAttestation(uint256 length);
     error InvalidMemberCount(uint256 count);
+    error DuplicateMemberKey(uint256 index);
     error InvalidProof();
     error RpIdMismatch();
     error NonceAlreadyUsed(bytes32 unitNonce);
@@ -218,14 +236,22 @@ contract WebAuthnP256PublicKeyRegistry {
         return keccak256(abi.encode(block.chainid, address(this), rpId, publicKey, unitNonce));
     }
 
-    /// @notice Whether a unit nonce has been consumed.
-    function isNonceUsed(bytes32 unitNonce) external view returns (bool) {
-        return _usedNonces[unitNonce];
+    /// @notice Whether a (publicKey, unitNonce) pair has been consumed —
+    ///         i.e. whether that key's proof over that nonce is spent.
+    function isNonceUsed(bytes calldata publicKey, bytes32 unitNonce) external view returns (bool) {
+        return _usedNoncePairs[keccak256(abi.encode(publicKey, unitNonce))];
     }
 
     /// @notice Whether identical unit content has already been registered.
     function isContentRegistered(bytes32 contentHash) external view returns (bool) {
-        return _seenContent[contentHash];
+        return _unitIdPlusOneByContent[contentHash] != 0;
+    }
+
+    /// @notice Resolve a unit by its stable identity, the content hash.
+    function getUnitIdByContentHash(bytes32 contentHash) external view returns (bool exists, uint256 unitId) {
+        uint256 idPlusOne = _unitIdPlusOneByContent[contentHash];
+        if (idPlusOne == 0) return (false, 0);
+        return (true, idPlusOne - 1);
     }
 
     /// @notice The content hash used for duplicate suppression.
@@ -285,8 +311,9 @@ contract WebAuthnP256PublicKeyRegistry {
 
     /// @notice The one write entrypoint: append one unit of 1..7 members
     ///         atomically. Every member authorizes the storage of its key
-    ///         with a fresh assertion over (rpId, own key, unitNonce); the
-    ///         nonce is consumed, and identical content registers only once.
+    ///         with a fresh assertion over (rpId, own key, unitNonce); each
+    ///         member's (key, nonce) pair is consumed, and identical content
+    ///         registers only once.
     function register(string calldata rpId, bytes calldata metadata, bytes32 unitNonce, Member[] calldata members)
         external
     {
@@ -296,13 +323,11 @@ contract WebAuthnP256PublicKeyRegistry {
             revert InvalidMemberCount(members.length);
         }
 
-        if (_usedNonces[unitNonce]) revert NonceAlreadyUsed(unitNonce);
-        _usedNonces[unitNonce] = true;
         bytes32 contentHash = contentHashFor(rpId, metadata, members);
-        if (_seenContent[contentHash]) revert UnitAlreadyRegistered(contentHash);
-        _seenContent[contentHash] = true;
+        if (_unitIdPlusOneByContent[contentHash] != 0) revert UnitAlreadyRegistered(contentHash);
 
         uint256 unitId = _units.length;
+        _unitIdPlusOneByContent[contentHash] = unitId + 1;
         uint256 firstEntryId = _entries.length;
         _units.push(
             Unit({
@@ -318,6 +343,22 @@ contract WebAuthnP256PublicKeyRegistry {
             _rpCreatedAt[rpId] = block.timestamp;
         }
 
+        // First pass: distinct member keys, and consume each (key, nonce)
+        // pair — only the key holder's own signature can ever burn it.
+        bytes32[] memory keyHashes = new bytes32[](members.length);
+        for (uint256 i = 0; i < members.length; i++) {
+            bytes32 keyHash = keccak256(members[i].publicKey);
+            for (uint256 j = 0; j < i; j++) {
+                if (keyHashes[j] == keyHash) revert DuplicateMemberKey(i);
+            }
+            keyHashes[i] = keyHash;
+
+            bytes32 noncePair = keccak256(abi.encode(members[i].publicKey, unitNonce));
+            if (_usedNoncePairs[noncePair]) revert NonceAlreadyUsed(unitNonce);
+            _usedNoncePairs[noncePair] = true;
+        }
+
+        // Second pass: verify each possession proof and append the entry.
         for (uint256 i = 0; i < members.length; i++) {
             Member calldata member = members[i];
             (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
@@ -326,10 +367,10 @@ contract WebAuthnP256PublicKeyRegistry {
 
             uint256 entryId = _entries.length;
             _entries.push(Entry({unitId: unitId, publicKey: member.publicKey, attestation: member.attestation}));
-            _entriesByKey[keccak256(member.publicKey)].push(entryId);
+            _entriesByKey[keyHashes[i]].push(entryId);
             _entriesByRpId[rpId].push(entryId);
 
-            emit EntryCreated(entryId, keccak256(member.publicKey), unitId, member.publicKey, member.attestation);
+            emit EntryCreated(entryId, keyHashes[i], unitId, member.publicKey, member.attestation);
         }
 
         emit UnitRegistered(unitId, keccak256(bytes(rpId)), firstEntryId, members.length);

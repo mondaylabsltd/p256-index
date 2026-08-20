@@ -141,7 +141,7 @@ pub trait ReadChain: Send + Sync {
     ) -> Result<Page<SiteItem>, ChainError>;
     /// (total entries, total units, total rpIds)
     async fn totals(&self) -> Result<(u64, u64, u64), ChainError>;
-    async fn is_nonce_used(&self, unit_nonce: B256) -> Result<bool, ChainError>;
+    async fn is_nonce_used(&self, public_key: Vec<u8>, unit_nonce: B256) -> Result<bool, ChainError>;
     async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError>;
 }
 
@@ -306,9 +306,16 @@ impl Chain {
         decode_has_entries(&bytes).map_err(|_| ChainError::InvalidResponse)
     }
 
-    pub async fn is_nonce_used(&self, unit_nonce: B256) -> Result<bool, ChainError> {
+    pub async fn is_nonce_used(
+        &self,
+        public_key: Vec<u8>,
+        unit_nonce: B256,
+    ) -> Result<bool, ChainError> {
         let bytes = self
-            .call_contract(self.registry_address, is_nonce_used_calldata(unit_nonce))
+            .call_contract(
+                self.registry_address,
+                is_nonce_used_calldata(public_key, unit_nonce),
+            )
             .await?;
         decode_bool(&bytes).map_err(|_| ChainError::InvalidResponse)
     }
@@ -692,8 +699,8 @@ impl ReadChain for Chain {
         Chain::totals(self).await
     }
 
-    async fn is_nonce_used(&self, unit_nonce: B256) -> Result<bool, ChainError> {
-        Chain::is_nonce_used(self, unit_nonce).await
+    async fn is_nonce_used(&self, public_key: Vec<u8>, unit_nonce: B256) -> Result<bool, ChainError> {
+        Chain::is_nonce_used(self, public_key, unit_nonce).await
     }
 
     async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError> {

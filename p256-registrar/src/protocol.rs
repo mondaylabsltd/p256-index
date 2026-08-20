@@ -71,7 +71,7 @@ sol! {
         function getTotalRpIds() external view returns (uint256);
         function getRpIds(uint256 offset, uint256 limit, bool desc)
             external view returns (uint256 total, string[] memory rpIds, uint256[] memory counts, uint256[] memory createdAts);
-        function isNonceUsed(bytes32 unitNonce) external view returns (bool);
+        function isNonceUsed(bytes calldata publicKey, bytes32 unitNonce) external view returns (bool);
         function isContentRegistered(bytes32 contentHash) external view returns (bool);
     }
 }
@@ -335,8 +335,9 @@ pub fn rp_ids_calldata(offset: u64, limit: u64, desc: bool) -> Vec<u8> {
     .abi_encode()
 }
 
-pub fn is_nonce_used_calldata(unit_nonce: B256) -> Vec<u8> {
+pub fn is_nonce_used_calldata(public_key: Vec<u8>, unit_nonce: B256) -> Vec<u8> {
     WebAuthnP256PublicKeyRegistry::isNonceUsedCall {
+        publicKey: public_key.into(),
         unitNonce: unit_nonce,
     }
     .abi_encode()

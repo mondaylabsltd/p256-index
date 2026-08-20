@@ -20,9 +20,9 @@ library Base64Url {
             out[outIndex++] = ALPHABET[chunk & 0x3f];
         }
         uint256 tail = (uint256(uint8(value[30])) << 8) | uint256(uint8(value[31]));
-        out[outIndex++] = ALPHABET[(tail >> 10) & 0x3f];
-        out[outIndex++] = ALPHABET[(tail >> 4) & 0x3f];
-        out[outIndex] = ALPHABET[(tail << 2) & 0x3f];
+        out[40] = ALPHABET[(tail >> 10) & 0x3f];
+        out[41] = ALPHABET[(tail >> 4) & 0x3f];
+        out[42] = ALPHABET[(tail << 2) & 0x3f];
         return string(out);
     }
 }
