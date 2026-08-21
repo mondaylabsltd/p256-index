@@ -18,7 +18,6 @@ use axum::{
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crux_core::Core;
-use rand::Rng as _;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -27,11 +26,12 @@ use p256_registrar::{
         AdmissionApp, AdmissionEffect, AdmissionEvent, AdmissionOperation, AdmissionOutcome,
         AdmissionResult, AdmitOutcome, RegisterRequest,
     },
+    admission::{validate_attestation_hex, validate_public_key_hex},
     lookup::{
         ChainFetch, LookupApp, LookupCacheKey, LookupEffect, LookupEndpoint, LookupEvent,
         LookupOperation, LookupOutcome, LookupParams, LookupResult, TtlClass, task_status_body,
     },
-    protocol::{challenge_for, parse_b256, parse_hex_bytes},
+    protocol::{challenge_for, content_hash_for, member_binding_for, parse_b256, parse_hex_bytes},
     sentinel,
     task::TaskStatus,
 };
@@ -193,50 +193,228 @@ async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Convenience: compute the storage-authorization challenge one member's key
-/// must sign for this registry and chain — pure arithmetic, so clients that
-/// would rather not implement abi.encode/keccak can fetch it. With no body it
-/// returns a random unitNonce suggestion.
+/// Compute storage-authorization challenges, enforcing exactly what
+/// admission (and the contract) will accept — a challenge handed out here
+/// is never one that register must reject.
+///
+/// Two modes, mirroring the two signing moments:
+/// - MEMBER mode ({rpId, groupPublicKey, publicKey, attestation?}): the
+///   binding a passkey signs the moment it is created — independent of the
+///   metadata and of every sibling.
+/// - GROUP mode ({rpId, metadata?, groupPublicKey, members: [{publicKey,
+///   attestation?}]}): the unit's content hash and the group key's closing
+///   challenge, once the unit is final (member challenges are echoed too).
 async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Response {
     let Ok(bytes) = to_bytes(request.into_body(), MAX_BODY_SIZE).await else {
         return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
     };
-    if bytes.is_empty() {
-        let mut nonce = [0u8; 32];
-        rand::rng().fill(&mut nonce);
-        return json_response(
-            StatusCode::OK,
-            json!({ "unitNonce": format!("0x{}", hex::encode(nonce)) }),
-        );
-    }
     let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid JSON body");
     };
-    let (Some(rp_id), Some(public_key), Some(unit_nonce)) = (
-        body.get("rpId").and_then(Value::as_str),
-        body.get("publicKey").and_then(Value::as_str),
-        body.get("unitNonce").and_then(Value::as_str),
-    ) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "rpId, publicKey, and unitNonce are required",
-        );
+
+    let Some(rp_id) = body.get("rpId").and_then(Value::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "rpId is required");
     };
+    if rp_id.is_empty() || rp_id.len() > 253 {
+        return error_response(StatusCode::BAD_REQUEST, "rpId must be 1..=253 bytes");
+    }
+    let Some(group_public_key) = body.get("groupPublicKey").and_then(Value::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "groupPublicKey is required");
+    };
+    let group_public_key = match validate_public_key_hex(group_public_key) {
+        Ok(normalized) => normalized,
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("groupPublicKey: {message}"),
+            );
+        }
+    };
+    let group_key_bytes = hex::decode(&group_public_key).expect("validated hex");
     let Ok(registry) = state.chain.registry_address().parse() else {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "registry misconfigured");
     };
-    let (Ok(key_bytes), Ok(nonce)) = (parse_hex_bytes(public_key), parse_b256(unit_nonce)) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "publicKey must be hex and unitNonce 32-byte hex",
-        );
-    };
-    let challenge = challenge_for(state.chain_id, registry, rp_id, &key_bytes, nonce);
-    json_response(
-        StatusCode::OK,
+
+    let render_challenge = |challenge: alloy::primitives::B256| {
         json!({
             "challenge": format!("{challenge:#x}"),
             "challengeBase64url": URL_SAFE_NO_PAD.encode(challenge.0),
+        })
+    };
+
+    // MEMBER mode: one passkey signing at creation.
+    if body.get("members").is_none() {
+        let Some(public_key) = body.get("publicKey").and_then(Value::as_str) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "publicKey (member mode) or members (group mode) is required",
+            );
+        };
+        let public_key = match validate_public_key_hex(public_key) {
+            Ok(normalized) => normalized,
+            Err(message) => {
+                return error_response(StatusCode::BAD_REQUEST, &format!("publicKey: {message}"));
+            }
+        };
+        if public_key == group_public_key {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "the group key cannot also be a member",
+            );
+        }
+        let attestation = match validate_attestation_hex(
+            body.get("attestation")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ) {
+            Ok(normalized) => normalized,
+            Err(message) => {
+                return error_response(StatusCode::BAD_REQUEST, &format!("attestation: {message}"));
+            }
+        };
+        let attestation_bytes = parse_hex_bytes(&attestation).expect("validated hex");
+        let binding = member_binding_for(&group_key_bytes, &attestation_bytes);
+        let key_bytes = hex::decode(&public_key).expect("validated hex");
+        let challenge = challenge_for(state.chain_id, registry, rp_id, &key_bytes, binding);
+        let mut response = render_challenge(challenge);
+        response["binding"] = json!(format!("{binding:#x}"));
+        return json_response(StatusCode::OK, response);
+    }
+
+    // GROUP mode: the finished unit's content hash and closing challenge.
+    let members = body
+        .get("members")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if members.is_empty() || members.len() > p256_registrar::admission::MAX_MEMBERS {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "members must contain 1 to 7 entries",
+        );
+    }
+    let metadata = body.get("metadata").and_then(Value::as_str).unwrap_or("");
+    let metadata_bytes = match parse_hex_bytes(metadata) {
+        Ok(bytes) if bytes.len() <= p256_registrar::admission::MAX_METADATA_BYTES => bytes,
+        Ok(_) => return error_response(StatusCode::BAD_REQUEST, "metadata exceeds max length"),
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "metadata must be hex"),
+    };
+    let metadata = if metadata_bytes.is_empty() {
+        String::new()
+    } else {
+        format!("0x{}", hex::encode(&metadata_bytes))
+    };
+
+    let mut skeleton_members = Vec::with_capacity(members.len());
+    for (index, member) in members.iter().enumerate() {
+        let Some(public_key) = member.get("publicKey").and_then(Value::as_str) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("members[{index}]: publicKey is required"),
+            );
+        };
+        let public_key = match validate_public_key_hex(public_key) {
+            Ok(normalized) => normalized,
+            Err(message) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("members[{index}]: {message}"),
+                );
+            }
+        };
+        if public_key == group_public_key {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("members[{index}]: the group key cannot also be a member"),
+            );
+        }
+        if skeleton_members
+            .iter()
+            .any(|earlier: &p256_registrar::task::Member| earlier.public_key == public_key)
+        {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("members[{index}]: duplicate public key within the unit"),
+            );
+        }
+        let attestation = match validate_attestation_hex(
+            member
+                .get("attestation")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ) {
+            Ok(normalized) => normalized,
+            Err(message) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("members[{index}]: {message}"),
+                );
+            }
+        };
+        skeleton_members.push(p256_registrar::task::Member {
+            public_key,
+            attestation,
+            proof: p256_registrar::task::Proof {
+                authenticator_data: String::new(),
+                client_data_json: String::new(),
+                challenge_index: 0,
+                type_index: 0,
+                r: String::new(),
+                s: String::new(),
+            },
+        });
+    }
+    let skeleton = p256_registrar::task::RegisterTask {
+        id: String::new(),
+        status: TaskStatus::Pending,
+        rp_id: rp_id.to_owned(),
+        metadata,
+        content_hash: String::new(),
+        group_public_key: group_public_key.clone(),
+        group_proof: p256_registrar::task::Proof {
+            authenticator_data: String::new(),
+            client_data_json: String::new(),
+            challenge_index: 0,
+            type_index: 0,
+            r: String::new(),
+            s: String::new(),
+        },
+        members: skeleton_members,
+        tx_hash: None,
+        first_entry_id: None,
+        error: None,
+        retries: 0,
+        created_at: 0,
+        admitted: false,
+    };
+    let content_hash = content_hash_for(&skeleton).expect("validated fields");
+
+    let group_challenge = challenge_for(
+        state.chain_id,
+        registry,
+        rp_id,
+        &group_key_bytes,
+        content_hash,
+    );
+    let member_challenges: Vec<Value> = skeleton
+        .members
+        .iter()
+        .map(|member| {
+            let key = hex::decode(&member.public_key).expect("validated hex");
+            let attestation = parse_hex_bytes(&member.attestation).expect("validated hex");
+            let binding = member_binding_for(&group_key_bytes, &attestation);
+            let challenge = challenge_for(state.chain_id, registry, rp_id, &key, binding);
+            let mut rendered = render_challenge(challenge);
+            rendered["publicKey"] = json!(member.public_key);
+            rendered
+        })
+        .collect();
+    json_response(
+        StatusCode::OK,
+        json!({
+            "contentHash": format!("{content_hash:#x}"),
+            "groupChallenge": render_challenge(group_challenge),
+            "members": member_challenges,
         }),
     )
 }
@@ -302,8 +480,8 @@ async fn execute_admission(
             Ok(allowed) => AdmissionResult::Allowed { allowed },
             Err(_) => AdmissionResult::StoreUnavailable,
         },
-        AdmissionOperation::FindTaskByNonce { unit_nonce } => {
-            match state.store.find_by_nonce(unit_nonce).await {
+        AdmissionOperation::FindTaskByContent { content_hash } => {
+            match state.store.find_by_content(content_hash).await {
                 Ok(task) => AdmissionResult::TaskFound { task },
                 Err(_) => AdmissionResult::StoreUnavailable,
             }
@@ -315,32 +493,6 @@ async fn execute_admission(
             match state.chain.is_content_registered(content_hash).await {
                 Ok(value) => AdmissionResult::ChainBool { value },
                 Err(_) => AdmissionResult::ChainReadFailed,
-            }
-        }
-        AdmissionOperation::CheckNonceUsed {
-            unit_nonce,
-            public_keys,
-        } => {
-            let Ok(unit_nonce) = parse_b256(unit_nonce) else {
-                return AdmissionResult::ChainReadFailed;
-            };
-            // True as soon as any member's (key, nonce) pair is spent;
-            // a read failure without a positive stays fail-open.
-            let mut any_failed = false;
-            for public_key in public_keys {
-                let Ok(key_bytes) = parse_hex_bytes(&public_key) else {
-                    return AdmissionResult::ChainReadFailed;
-                };
-                match state.chain.is_nonce_used(key_bytes, unit_nonce).await {
-                    Ok(true) => return AdmissionResult::ChainBool { value: true },
-                    Ok(false) => {}
-                    Err(_) => any_failed = true,
-                }
-            }
-            if any_failed {
-                AdmissionResult::ChainReadFailed
-            } else {
-                AdmissionResult::ChainBool { value: false }
             }
         }
         AdmissionOperation::QueueDepth => match state.store.queue_stats().await {
@@ -398,9 +550,6 @@ fn render_admission(outcome: AdmissionOutcome) -> Response {
             StatusCode::OK,
             json!({ "status": "done", "contentHash": content_hash }),
         ),
-        AdmissionOutcome::NonceConflict { message } => {
-            json_response(StatusCode::CONFLICT, json!({ "error": message }))
-        }
         AdmissionOutcome::Busy => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "service is busy, please retry later",
@@ -797,14 +946,6 @@ mod tests {
             Err(ChainError::Unavailable)
         }
 
-        async fn is_nonce_used(
-            &self,
-            _: Vec<u8>,
-            _: alloy::primitives::B256,
-        ) -> Result<bool, ChainError> {
-            Err(ChainError::Unavailable)
-        }
-
         async fn is_content_registered(
             &self,
             _: alloy::primitives::B256,
@@ -857,18 +998,12 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json body")
     }
 
-    /// One member with a REAL possession proof over its storage challenge.
-    fn signed_member_json(rp_id: &str, nonce_hex: &str) -> (Value, String) {
-        let signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
-        let public = hex::encode(signing.verifying_key().to_sec1_point(false).as_bytes());
-        let nonce = parse_b256(nonce_hex).unwrap();
-        let challenge = challenge_for(
-            p256_registrar::protocol::CHAIN_ID,
-            REGISTRY.parse().unwrap(),
-            rp_id,
-            &hex::decode(&public).unwrap(),
-            nonce,
-        );
+    /// A raw WebAuthn-shaped proof JSON by `signing` over `challenge`.
+    fn proof_json(
+        signing: &p256::ecdsa::SigningKey,
+        challenge: alloy::primitives::B256,
+        rp_id: &str,
+    ) -> Value {
         let client_data = format!(
             "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
             base64url_32(&challenge)
@@ -883,20 +1018,102 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(&signed).into();
         let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
         let bytes = signature.to_bytes();
-        (
-            json!({
-                "publicKey": public,
-                "proof": {
-                    "authenticatorData": hex::encode(auth_data),
-                    "clientDataJSON": client_data,
-                    "challengeIndex": 23,
-                    "typeIndex": 1,
-                    "r": format!("0x{}", hex::encode(&bytes[..32])),
-                    "s": format!("0x{}", hex::encode(&bytes[32..])),
-                }
-            }),
-            public,
-        )
+        json!({
+            "authenticatorData": hex::encode(auth_data),
+            "clientDataJSON": client_data,
+            "challengeIndex": 23,
+            "typeIndex": 1,
+            "r": format!("0x{}", hex::encode(&bytes[..32])),
+            "s": format!("0x{}", hex::encode(&bytes[32..])),
+        })
+    }
+
+    /// A fully-signed single-member unit exactly the way real clients build
+    /// one: a fresh group key and a fresh passkey; the member binds
+    /// (groupKey, own attestation), the group key closes over the content
+    /// hash. Returns (register body, member pub hex, group pub hex).
+    fn signed_unit_json(rp_id: &str, metadata_hex: &str) -> (Value, String, String) {
+        let member_signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+        let member_public = hex::encode(
+            member_signing
+                .verifying_key()
+                .to_sec1_point(false)
+                .as_bytes(),
+        );
+        let group_signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+        let group_public = hex::encode(
+            group_signing
+                .verifying_key()
+                .to_sec1_point(false)
+                .as_bytes(),
+        );
+        let registry: alloy::primitives::Address = REGISTRY.parse().unwrap();
+
+        let binding = member_binding_for(&hex::decode(&group_public).unwrap(), &[]);
+        let member_challenge = challenge_for(
+            p256_registrar::protocol::CHAIN_ID,
+            registry,
+            rp_id,
+            &hex::decode(&member_public).unwrap(),
+            binding,
+        );
+        let member_proof = proof_json(&member_signing, member_challenge, rp_id);
+
+        let skeleton = p256_registrar::task::RegisterTask {
+            id: String::new(),
+            status: TaskStatus::Pending,
+            rp_id: rp_id.to_owned(),
+            metadata: metadata_hex.to_owned(),
+            content_hash: String::new(),
+            group_public_key: group_public.clone(),
+            group_proof: p256_registrar::task::Proof {
+                authenticator_data: String::new(),
+                client_data_json: String::new(),
+                challenge_index: 0,
+                type_index: 0,
+                r: String::new(),
+                s: String::new(),
+            },
+            members: vec![p256_registrar::task::Member {
+                public_key: member_public.clone(),
+                attestation: String::new(),
+                proof: p256_registrar::task::Proof {
+                    authenticator_data: String::new(),
+                    client_data_json: String::new(),
+                    challenge_index: 0,
+                    type_index: 0,
+                    r: String::new(),
+                    s: String::new(),
+                },
+            }],
+            tx_hash: None,
+            first_entry_id: None,
+            error: None,
+            retries: 0,
+            created_at: 0,
+            admitted: false,
+        };
+        let content_hash = content_hash_for(&skeleton).unwrap();
+        let group_challenge = challenge_for(
+            p256_registrar::protocol::CHAIN_ID,
+            registry,
+            rp_id,
+            &hex::decode(&group_public).unwrap(),
+            content_hash,
+        );
+        let group_proof = proof_json(&group_signing, group_challenge, rp_id);
+
+        let body = json!({
+            "rpId": rp_id,
+            "metadata": metadata_hex,
+            "groupPublicKey": group_public,
+            "groupProof": group_proof,
+            "members": [{
+                "publicKey": member_public,
+                "proof": member_proof,
+            }],
+        });
+        (body, member_public, group_public)
     }
 
     /// The full HTTP contract over real Redis (Iggy is faked; the chain is
@@ -933,23 +1150,75 @@ mod tests {
         let invalid = request(&app, "POST", "/api/register", "not-json").await;
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
-        // Nonce suggestion from the empty-body challenge endpoint.
-        let suggestion = request(&app, "POST", "/api/challenge", "").await;
-        assert_eq!(suggestion.status(), StatusCode::OK);
-        let nonce_hex = response_json(suggestion).await["unitNonce"]
-            .as_str()
-            .expect("nonce")
-            .to_owned();
+        // A fully-proven single-member unit (group key + one passkey).
+        let (body_json, public_key, group_public_key) = signed_unit_json("http.example", "0xaabb");
+        let body = body_json.to_string();
 
-        // A fully-proven single-member registration.
-        let (member, public_key) = signed_member_json("http.example", &nonce_hex);
-        let body = json!({
+        // MEMBER mode: the endpoint reproduces exactly the binding-bound
+        // challenge the member signed.
+        let member_mode = json!({
             "rpId": "http.example",
-            "metadata": "0xaabb",
-            "unitNonce": nonce_hex,
-            "members": [member],
+            "groupPublicKey": group_public_key,
+            "publicKey": public_key,
         })
         .to_string();
+        let derived = request(&app, "POST", "/api/challenge", &member_mode).await;
+        assert_eq!(derived.status(), StatusCode::OK);
+        let derived = response_json(derived).await;
+        assert_eq!(
+            derived["challengeBase64url"].as_str().expect("challenge"),
+            body_json["members"][0]["proof"]["clientDataJSON"]
+                .as_str()
+                .expect("clientDataJSON")
+                .split("\"challenge\":\"")
+                .nth(1)
+                .expect("challenge field")
+                .split('\"')
+                .next()
+                .expect("challenge value")
+        );
+
+        // GROUP mode: content hash + the closing challenge the group signed.
+        let group_mode = json!({
+            "rpId": "http.example",
+            "metadata": "0xaabb",
+            "groupPublicKey": group_public_key,
+            "members": [{ "publicKey": public_key }],
+        })
+        .to_string();
+        let derived = request(&app, "POST", "/api/challenge", &group_mode).await;
+        assert_eq!(derived.status(), StatusCode::OK);
+        let derived = response_json(derived).await;
+        assert!(
+            derived["contentHash"]
+                .as_str()
+                .is_some_and(|hash| hash.starts_with("0x"))
+        );
+        assert_eq!(
+            derived["groupChallenge"]["challengeBase64url"]
+                .as_str()
+                .expect("group challenge"),
+            body_json["groupProof"]["clientDataJSON"]
+                .as_str()
+                .expect("group clientDataJSON")
+                .split("\"challenge\":\"")
+                .nth(1)
+                .expect("challenge field")
+                .split('\"')
+                .next()
+                .expect("challenge value")
+        );
+
+        // The endpoint enforces admission's checks: a malformed key is a
+        // 400, never a mis-computed challenge.
+        let bad_key = json!({
+            "rpId": "http.example",
+            "groupPublicKey": group_public_key,
+            "publicKey": "0x0400",
+        })
+        .to_string();
+        let refused = request(&app, "POST", "/api/challenge", &bad_key).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
 
         let created = request(&app, "POST", "/api/register", &body).await;
         assert_eq!(created.status(), StatusCode::ACCEPTED);
@@ -958,30 +1227,26 @@ mod tests {
         let id = created["id"].as_str().expect("task id").to_owned();
         assert_eq!(queue.tasks.lock().expect("lock").len(), 1);
 
-        // Same unit resubmitted → the same task (idempotency by nonce).
+        // Same unit resubmitted → the same task (idempotency by content
+        // hash).
         let duplicate = request(&app, "POST", "/api/register", &body).await;
         assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
         assert_eq!(response_json(duplicate).await["id"], id);
         assert_eq!(queue.tasks.lock().expect("lock").len(), 1);
 
-        // A DIFFERENT unit on the same nonce → 409.
-        let (other_member, _) = signed_member_json("http.example", &nonce_hex);
-        let conflicting = json!({
-            "rpId": "http.example",
-            "metadata": "0xcc",
-            "unitNonce": nonce_hex,
-            "members": [other_member],
-        })
-        .to_string();
-        let conflict = request(&app, "POST", "/api/register", &conflicting).await;
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        // A different unit is simply a second registration.
+        let (second_body, _, _) = signed_unit_json("http.example", "0xcc");
+        let second = request(&app, "POST", "/api/register", &second_body.to_string()).await;
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_ne!(response_json(second).await["id"], id);
+        assert_eq!(queue.tasks.lock().expect("lock").len(), 2);
 
         // An invalid proof never reaches Redis or the queue.
         let mut tampered: Value = serde_json::from_str(&body).unwrap();
         tampered["members"][0]["proof"]["typeIndex"] = json!(2);
         let rejected = request(&app, "POST", "/api/register", &tampered.to_string()).await;
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(queue.tasks.lock().expect("lock").len(), 1);
+        assert_eq!(queue.tasks.lock().expect("lock").len(), 2);
 
         // Task status disclosure.
         let status = request(&app, "GET", &format!("/api/task/{id}"), "").await;

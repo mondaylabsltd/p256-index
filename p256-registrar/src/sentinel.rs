@@ -100,8 +100,10 @@ pub fn low_runway_alert(runway: f64, balance_xdai: f64, gas_price_gwei: f64) -> 
 // ── Daily heartbeat ────────────────────────────────────────────────────────
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Rough all-in gas per single-member register(). Only used for the runway estimate.
-pub const EST_GAS_PER_CREATE: u64 = 700_000;
+/// Rough all-in gas per register(), used only for the runway estimate.
+/// A group + 1 member unit is ~1.1M gas on a precompile chain; multi-key
+/// units cost more, so treat the runway as an optimistic ceiling.
+pub const EST_GAS_PER_CREATE: u64 = 1_100_000;
 
 pub struct HeartbeatInput<'a> {
     pub runtime: &'a str,
@@ -189,10 +191,10 @@ mod tests {
 
     #[test]
     fn runway_multiplies_before_dividing() {
-        assert_eq!(EST_GAS_PER_CREATE, 700_000);
-        assert_eq!(estimate_create_runway(0.7, 1.0), 1000.0);
-        assert_eq!(estimate_create_runway(0.7, 10.0), 100.0);
-        assert!(estimate_create_runway(0.7, 0.0).is_infinite());
+        assert_eq!(EST_GAS_PER_CREATE, 1_100_000);
+        assert_eq!(estimate_create_runway(1.1, 1.0), 1000.0);
+        assert_eq!(estimate_create_runway(1.1, 10.0), 100.0);
+        assert!(estimate_create_runway(1.1, 0.0).is_infinite());
     }
 
     #[test]
@@ -210,7 +212,7 @@ mod tests {
         assert!(message.contains("daily heartbeat"));
         assert!(message.contains("2 active, 0 DLQ"));
         assert!(
-            message.contains("0xAAA: 0.700000 xDAI (~1000 registrations @ 1.000 gwei)"),
+            message.contains("0xAAA: 0.700000 xDAI (~636 registrations @ 1.000 gwei)"),
             "{message}"
         );
         assert!(message.contains("up 3h"));

@@ -24,8 +24,8 @@ use p256_registrar::{
         CHAIN_ID, UNIT_REGISTERED_TOPIC, decode_bool, decode_entries_page, decode_entry,
         decode_has_entries, decode_rp_ids, decode_total, entries_by_key_calldata,
         entries_by_rp_id_calldata, get_entry_calldata, has_entries_calldata,
-        is_content_registered_calldata, is_nonce_used_calldata, is_revert, register_calldata,
-        rp_ids_calldata, total_entries_calldata, total_rp_ids_calldata, total_units_calldata,
+        is_content_registered_calldata, is_revert, register_calldata, rp_ids_calldata,
+        total_entries_calldata, total_rp_ids_calldata, total_units_calldata,
     },
     roster::{Lane, Roster},
     task::RegisterTask,
@@ -141,7 +141,6 @@ pub trait ReadChain: Send + Sync {
     ) -> Result<Page<SiteItem>, ChainError>;
     /// (total entries, total units, total rpIds)
     async fn totals(&self) -> Result<(u64, u64, u64), ChainError>;
-    async fn is_nonce_used(&self, public_key: Vec<u8>, unit_nonce: B256) -> Result<bool, ChainError>;
     async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError>;
 }
 
@@ -304,20 +303,6 @@ impl Chain {
             .call_contract(self.registry_address, has_entries_calldata(key))
             .await?;
         decode_has_entries(&bytes).map_err(|_| ChainError::InvalidResponse)
-    }
-
-    pub async fn is_nonce_used(
-        &self,
-        public_key: Vec<u8>,
-        unit_nonce: B256,
-    ) -> Result<bool, ChainError> {
-        let bytes = self
-            .call_contract(
-                self.registry_address,
-                is_nonce_used_calldata(public_key, unit_nonce),
-            )
-            .await?;
-        decode_bool(&bytes).map_err(|_| ChainError::InvalidResponse)
     }
 
     pub async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError> {
@@ -632,7 +617,8 @@ impl Chain {
 
 /// Extract the unit's first entry id from a register receipt's
 /// UnitRegistered(uint256 indexed unitId, bytes32 indexed rpIdHash,
-/// uint256 firstEntryId, uint256 memberCount) log.
+/// bytes32 indexed groupKeyHash, uint256 firstEntryId, uint256 memberCount,
+/// bytes groupPublicKey) log — firstEntryId is the first data word.
 fn parse_first_entry_id(receipt: &Value) -> Option<u64> {
     let logs = receipt.get("logs")?.as_array()?;
     for log in logs {
@@ -697,10 +683,6 @@ impl ReadChain for Chain {
 
     async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
         Chain::totals(self).await
-    }
-
-    async fn is_nonce_used(&self, public_key: Vec<u8>, unit_nonce: B256) -> Result<bool, ChainError> {
-        Chain::is_nonce_used(self, public_key, unit_nonce).await
     }
 
     async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError> {

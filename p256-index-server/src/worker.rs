@@ -220,7 +220,7 @@ impl CreateWorker {
         Ok(())
     }
 
-    /// Drive one polled batch through the commit-reveal Core. The queue
+    /// Drive one polled batch through the submission Core. The queue
     /// messages are only envelopes: the Core loads the authoritative records
     /// itself, so only the ids cross into it.
     async fn process_batch(&self, queue_tasks: Vec<RegisterTask>) -> Result<(), WorkerError> {
@@ -239,14 +239,14 @@ impl CreateWorker {
             let output = self.execute(&request.operation).await;
             let next = core
                 .resolve(&mut request, output)
-                .map_err(|_| WorkerError::new("could not resolve commit-reveal effect"))?;
+                .map_err(|_| WorkerError::new("could not resolve submission effect"))?;
             effects.extend(next);
         }
 
         match core.view().outcome {
             Some(BatchVerdict::Advance) => Ok(()),
             Some(BatchVerdict::Retry { reason }) => Err(WorkerError(reason)),
-            None => Err(WorkerError::new("commit-reveal batch never settled")),
+            None => Err(WorkerError::new("submission batch never settled")),
         }
     }
 
@@ -471,7 +471,7 @@ mod e2e_chain_tests {
     use super::{CreateWorker, NonceManager};
     use crate::{chain::Chain, config::Config, store::RedisStore};
     use p256_registrar::{
-        protocol::{challenge_for, parse_b256},
+        protocol::{challenge_for, content_hash_for, member_binding_for},
         task::{Member, Proof, RegisterTask, TaskStatus},
         verify::base64url_32,
     };
@@ -515,56 +515,84 @@ mod e2e_chain_tests {
             .await
             .expect("Redis connect");
 
-        // A fresh key with a REAL possession proof over its storage challenge.
-        let signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
-        let public_key = hex::encode(signing.verifying_key().to_sec1_point(false).as_bytes());
+        // A fresh passkey plus a fresh group key, with REAL possession
+        // proofs: the member binds (groupKey, own attestation), the group
+        // key closes over the content hash.
+        fn sign_proof(
+            signing: &p256::ecdsa::SigningKey,
+            challenge: alloy::primitives::B256,
+            rp_id: &str,
+        ) -> Proof {
+            let client_data = format!(
+                "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
+                base64url_32(&challenge)
+            );
+            let mut auth_data = Vec::new();
+            auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+            auth_data.push(0x05);
+            auth_data.extend_from_slice(&[0, 0, 0, 0]);
+            let client_hash: [u8; 32] = Sha256::digest(client_data.as_bytes()).into();
+            let mut signed = auth_data.clone();
+            signed.extend_from_slice(&client_hash);
+            let digest: [u8; 32] = Sha256::digest(&signed).into();
+            let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+            let bytes = signature.to_bytes();
+            Proof {
+                authenticator_data: hex::encode(auth_data),
+                client_data_json: client_data,
+                challenge_index: 23,
+                type_index: 1,
+                r: format!("0x{}", hex::encode(&bytes[..32])),
+                s: format!("0x{}", hex::encode(&bytes[32..])),
+            }
+        }
+
+        let member_signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+        let public_key = hex::encode(
+            member_signing
+                .verifying_key()
+                .to_sec1_point(false)
+                .as_bytes(),
+        );
+        let group_signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+        let group_public_key = hex::encode(
+            group_signing
+                .verifying_key()
+                .to_sec1_point(false)
+                .as_bytes(),
+        );
         let suffix = uuid::Uuid::new_v4();
         let rp_id = format!("e2e-chain-{suffix}.example");
-        let nonce_hex = format!(
-            "0x{}",
-            hex::encode(uuid::Uuid::new_v4().as_bytes().repeat(2))
-        );
-        let nonce = parse_b256(&nonce_hex).unwrap();
         let registry = config.contract_address.parse().expect("registry address");
-        let challenge = challenge_for(
+
+        let binding = member_binding_for(&hex::decode(&group_public_key).unwrap(), &[]);
+        let member_challenge = challenge_for(
             chain.chain_id(),
             registry,
             &rp_id,
             &hex::decode(&public_key).unwrap(),
-            nonce,
+            binding,
         );
-        let client_data = format!(
-            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
-            base64url_32(&challenge)
-        );
-        let mut auth_data = Vec::new();
-        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-        auth_data.push(0x05);
-        auth_data.extend_from_slice(&[0, 0, 0, 0]);
-        let client_hash: [u8; 32] = Sha256::digest(client_data.as_bytes()).into();
-        let mut signed = auth_data.clone();
-        signed.extend_from_slice(&client_hash);
-        let digest: [u8; 32] = Sha256::digest(&signed).into();
-        let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
-        let bytes = signature.to_bytes();
 
-        let task = RegisterTask {
+        let mut task = RegisterTask {
             id: format!("e2e-chain-{suffix}"),
             status: TaskStatus::Pending,
             rp_id: rp_id.clone(),
             metadata: "0xe2e0".into(),
-            unit_nonce: nonce_hex,
+            content_hash: String::new(),
+            group_public_key: group_public_key.clone(),
+            group_proof: Proof {
+                authenticator_data: String::new(),
+                client_data_json: String::new(),
+                challenge_index: 23,
+                type_index: 1,
+                r: String::new(),
+                s: String::new(),
+            },
             members: vec![Member {
                 public_key: public_key.clone(),
                 attestation: String::new(),
-                proof: Proof {
-                    authenticator_data: hex::encode(auth_data),
-                    client_data_json: client_data,
-                    challenge_index: 23,
-                    type_index: 1,
-                    r: format!("0x{}", hex::encode(&bytes[..32])),
-                    s: format!("0x{}", hex::encode(&bytes[32..])),
-                },
+                proof: sign_proof(&member_signing, member_challenge, &rp_id),
             }],
             tx_hash: None,
             first_entry_id: None,
@@ -573,6 +601,16 @@ mod e2e_chain_tests {
             created_at: now_ms() as i64,
             admitted: true,
         };
+        let content_hash = content_hash_for(&task).expect("content hash");
+        task.content_hash = format!("{content_hash:#x}");
+        let group_challenge = challenge_for(
+            chain.chain_id(),
+            registry,
+            &rp_id,
+            &hex::decode(&group_public_key).unwrap(),
+            content_hash,
+        );
+        task.group_proof = sign_proof(&group_signing, group_challenge, &rp_id);
         store.admit(&task).await.expect("admit task");
 
         let worker = CreateWorker {

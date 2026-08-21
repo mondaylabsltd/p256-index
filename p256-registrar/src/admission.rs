@@ -5,13 +5,13 @@
 //!
 //! - validation is TOTAL: shapes, bounds, and every member's possession
 //!   proof are verified (pure P-256, mirroring the contract) before anything
-//!   touches Redis — an invalid proof can never reach the chain or burn gas;
-//! - the unitNonce is the idempotency key: a resubmission of the same unit
-//!   returns its existing task, a different unit reusing an in-flight nonce
-//!   is a 409;
-//! - chain pre-checks are fail-open: content already registered answers
-//!   "done" retroactively, a consumed nonce (with our content absent) is a
-//!   terminal 409 — the proofs died with it, the client must re-enroll;
+//!   touches Redis — an invalid proof can never reach the chain or burn gas.
+//!   Every proof binds the unit's content hash, so a valid request is valid
+//!   for exactly its own content;
+//! - the content hash is the idempotency key: a resubmission of the same
+//!   unit returns its existing task, and nothing else can collide with it;
+//! - the chain pre-check is fail-open: content already registered answers
+//!   "done" retroactively;
 //! - write gates: active queue depth and the global create budget;
 //! - the two-phase admission protocol: Redis admit → Iggy enqueue → mark
 //!   admitted. A failed enqueue keeps the placeholder so a retry reuses the
@@ -27,7 +27,7 @@ use alloy::primitives::Address;
 use crux_core::{App, Command, command::CommandContext, macros::effect};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{challenge_for, content_hash_for, parse_b256, parse_hex_bytes};
+use crate::protocol::{challenge_for, content_hash_for, member_binding_for, parse_hex_bytes};
 use crate::task::{Member, Proof, RegisterTask, TaskStatus};
 use crate::verify::verify_proof;
 
@@ -67,7 +67,8 @@ pub struct MemberRequest {
 pub struct RegisterRequest {
     pub rp_id: Option<String>,
     pub metadata: Option<String>,
-    pub unit_nonce: Option<String>,
+    pub group_public_key: Option<String>,
+    pub group_proof: Option<ProofRequest>,
     pub members: Option<Vec<MemberRequest>>,
 }
 
@@ -79,23 +80,17 @@ pub enum AdmissionOperation {
     /// May this client register right now? The shell resolves this against
     /// its salted per-IP counter; the raw IP never enters the Core.
     AllowIpCreate,
-    /// The in-flight/terminal task holding this unitNonce, if any.
-    FindTaskByNonce {
-        unit_nonce: String,
+    /// The in-flight/terminal task holding this content hash, if any.
+    FindTaskByContent {
+        content_hash: String,
     },
     /// isContentRegistered(contentHash) on the registry (fail-open).
     CheckContentRegistered {
         content_hash: String,
     },
-    /// isNonceUsed(publicKey, unitNonce) on the registry for each member
-    /// key (fail-open): true when any member's (key, nonce) pair is spent.
-    CheckNonceUsed {
-        unit_nonce: String,
-        public_keys: Vec<String>,
-    },
     QueueDepth,
     AllowGlobalCreate,
-    /// Phase one: the store's atomic admission keyed by the unitNonce.
+    /// Phase one: the store's atomic admission keyed by the content hash.
     Admit {
         task: RegisterTask,
     },
@@ -122,6 +117,9 @@ pub enum AdmitOutcome {
     Existing { id: String },
 }
 
+// In-process operation envelopes; the task-bearing variants dominate by
+// design and boxing them would complicate every core/shell match.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdmissionResult {
@@ -156,14 +154,13 @@ pub enum AdmissionOutcome {
     Queued { id: String, status: TaskStatus },
     /// 200: identical content is already on-chain.
     AlreadyRegistered { content_hash: String },
-    /// 409: the unitNonce cannot be used.
-    NonceConflict { message: String },
     /// 503 busy (depth or global rate gate).
     Busy,
     /// 503 retryable, naming the failed dependency ("redis" / "queue").
     DependencyUnavailable { dependency: String },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdmissionEvent {
@@ -244,10 +241,6 @@ fn redis_down() -> AdmissionOutcome {
     }
 }
 
-pub const CONFLICT_NONCE_IN_FLIGHT: &str =
-    "this unitNonce is already carrying a different unit; every unit needs a fresh nonce";
-pub const CONFLICT_NONCE_CONSUMED: &str = "this unitNonce was already consumed on-chain; the proofs are void — re-enroll with a fresh nonce";
-
 async fn request(ctx: &Ctx, operation: AdmissionOperation) -> AdmissionResult {
     ctx.request_from_shell(operation).await
 }
@@ -272,12 +265,15 @@ async fn drive_admission(
         _ => return Err(redis_down()),
     }
 
-    // Idempotency by unitNonce: the same unit resubmitted returns its task,
-    // a different unit on an in-flight nonce is a conflict.
+    // Idempotency by content hash: the same unit resubmitted returns its
+    // task — content-hash equality means it IS the same unit, so nothing
+    // else can collide. A found-but-unadmitted task means an earlier
+    // submission died between Redis admit and the queue append: repair
+    // phase two here instead of reporting a task that will never run.
     match request(
         ctx,
-        AdmissionOperation::FindTaskByNonce {
-            unit_nonce: task.unit_nonce.clone(),
+        AdmissionOperation::FindTaskByContent {
+            content_hash: content_hash.clone(),
         },
     )
     .await
@@ -285,24 +281,19 @@ async fn drive_admission(
         AdmissionResult::TaskFound {
             task: Some(existing),
         } => {
-            let same_unit = crate::protocol::content_hash_for(&existing)
-                .map(|hash| format!("{hash:#x}") == content_hash)
-                .unwrap_or(false);
-            if same_unit {
+            if existing.admitted || existing.status.is_terminal() {
                 return Ok(AdmissionOutcome::Queued {
                     id: existing.id,
                     status: existing.status,
                 });
             }
-            return Ok(AdmissionOutcome::NonceConflict {
-                message: CONFLICT_NONCE_IN_FLIGHT.to_owned(),
-            });
+            return enqueue(ctx, existing).await;
         }
         AdmissionResult::TaskFound { task: None } => {}
         _ => return Err(redis_down()),
     }
 
-    // Chain pre-checks, fail-open: an RPC outage never blocks admission —
+    // Chain pre-check, fail-open: an RPC outage never blocks admission —
     // the worker reconciles against the chain anyway.
     match request(
         ctx,
@@ -314,27 +305,6 @@ async fn drive_admission(
     {
         AdmissionResult::ChainBool { value: true } => {
             return Ok(AdmissionOutcome::AlreadyRegistered { content_hash });
-        }
-        AdmissionResult::ChainBool { value: false } | AdmissionResult::ChainReadFailed => {}
-        _ => return Err(redis_down()),
-    }
-    match request(
-        ctx,
-        AdmissionOperation::CheckNonceUsed {
-            unit_nonce: task.unit_nonce.clone(),
-            public_keys: task
-                .members
-                .iter()
-                .map(|member| member.public_key.clone())
-                .collect(),
-        },
-    )
-    .await
-    {
-        AdmissionResult::ChainBool { value: true } => {
-            return Ok(AdmissionOutcome::NonceConflict {
-                message: CONFLICT_NONCE_CONSUMED.to_owned(),
-            });
         }
         AdmissionResult::ChainBool { value: false } | AdmissionResult::ChainReadFailed => {}
         _ => return Err(redis_down()),
@@ -419,12 +389,6 @@ pub fn validate_register(
         return Err("rpId exceeds max length (253)".into());
     }
 
-    let Some(unit_nonce) = request.unit_nonce.as_deref() else {
-        return Err("unitNonce is required (32-byte hex)".into());
-    };
-    let nonce = parse_b256(unit_nonce).map_err(|_| "unitNonce must be 32-byte hex".to_owned())?;
-    let unit_nonce = format!("{nonce:#x}");
-
     let metadata = request.metadata.unwrap_or_default();
     let metadata_bytes =
         parse_hex_bytes(&metadata).map_err(|_| "metadata must be a valid hex string".to_owned())?;
@@ -446,10 +410,23 @@ pub fn validate_register(
         return Err(format!("members must contain 1 to {MAX_MEMBERS} entries"));
     }
 
+    // Structural parse first: the content hash covers the group key and
+    // every member's key and attestation, so it must exist before any
+    // proof can be checked.
+    let group_public_key = parse_public_key(request.group_public_key.as_deref())
+        .map_err(|message| format!("groupPublicKey: {message}"))?;
+    let group_proof =
+        parse_proof(request.group_proof).map_err(|message| format!("groupProof: {message}"))?;
+
     let mut parsed = Vec::with_capacity(members.len());
     for (index, member) in members.into_iter().enumerate() {
-        let member = validate_member(member, &rp_id, nonce, chain_id, registry)
-            .map_err(|message| format!("members[{index}]: {message}"))?;
+        let member =
+            parse_member(member).map_err(|message| format!("members[{index}]: {message}"))?;
+        if member.public_key == group_public_key {
+            return Err(format!(
+                "members[{index}]: the group key cannot also be a member"
+            ));
+        }
         if parsed
             .iter()
             .any(|earlier: &Member| earlier.public_key == member.public_key)
@@ -461,12 +438,14 @@ pub fn validate_register(
         parsed.push(member);
     }
 
-    let task = RegisterTask {
+    let mut task = RegisterTask {
         id: new_task_id,
         status: TaskStatus::Pending,
         rp_id,
         metadata,
-        unit_nonce,
+        content_hash: String::new(),
+        group_public_key,
+        group_proof,
         members: parsed,
         tx_hash: None,
         first_entry_id: None,
@@ -476,17 +455,72 @@ pub fn validate_register(
         admitted: false,
     };
     let content_hash = content_hash_for(&task).map_err(|error| error.to_string())?;
-    Ok((task, format!("{content_hash:#x}")))
+    task.content_hash = format!("{content_hash:#x}");
+
+    // The pure mirror of the contract's verification, so an invalid proof
+    // never reaches the chain: the group proof binds the content hash...
+    let group_key_bytes = hex::decode(&task.group_public_key).expect("validated hex");
+    let group_challenge = challenge_for(
+        chain_id,
+        registry,
+        &task.rp_id,
+        &group_key_bytes,
+        content_hash,
+    );
+    verify_proof(
+        &task.group_proof,
+        group_challenge,
+        &task.rp_id,
+        &group_key_bytes,
+    )
+    .map_err(|error| format!("groupProof: proof rejected: {error}"))?;
+
+    // ...and every member's proof binds (groupKey, own attestation).
+    for (index, member) in task.members.iter().enumerate() {
+        let key_bytes = hex::decode(&member.public_key).expect("validated hex");
+        let attestation_bytes = parse_hex_bytes(&member.attestation).expect("validated hex");
+        let binding = member_binding_for(&group_key_bytes, &attestation_bytes);
+        let challenge = challenge_for(chain_id, registry, &task.rp_id, &key_bytes, binding);
+        verify_proof(&member.proof, challenge, &task.rp_id, &key_bytes)
+            .map_err(|error| format!("members[{index}]: proof rejected: {error}"))?;
+    }
+
+    let content_hash = task.content_hash.clone();
+    Ok((task, content_hash))
 }
 
-fn validate_member(
-    member: MemberRequest,
-    rp_id: &str,
-    nonce: alloy::primitives::B256,
-    chain_id: u64,
-    registry: Address,
-) -> Result<Member, String> {
-    let Some(public_key) = member.public_key.as_deref() else {
+/// Key shape and curve membership for one hex-encoded key; returns the
+/// normalized lowercase hex (no 0x). Public so the shell's challenge
+/// endpoint enforces exactly what admission will.
+pub fn validate_public_key_hex(value: &str) -> Result<String, String> {
+    parse_public_key(Some(value))
+}
+
+/// Attestation shape (empty, or 20 versioned bytes); returns "" or 0x-hex.
+/// Public for the same reason as [`validate_public_key_hex`].
+pub fn validate_attestation_hex(value: &str) -> Result<String, String> {
+    let attestation_bytes =
+        parse_hex_bytes(value).map_err(|_| "attestation must be a valid hex string".to_owned())?;
+    if !attestation_bytes.is_empty() {
+        if attestation_bytes.len() != ATTESTATION_BYTES {
+            return Err(format!("attestation must be {ATTESTATION_BYTES} bytes"));
+        }
+        if attestation_bytes[0] != ATTESTATION_VERSION {
+            return Err(format!(
+                "attestation must start with version byte 0x{ATTESTATION_VERSION:02x}"
+            ));
+        }
+    }
+    Ok(if attestation_bytes.is_empty() {
+        String::new()
+    } else {
+        format!("0x{}", hex::encode(&attestation_bytes))
+    })
+}
+
+/// Key shape and curve membership; returns the normalized lowercase hex.
+fn parse_public_key(value: Option<&str>) -> Result<String, String> {
+    let Some(public_key) = value else {
         return Err("publicKey is required".into());
     };
     let raw = public_key.strip_prefix("0x").unwrap_or(public_key);
@@ -500,30 +534,16 @@ fn validate_member(
     let key_bytes = hex::decode(&public_key).expect("validated hex");
     p256::PublicKey::from_sec1_bytes(&key_bytes)
         .map_err(|_| "publicKey must be a valid point on the P-256 curve".to_owned())?;
+    Ok(public_key)
+}
 
-    let attestation = member.attestation.unwrap_or_default();
-    let attestation_bytes = parse_hex_bytes(&attestation)
-        .map_err(|_| "attestation must be a valid hex string".to_owned())?;
-    if !attestation_bytes.is_empty() {
-        if attestation_bytes.len() != ATTESTATION_BYTES {
-            return Err(format!("attestation must be {ATTESTATION_BYTES} bytes"));
-        }
-        if attestation_bytes[0] != ATTESTATION_VERSION {
-            return Err(format!(
-                "attestation must start with version byte 0x{ATTESTATION_VERSION:02x}"
-            ));
-        }
-    }
-    let attestation = if attestation_bytes.is_empty() {
-        String::new()
-    } else {
-        format!("0x{}", hex::encode(&attestation_bytes))
-    };
-
-    let Some(proof) = member.proof else {
+/// Field presence for a proof; verification happens once the challenge
+/// exists.
+fn parse_proof(proof: Option<ProofRequest>) -> Result<Proof, String> {
+    let Some(proof) = proof else {
         return Err("proof is required".into());
     };
-    let proof = Proof {
+    Ok(Proof {
         authenticator_data: proof
             .authenticator_data
             .ok_or("proof.authenticatorData is required")?,
@@ -536,13 +556,19 @@ fn validate_member(
         type_index: proof.type_index.ok_or("proof.typeIndex is required")?,
         r: proof.r.ok_or("proof.r is required")?,
         s: proof.s.ok_or("proof.s is required")?,
-    };
+    })
+}
 
-    // The pure mirror of the contract's verification: an invalid proof never
-    // reaches the chain.
-    let challenge = challenge_for(chain_id, registry, rp_id, &key_bytes, nonce);
-    verify_proof(&proof, challenge, rp_id, &key_bytes)
-        .map_err(|error| format!("proof rejected: {error}"))?;
+/// Structural parse of one member: key shape and curve membership,
+/// attestation shape, proof field presence. Proof VERIFICATION happens in
+/// `validate_register` once the group key and content hash exist, because
+/// every challenge binds them.
+fn parse_member(member: MemberRequest) -> Result<Member, String> {
+    let public_key = parse_public_key(member.public_key.as_deref())?;
+
+    let attestation = validate_attestation_hex(&member.attestation.unwrap_or_default())?;
+
+    let proof = parse_proof(member.proof)?;
 
     Ok(Member {
         public_key,
@@ -566,31 +592,33 @@ mod tests {
     const CHAIN: u64 = 100;
     const REGISTRY: &str = "0x1111111111111111111111111111111111111111";
 
-    fn keypair() -> (p256::ecdsa::SigningKey, String) {
-        let secret = [
-            0xba, 0xb2, 0x6f, 0x1a, 0xb9, 0x4e, 0x84, 0xa2, 0x31, 0x99, 0xc4, 0x6e, 0xc2, 0xdd,
-            0x44, 0x89, 0x50, 0x7c, 0x27, 0x8d, 0xd3, 0xdd, 0xf2, 0xba, 0x0a, 0x47, 0xec, 0x20,
-            0x12, 0x05, 0xfe, 0x7a,
-        ];
+    fn key_from(secret: [u8; 32]) -> (p256::ecdsa::SigningKey, String) {
         let key = p256::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
         let public = hex::encode(key.verifying_key().to_sec1_point(false).as_bytes());
         (key, public)
     }
 
-    fn nonce_hex() -> String {
-        format!("0x{}", "11".repeat(32))
+    fn keypair() -> (p256::ecdsa::SigningKey, String) {
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(
+            &hex::decode("bab26f1ab94e84a23199c46ec2dd4489507c278dd3ddf2ba0a47ec201205fe7a")
+                .unwrap(),
+        );
+        key_from(secret)
     }
 
-    fn signed_member(rp_id: &str) -> MemberRequest {
-        let (signing, public) = keypair();
-        let nonce = B256::repeat_byte(0x11);
-        let challenge = challenge_for(
-            CHAIN,
-            REGISTRY.parse().unwrap(),
-            rp_id,
-            &hex::decode(&public).unwrap(),
-            nonce,
+    /// The unit's GROUP key (a client-side software key in production).
+    fn group_keypair() -> (p256::ecdsa::SigningKey, String) {
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(
+            &hex::decode("7e7b5b9fba4858c30377ef6a0f3d3d9079cf00d2291bf0d468789a5cb5705aef")
+                .unwrap(),
         );
+        key_from(secret)
+    }
+
+    /// A raw WebAuthn-shaped proof by `signing` over `challenge` for `rp_id`.
+    fn proof_over(signing: &p256::ecdsa::SigningKey, challenge: B256, rp_id: &str) -> ProofRequest {
         let client_data = format!(
             "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
             base64url_32(&challenge)
@@ -605,25 +633,98 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(&signed).into();
         let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
         let bytes = signature.to_bytes();
+        ProofRequest {
+            authenticator_data: Some(hex::encode(auth_data)),
+            client_data_json: Some(client_data),
+            challenge_index: Some(23),
+            type_index: Some(1),
+            r: Some(format!("0x{}", hex::encode(&bytes[..32]))),
+            s: Some(format!("0x{}", hex::encode(&bytes[32..]))),
+        }
+    }
+
+    /// The content hash of the canonical test unit: rpId, metadata "0xaa",
+    /// the fixed group key, one member (the fixed keypair, no attestation)
+    /// — mirroring exactly what validate_register computes.
+    fn test_content_hash(rp_id: &str) -> B256 {
+        let (_, public) = keypair();
+        let (_, group_public) = group_keypair();
+        let skeleton = RegisterTask {
+            id: String::new(),
+            status: TaskStatus::Pending,
+            rp_id: rp_id.into(),
+            metadata: "0xaa".into(),
+            content_hash: String::new(),
+            group_public_key: group_public,
+            group_proof: Proof {
+                authenticator_data: String::new(),
+                client_data_json: String::new(),
+                challenge_index: 0,
+                type_index: 0,
+                r: String::new(),
+                s: String::new(),
+            },
+            members: vec![Member {
+                public_key: public,
+                attestation: String::new(),
+                proof: Proof {
+                    authenticator_data: String::new(),
+                    client_data_json: String::new(),
+                    challenge_index: 0,
+                    type_index: 0,
+                    r: String::new(),
+                    s: String::new(),
+                },
+            }],
+            tx_hash: None,
+            first_entry_id: None,
+            error: None,
+            retries: 0,
+            created_at: 0,
+            admitted: false,
+        };
+        content_hash_for(&skeleton).unwrap()
+    }
+
+    /// One member signing at creation time: binds (groupKey, own
+    /// attestation) — independent of the metadata and of any sibling.
+    fn signed_member(rp_id: &str) -> MemberRequest {
+        let (signing, public) = keypair();
+        let (_, group_public) = group_keypair();
+        let binding = member_binding_for(&hex::decode(&group_public).unwrap(), &[]);
+        let challenge = challenge_for(
+            CHAIN,
+            REGISTRY.parse().unwrap(),
+            rp_id,
+            &hex::decode(&public).unwrap(),
+            binding,
+        );
         MemberRequest {
             public_key: Some(public),
             attestation: None,
-            proof: Some(ProofRequest {
-                authenticator_data: Some(hex::encode(auth_data)),
-                client_data_json: Some(client_data),
-                challenge_index: Some(23),
-                type_index: Some(1),
-                r: Some(format!("0x{}", hex::encode(&bytes[..32]))),
-                s: Some(format!("0x{}", hex::encode(&bytes[32..]))),
-            }),
+            proof: Some(proof_over(&signing, challenge, rp_id)),
         }
+    }
+
+    /// The group key's silent closing proof over the finished unit content.
+    fn signed_group_proof(rp_id: &str) -> ProofRequest {
+        let (signing, group_public) = group_keypair();
+        let challenge = challenge_for(
+            CHAIN,
+            REGISTRY.parse().unwrap(),
+            rp_id,
+            &hex::decode(&group_public).unwrap(),
+            test_content_hash(rp_id),
+        );
+        proof_over(&signing, challenge, rp_id)
     }
 
     fn valid_request() -> RegisterRequest {
         RegisterRequest {
             rp_id: Some("example.com".into()),
             metadata: Some("0xaa".into()),
-            unit_nonce: Some(nonce_hex()),
+            group_public_key: Some(group_keypair().1),
+            group_proof: Some(signed_group_proof("example.com")),
             members: Some(vec![signed_member("example.com")]),
         }
     }
@@ -679,13 +780,6 @@ mod tests {
         assert_eq!(
             validate_register(no_rp, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
             "rpId is required"
-        );
-
-        let mut bad_nonce = valid_request();
-        bad_nonce.unit_nonce = Some("0x1234".into());
-        assert_eq!(
-            validate_register(bad_nonce, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
-            "unitNonce must be 32-byte hex"
         );
 
         let mut fat_metadata = valid_request();
@@ -787,21 +881,14 @@ mod tests {
             AdmissionResult::Allowed { allowed: true },
         );
         driver.step(
-            AdmissionOperation::FindTaskByNonce {
-                unit_nonce: nonce_hex(),
+            AdmissionOperation::FindTaskByContent {
+                content_hash: expected_content_hash(),
             },
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
             AdmissionOperation::CheckContentRegistered {
                 content_hash: expected_content_hash(),
-            },
-            AdmissionResult::ChainBool { value: false },
-        );
-        driver.step(
-            AdmissionOperation::CheckNonceUsed {
-                unit_nonce: nonce_hex(),
-                public_keys: vec![keypair().1],
             },
             AdmissionResult::ChainBool { value: false },
         );
@@ -866,9 +953,10 @@ mod tests {
         );
         let mut existing = expected_task();
         existing.id = "earlier".into();
+        existing.admitted = true;
         driver.step(
-            AdmissionOperation::FindTaskByNonce {
-                unit_nonce: nonce_hex(),
+            AdmissionOperation::FindTaskByContent {
+                content_hash: expected_content_hash(),
             },
             AdmissionResult::TaskFound {
                 task: Some(existing),
@@ -881,25 +969,45 @@ mod tests {
     }
 
     #[test]
-    fn different_unit_on_an_in_flight_nonce_conflicts() {
+    fn resubmission_repairs_a_stranded_unenqueued_task() {
+        // An earlier submission died between Redis admit and the queue
+        // append: the idempotency lookup finds the unadmitted task and
+        // repairs phase two instead of reporting a task that never runs.
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
             AdmissionResult::Allowed { allowed: true },
         );
-        let mut foreign = expected_task();
-        foreign.id = "earlier".into();
-        foreign.metadata = "0xbb".into(); // different content, same nonce
+        let mut stranded = expected_task();
+        stranded.id = "earlier".into();
+        stranded.admitted = false;
         driver.step(
-            AdmissionOperation::FindTaskByNonce {
-                unit_nonce: nonce_hex(),
+            AdmissionOperation::FindTaskByContent {
+                content_hash: expected_content_hash(),
             },
             AdmissionResult::TaskFound {
-                task: Some(foreign),
+                task: Some(stranded.clone()),
             },
         );
-        driver.assert_settled(AdmissionOutcome::NonceConflict {
-            message: CONFLICT_NONCE_IN_FLIGHT.into(),
+        driver.step(
+            AdmissionOperation::Enqueue {
+                task: stranded.clone(),
+            },
+            AdmissionResult::Enqueued,
+        );
+        let mut admitted = stranded;
+        admitted.admitted = true;
+        driver.step(
+            AdmissionOperation::MarkAdmitted {
+                id: "earlier".into(),
+            },
+            AdmissionResult::TaskFound {
+                task: Some(admitted),
+            },
+        );
+        driver.assert_settled(AdmissionOutcome::Queued {
+            id: "earlier".into(),
+            status: TaskStatus::Pending,
         });
     }
 
@@ -911,8 +1019,8 @@ mod tests {
             AdmissionResult::Allowed { allowed: true },
         );
         driver.step(
-            AdmissionOperation::FindTaskByNonce {
-                unit_nonce: nonce_hex(),
+            AdmissionOperation::FindTaskByContent {
+                content_hash: expected_content_hash(),
             },
             AdmissionResult::TaskFound { task: None },
         );
@@ -928,59 +1036,21 @@ mod tests {
     }
 
     #[test]
-    fn consumed_nonce_with_absent_content_is_terminal() {
+    fn chain_precheck_fails_open_to_the_gates() {
         let mut driver = Driver::submit(valid_request());
         driver.step(
             AdmissionOperation::AllowIpCreate,
             AdmissionResult::Allowed { allowed: true },
         );
         driver.step(
-            AdmissionOperation::FindTaskByNonce {
-                unit_nonce: nonce_hex(),
+            AdmissionOperation::FindTaskByContent {
+                content_hash: expected_content_hash(),
             },
             AdmissionResult::TaskFound { task: None },
         );
         driver.step(
             AdmissionOperation::CheckContentRegistered {
                 content_hash: expected_content_hash(),
-            },
-            AdmissionResult::ChainBool { value: false },
-        );
-        driver.step(
-            AdmissionOperation::CheckNonceUsed {
-                unit_nonce: nonce_hex(),
-                public_keys: vec![keypair().1],
-            },
-            AdmissionResult::ChainBool { value: true },
-        );
-        driver.assert_settled(AdmissionOutcome::NonceConflict {
-            message: CONFLICT_NONCE_CONSUMED.into(),
-        });
-    }
-
-    #[test]
-    fn chain_prechecks_fail_open_to_the_gates() {
-        let mut driver = Driver::submit(valid_request());
-        driver.step(
-            AdmissionOperation::AllowIpCreate,
-            AdmissionResult::Allowed { allowed: true },
-        );
-        driver.step(
-            AdmissionOperation::FindTaskByNonce {
-                unit_nonce: nonce_hex(),
-            },
-            AdmissionResult::TaskFound { task: None },
-        );
-        driver.step(
-            AdmissionOperation::CheckContentRegistered {
-                content_hash: expected_content_hash(),
-            },
-            AdmissionResult::ChainReadFailed,
-        );
-        driver.step(
-            AdmissionOperation::CheckNonceUsed {
-                unit_nonce: nonce_hex(),
-                public_keys: vec![keypair().1],
             },
             AdmissionResult::ChainReadFailed,
         );
@@ -988,7 +1058,7 @@ mod tests {
             AdmissionOperation::QueueDepth,
             AdmissionResult::Depth { depth: 0 },
         );
-        // Reaching the depth gate proves both fail-open arms.
+        // Reaching the depth gate proves the fail-open arm.
     }
 
     #[test]

@@ -9,22 +9,30 @@ first client, not its owner.
 
 ## The trust model
 
-- **The public key is the primary key, and possession is the only thing
-  verified — on-chain.** Every stored entry requires a WebAuthn-formatted
-  P-256 assertion by its own key over a storage-authorization challenge
-  (`keccak256(abi.encode(chainid, registry, rpId, publicKey, unitNonce))`),
-  verified by the contract via the EIP-7951/RIP-7212 precompile. Nobody can
-  attach data to a key they do not hold.
+- **The public key is the primary key; possession and content are what is
+  verified — on-chain.** Every signer produces a WebAuthn-formatted P-256
+  assertion over its storage-authorization challenge
+  (`keccak256(abi.encode(chainid, registry, rpId, publicKey, binding))`),
+  verified via the EIP-7951/RIP-7212 precompile. The binding depends on the
+  role: the GROUP KEY signs the unit's contentHash (rpId, metadata, group
+  key, every member), and each MEMBER passkey signs
+  `memberBindingFor(groupKey, ownAttestation)`. Together every byte is
+  signature-covered: nobody can attach data to a key they do not hold, and
+  nobody can alter any field — front-running, replay and content
+  substitution do not exist at the protocol level.
 - **Nothing else is exclusive or interpreted.** A key may appear in any
   number of registration units; queries return lists and readers filter by
   their own metadata schema. Credential ids, display names, wallet
   derivation preimages all live inside `metadata` (≤2048 bytes, opaque).
-- **A registration unit** is 1..7 members sharing one rpId, one metadata
-  payload and one `unitNonce`, appended atomically in one `register`
-  transaction. Consumption is per (publicKey, nonce) pair: every proof dies
-  with its registration and identical content registers only once, while a
-  stranger pairing their own keys with the same nonce burns nothing of
-  anyone else's — the nonce needs no global uniqueness.
+- **A registration unit** is one group key plus 1..7 member passkeys
+  sharing one rpId and one metadata payload, appended atomically in ONE
+  `register` transaction (7 passkeys = 8 signatures). The group key is a
+  client-held software key — every unit has exactly one; it closes the unit
+  silently, no ceremony. Member passkeys sign the moment they are created:
+  any order, any device, no waiting. There is no nonce and nothing
+  consumable: identical content registers exactly once and altered content
+  invalidates the signatures. Units are indexed by their group key
+  (getUnitIdsByGroupKey); group semantics belong to the storer's schema.
 - **Reads are list-shaped and id-stable.** Entry ids are sequential and
   immutable — clients that remember their entry ids read in O(1) forever.
   Discovery without local state: recover the two candidate keys from any
@@ -33,13 +41,17 @@ first client, not its owner.
 
 ## Client flow
 
-1. At flow start, pick a random 32-byte `unitNonce`
-   (`POST /api/challenge` with an empty body suggests one).
-2. For each passkey: `navigator.credentials.create()` (collect the public
-   key), then one `navigator.credentials.get()` whose challenge is the
-   member's storage-authorization challenge (`POST /api/challenge` with
-   `{rpId, publicKey, unitNonce}` computes it, or compute it locally).
-   Two prompts per key, any order, any device, independently.
+1. At enrollment start the client generates a one-time software P-256
+   group key. For each passkey: `navigator.credentials.create()` (collect
+   the public key), then one `navigator.credentials.get()` whose challenge
+   is the member-binding challenge (`POST /api/challenge` member mode:
+   `{rpId, groupPublicKey, publicKey, attestation?}`) — it depends only on
+   the group key and the member's own fields, so any order, any device, no
+   waiting. Two prompts per key.
+2. Once every key exists, finalize the unit and have the group key silently
+   sign the closing challenge (`POST /api/challenge` group mode:
+   `{rpId, metadata, groupPublicKey, members}` returns the contentHash and
+   the group challenge), then submit in one shot.
 3. `POST /api/register` with the unit. The service verifies every proof
    (pure Rust mirror of the contract check — invalid proofs never reach the
    chain), durably queues the unit (Redis + Iggy, two-phase), and the worker
@@ -56,7 +68,7 @@ first client, not its owner.
   `p256-index-server` is the shell that wires those rules to Axum, Redis,
   Iggy, Gnosis RPC and Telegram.
 - Redis holds the response cache, rate limits, task status, the
-  nonce-idempotency and per-key placeholders, queue-depth and DLQ
+  content-hash idempotency and per-key placeholders, queue-depth and DLQ
   projections, and the broadcast ledger.
 - Iggy provides the durable registration stream (at-least-once, ordered);
   Redis admission and Iggy append are two-phase so a lost acknowledgement
@@ -75,7 +87,7 @@ first client, not its owner.
 | --- | --- | --- |
 | POST | /api/register | Verify proofs and durably enqueue one unit (1..7 members) |
 | GET | /api/task/{id} | Task status (full disclosure; no proofs echoed) |
-| POST | /api/challenge | Compute a member's storage challenge; empty body suggests a unitNonce |
+| POST | /api/challenge | Member mode: one member's challenge; group mode: contentHash + closing challenge |
 | GET | /api/query?publicKey= | Paginated entries for a key (`_queue` marker pre-chain) |
 | GET | /api/query?entryId= | One entry by its immutable id |
 | GET | /api/stats/total | {totalEntries, totalUnits, totalRpIds} |
@@ -89,7 +101,9 @@ Register body shape:
 {
   "rpId": "example.com",
   "metadata": "0x…",
-  "unitNonce": "0x…32 bytes…",
+  "groupPublicKey": "04…65 bytes…",
+  "groupProof": { "authenticatorData": "…", "clientDataJSON": "…",
+                  "challengeIndex": 23, "typeIndex": 1, "r": "0x…", "s": "0x…" },
   "members": [{
     "publicKey": "04…65 bytes…",
     "attestation": "0x…20 bytes, optional…",
@@ -105,9 +119,9 @@ Register body shape:
 (version, AAGUID, authData flags, attachment, transports) — shape-checked,
 truthfulness is the storer's claim; display mapping is a client concern.
 
-Conflicts: 409 only for unitNonce problems (a different unit on an in-flight
-nonce, or a nonce already consumed on-chain — the proofs are void, re-enroll
-with a fresh nonce). Identical content already on-chain answers 200 "done".
+There is no 409: the content hash is the unit's identity, resubmitting the
+same unit is idempotent, and different units never collide. Identical
+content already on-chain answers 200 "done".
 
 ## Configuration
 
@@ -139,7 +153,7 @@ cd contracts && forge test
 forge script script/DeployRegistry.s.sol --rpc-url $RPC --broadcast
 ~~~
 
-Gas: a 1-member unit is ~0.7M gas, 7 members ~3.1M (linear per member).
+Gas: a group + 1 member is ~1.1M gas, group + 7 members ~3.6M (linear per member).
 
 ## Run and verify
 

@@ -118,7 +118,7 @@ impl RedisStore {
     /// re-appends it, while the worker treats duplicate task IDs idempotently.
     ///
     /// Atomically establishes the Redis half of Iggy admission, keyed by the
-    /// unitNonce (KEYS[4]): a resubmission finds its task. Per-member
+    /// unit's content hash (KEYS[4]): a resubmission finds its task. Per-member
     /// public-key placeholders (KEYS[5..]) feed the lookup queue-fallback so
     /// a unit is visible before it lands on-chain.
     pub async fn admit(&self, task: &RegisterTask) -> Result<Admission, StoreError> {
@@ -131,7 +131,13 @@ impl RedisStore {
             redis.call('SET', KEYS[1], ARGV[2])
             redis.call('SADD', KEYS[2], ARGV[1])
             redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
-            for i = 4, #KEYS do redis.call('SET', KEYS[i], ARGV[1]) end
+            redis.call('SET', KEYS[4], ARGV[1])
+            -- Public-key placeholders: first active task keeps its claim, so
+            -- a later unit sharing a key can never strand the earlier one's
+            -- pre-chain visibility when it terminates.
+            for i = 5, #KEYS do
+                if redis.call('EXISTS', KEYS[i]) == 0 then redis.call('SET', KEYS[i], ARGV[1]) end
+            end
             return 'new|' .. ARGV[1]
         "#,
         );
@@ -140,7 +146,7 @@ impl RedisStore {
             .key(task_key(&task.id))
             .key(active_set_key())
             .key(active_age_key())
-            .key(nonce_active_key(&task.unit_nonce));
+            .key(content_active_key(&task.content_hash));
         for key in member_key_placeholders(task) {
             invocation.key(key);
         }
@@ -160,19 +166,28 @@ impl RedisStore {
         let mut command = redis::cmd("GET");
         command.arg(task_key(id));
         let payload: Option<String> = self.query(command).await?;
-        payload
-            .map(|payload| {
-                serde_json::from_str(&payload)
-                    .map_err(|_| StoreError("stored create task is invalid"))
-            })
-            .transpose()
+        Ok(
+            payload.and_then(|payload| match serde_json::from_str(&payload) {
+                Ok(task) => Some(task),
+                Err(_) => {
+                    // An unparseable record must read as missing, not as a store
+                    // outage: a single corrupt payload would otherwise jam every
+                    // batch that touches it, forever.
+                    tracing::warn!(
+                        id,
+                        "stored register task is unparseable; treating as missing"
+                    );
+                    None
+                }
+            }),
+        )
     }
 
-    pub async fn find_by_nonce(
+    pub async fn find_by_content(
         &self,
-        unit_nonce: &str,
+        content_hash: &str,
     ) -> Result<Option<RegisterTask>, StoreError> {
-        self.find_by_index(nonce_active_key(unit_nonce)).await
+        self.find_by_index(content_active_key(content_hash)).await
     }
 
     pub async fn find_by_public_key(
@@ -193,12 +208,38 @@ impl RedisStore {
     }
 
     pub async fn mark_admitted(&self, id: &str) -> Result<Option<RegisterTask>, StoreError> {
-        let Some(mut task) = self.get_task(id).await? else {
+        let Some(before) = self.get_task(id).await? else {
             return Ok(None);
         };
+        // A terminal transition already set admitted (and owns the record's
+        // TTL): never resurrect it into a TTL-less active task.
+        if before.status.is_terminal() {
+            return Ok(Some(before));
+        }
+        let previous = serde_json::to_string(&before)
+            .map_err(|_| StoreError("could not serialize register task"))?;
+        let mut task = before;
         task.admitted = true;
-        self.write_active_task(&task).await?;
-        Ok(Some(task))
+        let updated = serde_json::to_string(&task)
+            .map_err(|_| StoreError("could not serialize register task"))?;
+        // Compare-and-swap: if a worker transition raced us, its write wins
+        // (terminal transitions set admitted themselves).
+        let script = Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                redis.call('SET', KEYS[1], ARGV[2], 'KEEPTTL')
+                return 1
+            end
+            return 0
+        "#,
+        );
+        let mut invocation = script.prepare_invoke();
+        invocation.key(task_key(id)).arg(previous).arg(updated);
+        let swapped: i64 = self.run_script(&mut invocation).await?;
+        if swapped == 1 {
+            return Ok(Some(task));
+        }
+        self.get_task(id).await
     }
 
     pub async fn mark_done(
@@ -471,7 +512,7 @@ impl RedisStore {
     async fn transition_done(&self, task: &RegisterTask) -> Result<(), StoreError> {
         let payload = serde_json::to_string(task)
             .map_err(|_| StoreError("could not serialize create task"))?;
-        // The nonce key and the member public-key placeholders (KEYS[4..])
+        // The content key and the member public-key placeholders (KEYS[4..])
         // could have been claimed by another task after ours went terminal
         // elsewhere; only expire the ones still pointing at this task.
         let script = Script::new(
@@ -490,7 +531,7 @@ impl RedisStore {
             .key(task_key(&task.id))
             .key(active_set_key())
             .key(active_age_key())
-            .key(nonce_active_key(&task.unit_nonce));
+            .key(content_active_key(&task.content_hash));
         for key in member_key_placeholders(task) {
             invocation.key(key);
         }
@@ -524,7 +565,7 @@ impl RedisStore {
             .key(active_set_key())
             .key(active_age_key())
             .key(dlq_set_key())
-            .key(nonce_active_key(&task.unit_nonce));
+            .key(content_active_key(&task.content_hash));
         for key in member_key_placeholders(task) {
             invocation.key(key);
         }
@@ -595,8 +636,11 @@ fn escaped_hash(input: &str) -> String {
 fn task_key(id: &str) -> String {
     format!("p256-index:task:{id}")
 }
-fn nonce_active_key(unit_nonce: &str) -> String {
-    format!("p256-index:task-nonce:{}", unit_nonce.to_ascii_lowercase())
+fn content_active_key(content_hash: &str) -> String {
+    format!(
+        "p256-index:task-content:{}",
+        content_hash.to_ascii_lowercase()
+    )
 }
 
 fn key_active_key(public_key: &str) -> String {
@@ -604,10 +648,13 @@ fn key_active_key(public_key: &str) -> String {
 }
 
 fn member_key_placeholders(task: &RegisterTask) -> Vec<String> {
-    task.members
+    let mut keys: Vec<String> = task
+        .members
         .iter()
         .map(|member| key_active_key(&member.public_key))
-        .collect()
+        .collect();
+    keys.push(key_active_key(&task.group_public_key));
+    keys
 }
 fn active_set_key() -> &'static str {
     "p256-index:active-tasks"

@@ -32,6 +32,7 @@ pub struct Entry {
     pub attestation: String,
     pub rp_id: String,
     pub metadata: String,
+    pub group_public_key: String,
     pub first_entry_id: u64,
     pub member_count: u32,
     pub created_at: u64,
@@ -69,7 +70,8 @@ pub fn task_status_body(task: &RegisterTask) -> Value {
         "status": task.status,
         "rpId": task.rp_id,
         "metadata": task.metadata,
-        "unitNonce": task.unit_nonce,
+        "contentHash": task.content_hash,
+        "groupPublicKey": task.group_public_key,
         "members": task.members.iter().map(|member| json!({
             "publicKey": member.public_key,
             "attestation": member.attestation,
@@ -217,6 +219,7 @@ impl crux_core::capability::Operation for LookupOperation {
     type Output = LookupResult;
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LookupResult {
@@ -732,7 +735,16 @@ mod tests {
             status,
             rp_id: "example.com".into(),
             metadata: "0xaa".into(),
-            unit_nonce: format!("0x{}", "11".repeat(32)),
+            content_hash: format!("0x{}", "11".repeat(32)),
+            group_public_key: "049e666db13bc6d0a76ec6801fbe24864030f15eca3b2d07ebcaf824bb2dc4f0aea8221dc27980b7c133a00d910c39723eb1523e88ad050a7303bba8bde07367fa".into(),
+            group_proof: Proof {
+                authenticator_data: String::new(),
+                client_data_json: String::new(),
+                challenge_index: 0,
+                type_index: 0,
+                r: String::new(),
+                s: String::new(),
+            },
             members: vec![Member {
                 public_key: KEY.into(),
                 attestation: String::new(),
@@ -1078,6 +1090,6 @@ mod tests {
         assert_eq!(body["status"], "pending");
         assert_eq!(body["members"][0]["publicKey"], KEY);
         assert!(body["members"][0].get("proof").is_none());
-        assert_eq!(body["unitNonce"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(body["contentHash"], format!("0x{}", "11".repeat(32)));
     }
 }

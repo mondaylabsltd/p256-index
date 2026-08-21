@@ -1,9 +1,12 @@
 //! The `RegisterTask` lifecycle vocabulary.
 //!
-//! A task carries one registration unit — 1..7 possession-proven members
-//! sharing an rpId, an opaque metadata payload and a one-time unitNonce —
-//! from an accepted request to on-chain entries. Its status walks Pending →
-//! Done/Failed; there is no commit-reveal, so no intermediate state.
+//! A task carries one registration unit — a group key plus 1..7
+//! possession-proven member passkeys sharing an rpId and an opaque metadata
+//! payload; the group proof binds the unit's content hash and every member
+//! proof binds (groupKey, own attestation) — from an accepted request to
+//! on-chain entries. Its status walks Pending → Done/Failed with no
+//! intermediate state. The content hash is the unit's identity and the
+//! service's idempotency key.
 
 use serde::{Deserialize, Serialize};
 
@@ -48,10 +51,16 @@ pub struct RegisterTask {
     /// The unit's shared opaque payload, hex, may be empty. Credential ids,
     /// display names, wallet derivation preimages — all caller-defined.
     pub metadata: String,
-    /// The unit's one-time nonce (32-byte hex): every member's challenge
-    /// binds it, the contract consumes it, and it doubles as the service's
-    /// idempotency key.
-    pub unit_nonce: String,
+    /// The unit's content hash (0x-hex), keccak over (rpId, metadata,
+    /// groupPublicKey, member hashes) exactly as the contract computes it:
+    /// the unit's stable identity, the service's idempotency key, and the
+    /// value the group key's challenge binds. Set once at validation.
+    pub content_hash: String,
+    /// The unit's group key: an uncompressed P-256 point (hex), client-held
+    /// software key. Every unit has exactly one; members bind it.
+    pub group_public_key: String,
+    /// The group key's content-bound closing proof over the whole unit.
+    pub group_proof: Proof,
     /// 1..=7 members, registered atomically in one `register` transaction.
     pub members: Vec<Member>,
     #[serde(skip_serializing_if = "Option::is_none")]

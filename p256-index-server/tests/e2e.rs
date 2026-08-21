@@ -13,11 +13,7 @@
 //! The full register -> chain -> confirmed path (real on-chain write, real
 //! gas) lives in the `worker.rs` inline test gated by `P256_INDEX_E2E_CHAIN=1`.
 
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use alloy::primitives::B256;
 use async_trait::async_trait;
@@ -44,19 +40,12 @@ use p256_index_server::{
 };
 use p256_registrar::{
     lookup::{Entry, Page, SiteItem},
-    protocol::{challenge_for, parse_b256},
+    protocol::{challenge_for, content_hash_for, member_binding_for},
     task::RegisterTask,
     verify::base64url_32,
 };
 
 const REGISTRY: &str = "0x1111111111111111111111111111111111111111";
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 fn test_config(redis_url: &str, iggy_url: &str) -> Config {
     Config {
@@ -128,10 +117,6 @@ impl ReadChain for FakeChain {
         Err(ChainError::Unavailable)
     }
 
-    async fn is_nonce_used(&self, _: Vec<u8>, _: B256) -> Result<bool, ChainError> {
-        Err(ChainError::Unavailable)
-    }
-
     async fn is_content_registered(&self, _: B256) -> Result<bool, ChainError> {
         Err(ChainError::Unavailable)
     }
@@ -159,45 +144,118 @@ async fn body_json(response: Response) -> Value {
     serde_json::from_slice(&bytes).expect("json body")
 }
 
-/// One member with a real possession proof over its storage challenge.
-fn signed_member(rp_id: &str, nonce_hex: &str) -> (Value, String) {
-    let signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
-    let public = hex::encode(signing.verifying_key().to_sec1_point(false).as_bytes());
-    let nonce = parse_b256(nonce_hex).unwrap();
-    let challenge = challenge_for(
+/// A fully-signed single-member unit (fresh group key + fresh passkey):
+/// the member binds (groupKey, own attestation), the group key closes over
+/// the content hash. Returns (register body, member pub hex).
+fn signed_unit(rp_id: &str, metadata_hex: &str) -> (Value, String) {
+    fn proof_json(
+        signing: &p256::ecdsa::SigningKey,
+        challenge: alloy::primitives::B256,
+        rp_id: &str,
+    ) -> Value {
+        let client_data = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
+            base64url_32(&challenge)
+        );
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        auth_data.push(0x05);
+        auth_data.extend_from_slice(&[0, 0, 0, 0]);
+        let client_hash: [u8; 32] = Sha256::digest(client_data.as_bytes()).into();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&client_hash);
+        let digest: [u8; 32] = Sha256::digest(&signed).into();
+        let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let bytes = signature.to_bytes();
+        json!({
+            "authenticatorData": hex::encode(auth_data),
+            "clientDataJSON": client_data,
+            "challengeIndex": 23,
+            "typeIndex": 1,
+            "r": format!("0x{}", hex::encode(&bytes[..32])),
+            "s": format!("0x{}", hex::encode(&bytes[32..])),
+        })
+    }
+
+    let member_signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+    let member_public = hex::encode(
+        member_signing
+            .verifying_key()
+            .to_sec1_point(false)
+            .as_bytes(),
+    );
+    let group_signing = p256::ecdsa::SigningKey::from(&p256::SecretKey::generate());
+    let group_public = hex::encode(
+        group_signing
+            .verifying_key()
+            .to_sec1_point(false)
+            .as_bytes(),
+    );
+    let registry: alloy::primitives::Address = REGISTRY.parse().unwrap();
+
+    let binding = member_binding_for(&hex::decode(&group_public).unwrap(), &[]);
+    let member_challenge = challenge_for(
         p256_registrar::protocol::CHAIN_ID,
-        REGISTRY.parse().unwrap(),
+        registry,
         rp_id,
-        &hex::decode(&public).unwrap(),
-        nonce,
+        &hex::decode(&member_public).unwrap(),
+        binding,
     );
-    let client_data = format!(
-        "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://example.com\"}}",
-        base64url_32(&challenge)
+    let member_proof = proof_json(&member_signing, member_challenge, rp_id);
+
+    let skeleton = p256_registrar::task::RegisterTask {
+        id: String::new(),
+        status: p256_registrar::task::TaskStatus::Pending,
+        rp_id: rp_id.to_owned(),
+        metadata: metadata_hex.to_owned(),
+        content_hash: String::new(),
+        group_public_key: group_public.clone(),
+        group_proof: p256_registrar::task::Proof {
+            authenticator_data: String::new(),
+            client_data_json: String::new(),
+            challenge_index: 0,
+            type_index: 0,
+            r: String::new(),
+            s: String::new(),
+        },
+        members: vec![p256_registrar::task::Member {
+            public_key: member_public.clone(),
+            attestation: String::new(),
+            proof: p256_registrar::task::Proof {
+                authenticator_data: String::new(),
+                client_data_json: String::new(),
+                challenge_index: 0,
+                type_index: 0,
+                r: String::new(),
+                s: String::new(),
+            },
+        }],
+        tx_hash: None,
+        first_entry_id: None,
+        error: None,
+        retries: 0,
+        created_at: 0,
+        admitted: false,
+    };
+    let content_hash = content_hash_for(&skeleton).unwrap();
+    let group_challenge = challenge_for(
+        p256_registrar::protocol::CHAIN_ID,
+        registry,
+        rp_id,
+        &hex::decode(&group_public).unwrap(),
+        content_hash,
     );
-    let mut auth_data = Vec::new();
-    auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-    auth_data.push(0x05);
-    auth_data.extend_from_slice(&[0, 0, 0, 0]);
-    let client_hash: [u8; 32] = Sha256::digest(client_data.as_bytes()).into();
-    let mut signed = auth_data.clone();
-    signed.extend_from_slice(&client_hash);
-    let digest: [u8; 32] = Sha256::digest(&signed).into();
-    let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
-    let bytes = signature.to_bytes();
+    let group_proof = proof_json(&group_signing, group_challenge, rp_id);
+
     (
         json!({
-            "publicKey": public,
-            "proof": {
-                "authenticatorData": hex::encode(auth_data),
-                "clientDataJSON": client_data,
-                "challengeIndex": 23,
-                "typeIndex": 1,
-                "r": format!("0x{}", hex::encode(&bytes[..32])),
-                "s": format!("0x{}", hex::encode(&bytes[32..])),
-            }
+            "rpId": rp_id,
+            "metadata": metadata_hex,
+            "groupPublicKey": group_public,
+            "groupProof": group_proof,
+            "members": [{ "publicKey": member_public, "proof": member_proof }],
         }),
-        public,
+        member_public,
     )
 }
 
@@ -229,18 +287,11 @@ async fn http_contract_over_real_redis_and_iggy() {
     let state = AppState::new(store.clone(), queue, Arc::new(FakeChain), &config);
     let app = router(state);
 
-    // A fully-proven registration flows to 202, is idempotent by nonce, and
-    // is visible pre-chain via task status and the key query.
-    let nonce_hex = format!("0x{}", hex::encode(now_ms().to_be_bytes().repeat(4)));
+    // A fully-proven registration flows to 202, is idempotent by content
+    // hash, and is visible pre-chain via task status and the key query.
     let rp_id = format!("e2e-{}.example", uuid::Uuid::new_v4());
-    let (member, public_key) = signed_member(&rp_id, &nonce_hex);
-    let body = json!({
-        "rpId": rp_id,
-        "metadata": "0xe2e0",
-        "unitNonce": nonce_hex,
-        "members": [member],
-    })
-    .to_string();
+    let (unit_body, public_key) = signed_unit(&rp_id, "0xe2e0");
+    let body = unit_body.to_string();
 
     let created = send(&app, "POST", "/api/register", &body).await;
     assert_eq!(created.status(), StatusCode::ACCEPTED);

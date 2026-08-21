@@ -14,9 +14,7 @@
 //!   reason, so the task reconciles then resends ONCE — the resend's gas
 //!   estimation surfaces the actual revert for classification;
 //! - chain-write errors classify via [`classify_chain_error`]:
-//!   content-registered → done, nonce-used → reconcile then terminal
-//!   CONFLICT (the proofs died with the nonce), transient → retry counter,
-//!   else POISON;
+//!   content-registered → done, transient → retry counter, else POISON;
 //! - any transient condition settles the batch as Retry so the shell does
 //!   not advance the consumer offset.
 //!
@@ -35,6 +33,9 @@ use crate::task::RegisterTask;
 
 // ── Shell protocol ─────────────────────────────────────────────────────────
 
+// In-process operation envelope; the task-bearing variants dominate by
+// design and boxing them would complicate every core/shell match.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubmissionOperation {
@@ -75,7 +76,6 @@ impl crux_core::capability::Operation for SubmissionOperation {
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     Poison,
-    Conflict,
 }
 
 impl FailureKind {
@@ -83,7 +83,6 @@ impl FailureKind {
     pub fn as_store_class(&self) -> &'static str {
         match self {
             Self::Poison => "POISON",
-            Self::Conflict => "CONFLICT",
         }
     }
 }
@@ -415,24 +414,6 @@ async fn classify_task(ctx: &Ctx, task: &RegisterTask, error: &ChainError) -> Fl
     let message = format!("register: {error}");
     match classify_chain_error(error) {
         ErrorClass::ContentRegistered => mark_done(ctx, task, task.tx_hash.clone(), None).await,
-        // The nonce was consumed. If our content is on-chain the consumer
-        // was our own lost-receipt transaction (done); otherwise a third
-        // party consumed it — the proofs are void, terminal CONFLICT.
-        ErrorClass::NonceUsed => match check_content(ctx, task).await? {
-            ContentState::Registered => mark_done(ctx, task, task.tx_hash.clone(), None).await,
-            ContentState::Absent | ContentState::Unencodable => {
-                persist(
-                    ctx,
-                    SubmissionOperation::MarkFailed {
-                        task_id: task.id.clone(),
-                        kind: FailureKind::Conflict,
-                        message,
-                    },
-                    "could not persist conflict task",
-                )
-                .await
-            }
-        },
         ErrorClass::Transient => {
             persist(
                 ctx,
@@ -525,7 +506,16 @@ mod tests {
             status,
             rp_id: format!("{id}.example"),
             metadata: "0xaa".into(),
-            unit_nonce: format!("0x{}", "11".repeat(32)),
+            content_hash: String::new(),
+            group_public_key: "049e666db13bc6d0a76ec6801fbe24864030f15eca3b2d07ebcaf824bb2dc4f0aea8221dc27980b7c133a00d910c39723eb1523e88ad050a7303bba8bde07367fa".into(),
+            group_proof: Proof {
+                authenticator_data: String::new(),
+                client_data_json: String::new(),
+                challenge_index: 0,
+                type_index: 0,
+                r: String::new(),
+                s: String::new(),
+            },
             members: vec![Member {
                 public_key: PK.into(),
                 attestation: String::new(),
@@ -766,60 +756,6 @@ mod tests {
                 task_id: "a".into(),
                 tx_hash: None,
                 first_entry_id: None,
-            },
-            SubmissionResult::Persisted,
-        );
-        driver.assert_settled(advance());
-    }
-
-    #[test]
-    fn nonce_used_reconciles_content_before_the_conflict_verdict() {
-        // Our own earlier transaction consumed the nonce with a lost receipt:
-        // content present → done.
-        let pending = task("a", TaskStatus::Pending);
-        let mut driver = Driver::start(&["a"]);
-        driver.step(load(&["a"]), loaded(&[&pending]));
-        driver.step(check(&pending), registered(false));
-        driver.step(
-            SubmissionOperation::SubmitRegister {
-                task: pending.clone(),
-            },
-            SubmissionResult::Tx(TxOutcome::SendFailed {
-                error: ChainError::Rejected("NonceAlreadyUsed".into()),
-            }),
-        );
-        driver.step(check(&pending), registered(true));
-        driver.step(
-            SubmissionOperation::MarkDone {
-                task_id: "a".into(),
-                tx_hash: None,
-                first_entry_id: None,
-            },
-            SubmissionResult::Persisted,
-        );
-        driver.assert_settled(advance());
-    }
-
-    #[test]
-    fn nonce_used_with_absent_content_is_a_terminal_conflict() {
-        let pending = task("a", TaskStatus::Pending);
-        let mut driver = Driver::start(&["a"]);
-        driver.step(load(&["a"]), loaded(&[&pending]));
-        driver.step(check(&pending), registered(false));
-        driver.step(
-            SubmissionOperation::SubmitRegister {
-                task: pending.clone(),
-            },
-            SubmissionResult::Tx(TxOutcome::SendFailed {
-                error: ChainError::Rejected("NonceAlreadyUsed".into()),
-            }),
-        );
-        driver.step(check(&pending), registered(false));
-        driver.step(
-            SubmissionOperation::MarkFailed {
-                task_id: "a".into(),
-                kind: FailureKind::Conflict,
-                message: "register: chain RPC rejected the request".into(),
             },
             SubmissionResult::Persisted,
         );

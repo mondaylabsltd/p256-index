@@ -13,7 +13,7 @@
 //!   contract check for check, so invalid proofs die at admission instead of
 //!   burning gas.
 //! - [`admission`] — the register endpoint's decision tree (crux app):
-//!   validation, proof verification, idempotency by unitNonce, chain
+//!   validation, proof verification, idempotency by content hash, chain
 //!   pre-checks, write gates and the two-phase Redis/Iggy admission protocol.
 //!   The server's HTTP handler is its shell.
 //! - [`lookup`] — read-side vocabulary (entries, site stats, pagination) and
