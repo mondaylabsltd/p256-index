@@ -27,8 +27,10 @@ use alloy::primitives::Address;
 use crux_core::{App, Command, command::CommandContext, macros::effect};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{challenge_for, content_hash_for, member_binding_for, parse_hex_bytes};
-use crate::task::{Member, Proof, RegisterTask, TaskStatus};
+use crate::protocol::{
+    challenge_for, content_hash_for, member_binding_for, parse_hex_bytes, reference_binding_for,
+};
+use crate::task::{Member, Proof, RegisterTask, TaskKind, TaskStatus};
 use crate::verify::verify_proof;
 
 /// New registrations are rejected while the active queue is at least this deep.
@@ -72,6 +74,26 @@ pub struct RegisterRequest {
     pub members: Option<Vec<MemberRequest>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferRequest {
+    /// The target group's rpId — re-verified against the group's frozen
+    /// record by the contract.
+    pub rp_id: Option<String>,
+    pub group_public_key: Option<String>,
+    /// The reference's own opaque payload.
+    pub metadata: Option<String>,
+    pub member: Option<MemberRequest>,
+}
+
+/// One admitted write, dispatched by kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum AdmissionRequest {
+    Register(RegisterRequest),
+    Refer(ReferRequest),
+}
+
 // ── Shell protocol ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,6 +109,12 @@ pub enum AdmissionOperation {
     /// isContentRegistered(contentHash) on the registry (fail-open).
     CheckContentRegistered {
         content_hash: String,
+    },
+    /// isReferenced(groupPublicKey, memberPublicKey) on the registry
+    /// (fail-open).
+    CheckReferenced {
+        group_public_key: String,
+        member_public_key: String,
     },
     QueueDepth,
     AllowGlobalCreate,
@@ -167,7 +195,7 @@ pub enum AdmissionEvent {
     /// The shell supplies task identity, wall-clock time and the chain
     /// context so the program stays deterministic.
     Submit {
-        request: RegisterRequest,
+        request: AdmissionRequest,
         new_task_id: String,
         now_ms: u64,
         chain_id: u64,
@@ -247,17 +275,24 @@ async fn request(ctx: &Ctx, operation: AdmissionOperation) -> AdmissionResult {
 
 async fn drive_admission(
     ctx: &Ctx,
-    register: RegisterRequest,
+    submitted: AdmissionRequest,
     new_task_id: String,
     now_ms: u64,
     chain_id: u64,
     registry: &str,
 ) -> Flow<AdmissionOutcome> {
-    let (task, content_hash) =
-        match validate_register(register, new_task_id, now_ms, chain_id, registry) {
-            Ok(valid) => valid,
-            Err(message) => return Ok(AdmissionOutcome::Invalid { message }),
-        };
+    let validated = match submitted {
+        AdmissionRequest::Register(register) => {
+            validate_register(register, new_task_id, now_ms, chain_id, registry)
+        }
+        AdmissionRequest::Refer(refer) => {
+            validate_refer(refer, new_task_id, now_ms, chain_id, registry)
+        }
+    };
+    let (task, content_hash) = match validated {
+        Ok(valid) => valid,
+        Err(message) => return Ok(AdmissionOutcome::Invalid { message }),
+    };
 
     match request(ctx, AdmissionOperation::AllowIpCreate).await {
         AdmissionResult::Allowed { allowed: true } => {}
@@ -295,14 +330,16 @@ async fn drive_admission(
 
     // Chain pre-check, fail-open: an RPC outage never blocks admission —
     // the worker reconciles against the chain anyway.
-    match request(
-        ctx,
-        AdmissionOperation::CheckContentRegistered {
+    let precheck = match task.kind {
+        TaskKind::Register => AdmissionOperation::CheckContentRegistered {
             content_hash: content_hash.clone(),
         },
-    )
-    .await
-    {
+        TaskKind::Refer => AdmissionOperation::CheckReferenced {
+            group_public_key: task.group_public_key.clone(),
+            member_public_key: task.members[0].public_key.clone(),
+        },
+    };
+    match request(ctx, precheck).await {
         AdmissionResult::ChainBool { value: true } => {
             return Ok(AdmissionOutcome::AlreadyRegistered { content_hash });
         }
@@ -441,14 +478,15 @@ pub fn validate_register(
     let mut task = RegisterTask {
         id: new_task_id,
         status: TaskStatus::Pending,
+        kind: TaskKind::Register,
         rp_id,
         metadata,
         content_hash: String::new(),
         group_public_key,
-        group_proof,
+        group_proof: Some(group_proof),
         members: parsed,
         tx_hash: None,
-        first_entry_id: None,
+        on_chain_id: None,
         error: None,
         retries: 0,
         created_at: now_ms as i64,
@@ -468,7 +506,7 @@ pub fn validate_register(
         content_hash,
     );
     verify_proof(
-        &task.group_proof,
+        task.group_proof.as_ref().expect("register task has one"),
         group_challenge,
         &task.rp_id,
         &group_key_bytes,
@@ -484,6 +522,87 @@ pub fn validate_register(
         verify_proof(&member.proof, challenge, &task.rp_id, &key_bytes)
             .map_err(|error| format!("members[{index}]: proof rejected: {error}"))?;
     }
+
+    let content_hash = task.content_hash.clone();
+    Ok((task, content_hash))
+}
+
+/// Total validation for a Refer request: shapes, bounds and the referring
+/// key's reference-bound possession proof.
+pub fn validate_refer(
+    request: ReferRequest,
+    new_task_id: String,
+    now_ms: u64,
+    chain_id: u64,
+    registry: &str,
+) -> Result<(RegisterTask, String), String> {
+    let registry: Address = registry
+        .parse()
+        .map_err(|_| "service misconfigured: invalid registry address".to_owned())?;
+
+    let Some(rp_id) = request.rp_id.filter(|value| !value.is_empty()) else {
+        return Err("rpId is required".into());
+    };
+    if rp_id.len() > 253 {
+        return Err("rpId exceeds max length (253)".into());
+    }
+
+    let group_public_key = parse_public_key(request.group_public_key.as_deref())
+        .map_err(|message| format!("groupPublicKey: {message}"))?;
+
+    let metadata = request.metadata.unwrap_or_default();
+    let metadata_bytes =
+        parse_hex_bytes(&metadata).map_err(|_| "metadata must be a valid hex string".to_owned())?;
+    if metadata_bytes.len() > MAX_METADATA_BYTES {
+        return Err(format!(
+            "metadata exceeds max length ({MAX_METADATA_BYTES} bytes)"
+        ));
+    }
+    let metadata = if metadata_bytes.is_empty() {
+        String::new()
+    } else {
+        format!("0x{}", hex::encode(&metadata_bytes))
+    };
+
+    let Some(member) = request.member else {
+        return Err("member is required".into());
+    };
+    let member = parse_member(member).map_err(|message| format!("member: {message}"))?;
+    if member.public_key == group_public_key {
+        return Err("member: the group key cannot also be a member".into());
+    }
+
+    let mut task = RegisterTask {
+        id: new_task_id,
+        status: TaskStatus::Pending,
+        kind: TaskKind::Refer,
+        rp_id,
+        metadata,
+        content_hash: String::new(),
+        group_public_key,
+        group_proof: None,
+        members: vec![member],
+        tx_hash: None,
+        on_chain_id: None,
+        error: None,
+        retries: 0,
+        created_at: now_ms as i64,
+        admitted: false,
+    };
+    let content_hash = content_hash_for(&task).map_err(|error| error.to_string())?;
+    task.content_hash = format!("{content_hash:#x}");
+
+    // The pure mirror of the contract's verification: the referring key
+    // binds (groupKey, own attestation, reference metadata).
+    let group_key_bytes = hex::decode(&task.group_public_key).expect("validated hex");
+    let member_ref = &task.members[0];
+    let key_bytes = hex::decode(&member_ref.public_key).expect("validated hex");
+    let attestation_bytes = parse_hex_bytes(&member_ref.attestation).expect("validated hex");
+    let metadata_bytes = parse_hex_bytes(&task.metadata).expect("validated hex");
+    let binding = reference_binding_for(&group_key_bytes, &attestation_bytes, &metadata_bytes);
+    let challenge = challenge_for(chain_id, registry, &task.rp_id, &key_bytes, binding);
+    verify_proof(&member_ref.proof, challenge, &task.rp_id, &key_bytes)
+        .map_err(|error| format!("member: proof rejected: {error}"))?;
 
     let content_hash = task.content_hash.clone();
     Ok((task, content_hash))
@@ -652,18 +771,19 @@ mod tests {
         let skeleton = RegisterTask {
             id: String::new(),
             status: TaskStatus::Pending,
+            kind: TaskKind::Register,
             rp_id: rp_id.into(),
             metadata: "0xaa".into(),
             content_hash: String::new(),
             group_public_key: group_public,
-            group_proof: Proof {
+            group_proof: Some(Proof {
                 authenticator_data: String::new(),
                 client_data_json: String::new(),
                 challenge_index: 0,
                 type_index: 0,
                 r: String::new(),
                 s: String::new(),
-            },
+            }),
             members: vec![Member {
                 public_key: public,
                 attestation: String::new(),
@@ -677,7 +797,7 @@ mod tests {
                 },
             }],
             tx_hash: None,
-            first_entry_id: None,
+            on_chain_id: None,
             error: None,
             retries: 0,
             created_at: 0,
@@ -727,6 +847,45 @@ mod tests {
             group_proof: Some(signed_group_proof("example.com")),
             members: Some(vec![signed_member("example.com")]),
         }
+    }
+
+    fn refer_binding() -> alloy::primitives::B256 {
+        let (_, group_public) = group_keypair();
+        reference_binding_for(&hex::decode(&group_public).unwrap(), &[], &[0xca, 0xfe])
+    }
+
+    /// A referring passkey's request: the fixed keypair pointing at the
+    /// fixed group key with metadata 0xcafe.
+    fn valid_refer_request() -> ReferRequest {
+        let (signing, public) = keypair();
+        let challenge = challenge_for(
+            CHAIN,
+            REGISTRY.parse().unwrap(),
+            "example.com",
+            &hex::decode(&public).unwrap(),
+            refer_binding(),
+        );
+        ReferRequest {
+            rp_id: Some("example.com".into()),
+            group_public_key: Some(group_keypair().1),
+            metadata: Some("0xcafe".into()),
+            member: Some(MemberRequest {
+                public_key: Some(public),
+                attestation: None,
+                proof: Some(proof_over(&signing, challenge, "example.com")),
+            }),
+        }
+    }
+
+    fn validated_refer() -> (RegisterTask, String) {
+        validate_refer(
+            valid_refer_request(),
+            "task-new".into(),
+            1_000,
+            CHAIN,
+            REGISTRY,
+        )
+        .expect("valid refer request")
     }
 
     fn validated() -> (RegisterTask, String) {
@@ -812,6 +971,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_fully_proven_refer_validates() {
+        let (task, content_hash) = validated_refer();
+        assert_eq!(task.kind, TaskKind::Refer);
+        assert_eq!(task.metadata, "0xcafe");
+        assert_eq!(task.members.len(), 1);
+        assert!(task.group_proof.is_none());
+        assert!(content_hash.starts_with("0x"));
+        // The idempotency digest is (group, key) ONLY — resubmitting the
+        // same pair with different metadata maps to the SAME task.
+        let mut replaced = valid_refer_request();
+        replaced.metadata = Some("0xbeef".into());
+        // (The proof no longer matches the new metadata, so recompute it.)
+        let (signing, public) = keypair();
+        let binding = reference_binding_for(
+            &hex::decode(&group_keypair().1).unwrap(),
+            &[],
+            &[0xbe, 0xef],
+        );
+        let challenge = challenge_for(
+            CHAIN,
+            REGISTRY.parse().unwrap(),
+            "example.com",
+            &hex::decode(&public).unwrap(),
+            binding,
+        );
+        replaced.member.as_mut().unwrap().proof =
+            Some(proof_over(&signing, challenge, "example.com"));
+        let (_, replaced_hash) =
+            validate_refer(replaced, "t2".into(), 0, CHAIN, REGISTRY).expect("valid");
+        assert_eq!(content_hash, replaced_hash);
+    }
+
+    #[test]
+    fn refer_rejections() {
+        let mut no_member = valid_refer_request();
+        no_member.member = None;
+        assert_eq!(
+            validate_refer(no_member, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
+            "member is required"
+        );
+
+        let mut self_refer = valid_refer_request();
+        self_refer.member.as_mut().unwrap().public_key = Some(group_keypair().1);
+        assert_eq!(
+            validate_refer(self_refer, "t".into(), 0, CHAIN, REGISTRY).unwrap_err(),
+            "member: the group key cannot also be a member"
+        );
+
+        // A member-binding proof is not a reference proof.
+        let mut wrong_binding = valid_refer_request();
+        wrong_binding.member = Some(signed_member("example.com"));
+        let error = validate_refer(wrong_binding, "t".into(), 0, CHAIN, REGISTRY).unwrap_err();
+        assert!(error.starts_with("member: proof rejected"), "{error}");
+
+        // Metadata tampering after signing dies too.
+        let mut tampered = valid_refer_request();
+        tampered.metadata = Some("0xbeef".into());
+        let error = validate_refer(tampered, "t".into(), 0, CHAIN, REGISTRY).unwrap_err();
+        assert!(error.starts_with("member: proof rejected"), "{error}");
+    }
+
+    #[test]
+    fn refer_walks_check_referenced_and_admits() {
+        let core: Core<AdmissionApp> = Core::new();
+        let effects = core.process_event(AdmissionEvent::Submit {
+            request: AdmissionRequest::Refer(valid_refer_request()),
+            new_task_id: "task-new".into(),
+            now_ms: 1_000,
+            chain_id: CHAIN,
+            registry: REGISTRY.into(),
+        });
+        let mut driver = Driver {
+            core,
+            queue: VecDeque::new(),
+        };
+        driver.absorb(effects);
+        let (task, content_hash) = validated_refer();
+
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::FindTaskByContent {
+                content_hash: content_hash.clone(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+        driver.step(
+            AdmissionOperation::CheckReferenced {
+                group_public_key: task.group_public_key.clone(),
+                member_public_key: task.members[0].public_key.clone(),
+            },
+            AdmissionResult::ChainBool { value: false },
+        );
+        driver.step(
+            AdmissionOperation::QueueDepth,
+            AdmissionResult::Depth { depth: 0 },
+        );
+        driver.step(
+            AdmissionOperation::AllowGlobalCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::Admit { task: task.clone() },
+            AdmissionResult::Admitted(AdmitOutcome::New),
+        );
+        driver.step(
+            AdmissionOperation::Enqueue { task: task.clone() },
+            AdmissionResult::Enqueued,
+        );
+        let mut admitted = task;
+        admitted.admitted = true;
+        driver.step(
+            AdmissionOperation::MarkAdmitted {
+                id: "task-new".into(),
+            },
+            AdmissionResult::TaskFound {
+                task: Some(admitted),
+            },
+        );
+        driver.assert_settled(AdmissionOutcome::Queued {
+            id: "task-new".into(),
+            status: TaskStatus::Pending,
+        });
+    }
+
+    #[test]
+    fn refer_already_on_chain_answers_done_retroactively() {
+        let core: Core<AdmissionApp> = Core::new();
+        let effects = core.process_event(AdmissionEvent::Submit {
+            request: AdmissionRequest::Refer(valid_refer_request()),
+            new_task_id: "task-new".into(),
+            now_ms: 1_000,
+            chain_id: CHAIN,
+            registry: REGISTRY.into(),
+        });
+        let mut driver = Driver {
+            core,
+            queue: VecDeque::new(),
+        };
+        driver.absorb(effects);
+        let (task, content_hash) = validated_refer();
+
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::FindTaskByContent {
+                content_hash: content_hash.clone(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+        driver.step(
+            AdmissionOperation::CheckReferenced {
+                group_public_key: task.group_public_key.clone(),
+                member_public_key: task.members[0].public_key.clone(),
+            },
+            AdmissionResult::ChainBool { value: true },
+        );
+        driver.assert_settled(AdmissionOutcome::AlreadyRegistered { content_hash });
+    }
+
     // ── Driver ─────────────────────────────────────────────────────────────
 
     struct Driver {
@@ -823,7 +1147,7 @@ mod tests {
         fn submit(request_body: RegisterRequest) -> Self {
             let core = Core::new();
             let effects = core.process_event(AdmissionEvent::Submit {
-                request: request_body,
+                request: AdmissionRequest::Register(request_body),
                 new_task_id: "task-new".into(),
                 now_ms: 1_000,
                 chain_id: CHAIN,

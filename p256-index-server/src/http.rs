@@ -24,14 +24,17 @@ use tokio_util::sync::CancellationToken;
 use p256_registrar::{
     admission::{
         AdmissionApp, AdmissionEffect, AdmissionEvent, AdmissionOperation, AdmissionOutcome,
-        AdmissionResult, AdmitOutcome, RegisterRequest,
+        AdmissionRequest, AdmissionResult, AdmitOutcome, ReferRequest, RegisterRequest,
     },
     admission::{validate_attestation_hex, validate_public_key_hex},
     lookup::{
         ChainFetch, LookupApp, LookupCacheKey, LookupEffect, LookupEndpoint, LookupEvent,
         LookupOperation, LookupOutcome, LookupParams, LookupResult, TtlClass, task_status_body,
     },
-    protocol::{challenge_for, content_hash_for, member_binding_for, parse_b256, parse_hex_bytes},
+    protocol::{
+        challenge_for, content_hash_for, member_binding_for, parse_b256, parse_hex_bytes,
+        reference_binding_for,
+    },
     sentinel,
     task::TaskStatus,
 };
@@ -84,6 +87,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/challenge", post(challenge))
         .route("/api/register", post(register))
+        .route("/api/refer", post(refer))
         .route("/api/task/", get(missing_task_id))
         .route("/api/task/{id}", get(task_status))
         .route("/api/query", get(query))
@@ -197,13 +201,17 @@ async fn health(State(state): State<AppState>) -> Response {
 /// admission (and the contract) will accept — a challenge handed out here
 /// is never one that register must reject.
 ///
-/// Two modes, mirroring the two signing moments:
+/// Three modes, mirroring the three signing roles:
 /// - MEMBER mode ({rpId, groupPublicKey, publicKey, attestation?}): the
 ///   binding a passkey signs the moment it is created — independent of the
 ///   metadata and of every sibling.
+/// - REFERENCE mode (member mode body plus "refer": true and an optional
+///   "metadata"): the binding a passkey signs to point at an existing
+///   group.
 /// - GROUP mode ({rpId, metadata?, groupPublicKey, members: [{publicKey,
-///   attestation?}]}): the unit's content hash and the group key's closing
-///   challenge, once the unit is final (member challenges are echoed too).
+///   attestation?}]}): the group's content hash and the group key's
+///   closing challenge, once the group is final (member challenges are
+///   echoed too).
 async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Response {
     let Ok(bytes) = to_bytes(request.into_body(), MAX_BODY_SIZE).await else {
         return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
@@ -242,6 +250,13 @@ async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Res
         })
     };
 
+    if body.get("members").is_some() && body.get("refer").and_then(Value::as_bool) == Some(true) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "choose one mode: members (group) or refer (reference), not both",
+        );
+    }
+
     // MEMBER mode: one passkey signing at creation.
     if body.get("members").is_none() {
         let Some(public_key) = body.get("publicKey").and_then(Value::as_str) else {
@@ -273,7 +288,19 @@ async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Res
             }
         };
         let attestation_bytes = parse_hex_bytes(&attestation).expect("validated hex");
-        let binding = member_binding_for(&group_key_bytes, &attestation_bytes);
+        let binding = if body.get("refer").and_then(Value::as_bool).unwrap_or(false) {
+            let metadata = body.get("metadata").and_then(Value::as_str).unwrap_or("");
+            let metadata_bytes = match parse_hex_bytes(metadata) {
+                Ok(bytes) if bytes.len() <= p256_registrar::admission::MAX_METADATA_BYTES => bytes,
+                Ok(_) => {
+                    return error_response(StatusCode::BAD_REQUEST, "metadata exceeds max length");
+                }
+                Err(_) => return error_response(StatusCode::BAD_REQUEST, "metadata must be hex"),
+            };
+            reference_binding_for(&group_key_bytes, &attestation_bytes, &metadata_bytes)
+        } else {
+            member_binding_for(&group_key_bytes, &attestation_bytes)
+        };
         let key_bytes = hex::decode(&public_key).expect("validated hex");
         let challenge = challenge_for(state.chain_id, registry, rp_id, &key_bytes, binding);
         let mut response = render_challenge(challenge);
@@ -367,21 +394,22 @@ async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Res
     let skeleton = p256_registrar::task::RegisterTask {
         id: String::new(),
         status: TaskStatus::Pending,
+        kind: p256_registrar::task::TaskKind::Register,
         rp_id: rp_id.to_owned(),
         metadata,
         content_hash: String::new(),
         group_public_key: group_public_key.clone(),
-        group_proof: p256_registrar::task::Proof {
+        group_proof: Some(p256_registrar::task::Proof {
             authenticator_data: String::new(),
             client_data_json: String::new(),
             challenge_index: 0,
             type_index: 0,
             r: String::new(),
             s: String::new(),
-        },
+        }),
         members: skeleton_members,
         tx_hash: None,
-        first_entry_id: None,
+        on_chain_id: None,
         error: None,
         retries: 0,
         created_at: 0,
@@ -441,11 +469,61 @@ async fn register(
     let Ok(body) = serde_json::from_slice::<RegisterRequest>(&bytes) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid JSON body");
     };
+    drive_admission_request(state, peer, AdmissionRequest::Register(body)).await
+}
 
+/// POST /api/refer — one passkey pointing at an existing group.
+async fn refer(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response {
+    let content_length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if request.headers().contains_key(header::CONTENT_LENGTH) && content_length.is_none() {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+    if content_length.is_some_and(|length| length > MAX_BODY_SIZE) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+    let Ok(bytes) = to_bytes(request.into_body(), MAX_BODY_SIZE).await else {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    };
+    let Ok(body) = serde_json::from_slice::<ReferRequest>(&bytes) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid JSON body");
+    };
+
+    // Fail-open rpId cross-check: the contract verifies the proof against
+    // the GROUP's frozen rpId, not the client's claim. When the chain can
+    // tell us the group's record, reject a mismatch here instead of
+    // admitting a task that can only revert. A missing group passes (it
+    // may be racing through our own pipeline); an RPC failure passes.
+    if let (Some(rp_id), Some(group_key)) =
+        (body.rp_id.as_deref(), body.group_public_key.as_deref())
+        && let Ok(group_key_bytes) = parse_hex_bytes(group_key)
+        && let Ok(Some(unit)) = state.chain.unit_by_group_key(group_key_bytes).await
+        && unit.rp_id != rp_id
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "rpId does not match the group's frozen record",
+        );
+    }
+    drive_admission_request(state, peer, AdmissionRequest::Refer(body)).await
+}
+
+async fn drive_admission_request(
+    state: AppState,
+    peer: SocketAddr,
+    submitted: AdmissionRequest,
+) -> Response {
     let ip_hash = hash_ip(&state.ip_salt, &peer.ip().to_string());
     let core: Core<AdmissionApp> = Core::new();
     let mut effects = core.process_event(AdmissionEvent::Submit {
-        request: body,
+        request: submitted,
         new_task_id: uuid::Uuid::new_v4().to_string(),
         now_ms: now_ms(),
         chain_id: state.chain_id,
@@ -491,6 +569,21 @@ async fn execute_admission(
                 return AdmissionResult::ChainReadFailed;
             };
             match state.chain.is_content_registered(content_hash).await {
+                Ok(value) => AdmissionResult::ChainBool { value },
+                Err(_) => AdmissionResult::ChainReadFailed,
+            }
+        }
+        AdmissionOperation::CheckReferenced {
+            group_public_key,
+            member_public_key,
+        } => {
+            let (Ok(group), Ok(member)) = (
+                parse_hex_bytes(group_public_key),
+                parse_hex_bytes(member_public_key),
+            ) else {
+                return AdmissionResult::ChainReadFailed;
+            };
+            match state.chain.is_referenced(group, member).await {
                 Ok(value) => AdmissionResult::ChainBool { value },
                 Err(_) => AdmissionResult::ChainReadFailed,
             }
@@ -715,12 +808,22 @@ async fn execute_fetch(state: &AppState, fetch: &ChainFetch) -> LookupResult {
             let page = offset / limit + 1;
             match state
                 .chain
-                .entries_by_key(public_key, page, *limit, *descending)
+                .key_profile(public_key, page, *limit, *descending)
                 .await
             {
-                Ok(page) => LookupResult::Chain {
-                    value: serde_json::to_value(&page).unwrap_or(Value::Null),
+                Ok(Some(profile)) => LookupResult::Chain {
+                    value: json!({
+                        "entry": profile.entry,
+                        "groups": { "total": profile.group_total, "unitIds": profile.group_ids },
+                        "references": {
+                            "total": profile.reference_total,
+                            "referenceIds": profile.reference_ids,
+                        },
+                        "page": page,
+                        "pageSize": limit,
+                    }),
                 },
+                Ok(None) => LookupResult::ChainNotFound,
                 Err(_) => LookupResult::ChainFailed,
             }
         }
@@ -732,11 +835,12 @@ async fn execute_fetch(state: &AppState, fetch: &ChainFetch) -> LookupResult {
             Err(_) => LookupResult::ChainFailed,
         },
         ChainFetch::Totals => match state.chain.totals().await {
-            Ok((entries, units, rp_ids)) => LookupResult::Chain {
+            Ok(totals) => LookupResult::Chain {
                 value: json!({
-                    "totalEntries": entries,
-                    "totalUnits": units,
-                    "totalRpIds": rp_ids,
+                    "totalEntries": totals.entries,
+                    "totalUnits": totals.units,
+                    "totalReferences": totals.references,
+                    "totalRpIds": totals.rp_ids,
                 }),
             },
             Err(_) => LookupResult::ChainFailed,
@@ -763,7 +867,7 @@ async fn execute_fetch(state: &AppState, fetch: &ChainFetch) -> LookupResult {
             let page = offset / limit + 1;
             match state
                 .chain
-                .entries_by_rp_id(rp_id, page, *limit, *descending)
+                .groups_by_rp_id(rp_id, page, *limit, *descending)
                 .await
             {
                 Ok(page) => LookupResult::Chain {
@@ -867,7 +971,7 @@ mod tests {
     use axum::body::to_bytes;
     use p256::ecdsa::signature::hazmat::PrehashSigner;
     use p256::elliptic_curve::Generate as _;
-    use p256_registrar::lookup::{Entry, Page, SiteItem};
+    use p256_registrar::lookup::{Entry, Page, SiteItem, Unit};
     use p256_registrar::task::RegisterTask;
     use p256_registrar::verify::base64url_32;
     use sha2::{Digest, Sha256};
@@ -913,28 +1017,34 @@ mod tests {
             Err(ChainError::Unavailable)
         }
 
-        async fn entries_by_key(
-            &self,
-            _: &str,
-            page: u64,
-            page_size: u64,
-            _: bool,
-        ) -> Result<Page<Entry>, ChainError> {
-            Ok(Page {
-                total: 0,
-                page,
-                page_size,
-                items: Vec::new(),
-            })
+        async fn unit(&self, _: u64) -> Result<Option<Unit>, ChainError> {
+            Err(ChainError::Unavailable)
         }
 
-        async fn entries_by_rp_id(
+        async fn key_profile(
             &self,
             _: &str,
             _: u64,
             _: u64,
             _: bool,
-        ) -> Result<Page<Entry>, ChainError> {
+        ) -> Result<Option<crate::chain::KeyProfile>, ChainError> {
+            Ok(None)
+        }
+
+        async fn groups_by_rp_id(
+            &self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: bool,
+        ) -> Result<Page<Unit>, ChainError> {
+            Err(ChainError::Unavailable)
+        }
+
+        async fn is_referenced(&self, _: Vec<u8>, _: Vec<u8>) -> Result<bool, ChainError> {
+            Err(ChainError::Unavailable)
+        }
+        async fn unit_by_group_key(&self, _: Vec<u8>) -> Result<Option<Unit>, ChainError> {
             Err(ChainError::Unavailable)
         }
 
@@ -942,7 +1052,7 @@ mod tests {
             Err(ChainError::Unavailable)
         }
 
-        async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
+        async fn totals(&self) -> Result<crate::chain::Totals, ChainError> {
             Err(ChainError::Unavailable)
         }
 
@@ -1062,18 +1172,19 @@ mod tests {
         let skeleton = p256_registrar::task::RegisterTask {
             id: String::new(),
             status: TaskStatus::Pending,
+            kind: p256_registrar::task::TaskKind::Register,
             rp_id: rp_id.to_owned(),
             metadata: metadata_hex.to_owned(),
             content_hash: String::new(),
             group_public_key: group_public.clone(),
-            group_proof: p256_registrar::task::Proof {
+            group_proof: Some(p256_registrar::task::Proof {
                 authenticator_data: String::new(),
                 client_data_json: String::new(),
                 challenge_index: 0,
                 type_index: 0,
                 r: String::new(),
                 s: String::new(),
-            },
+            }),
             members: vec![p256_registrar::task::Member {
                 public_key: member_public.clone(),
                 attestation: String::new(),
@@ -1087,7 +1198,7 @@ mod tests {
                 },
             }],
             tx_hash: None,
-            first_entry_id: None,
+            on_chain_id: None,
             error: None,
             retries: 0,
             created_at: 0,

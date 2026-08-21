@@ -9,30 +9,41 @@ first client, not its owner.
 
 ## The trust model
 
-- **The public key is the primary key; possession and content are what is
-  verified — on-chain.** Every signer produces a WebAuthn-formatted P-256
-  assertion over its storage-authorization challenge
-  (`keccak256(abi.encode(chainid, registry, rpId, publicKey, binding))`),
+- **Three plain tables, two writes.** ENTRY is the global file of one
+  passkey (one row per key, ever; attestation fixed at first sight, signed
+  by the key itself). UNIT is one group (one row per single-use group key;
+  rpId, metadata and the member set frozen at creation — a group's members
+  can never change, and there is deliberately no operation that could
+  change them). REFERENCE is one passkey pointing at one existing group —
+  its own table, its own counters, never mixed with groups.
+- **Possession and content are what is verified — on-chain.** Every signer
+  produces a WebAuthn-formatted P-256 assertion over
+  `keccak256(abi.encode(chainid, registry, rpId, publicKey, binding))`,
   verified via the EIP-7951/RIP-7212 precompile. The binding depends on the
-  role: the GROUP KEY signs the unit's contentHash (rpId, metadata, group
-  key, every member), and each MEMBER passkey signs
-  `memberBindingFor(groupKey, ownAttestation)`. Together every byte is
-  signature-covered: nobody can attach data to a key they do not hold, and
-  nobody can alter any field — front-running, replay and content
-  substitution do not exist at the protocol level.
+  role: the GROUP KEY signs the group's contentHash; a MEMBER passkey signs
+  `memberBindingFor(groupKey, ownAttestation)`; a REFERRING passkey signs
+  `referenceBindingFor(groupKey, ownAttestation, referenceMetadata)`.
+  Every byte is signature-covered: nobody can attach data to a key they do
+  not hold, and nobody can alter any field — front-running, replay and
+  content substitution do not exist at the protocol level.
 - **Nothing else is exclusive or interpreted.** A key may appear in any
   number of registration units; queries return lists and readers filter by
   their own metadata schema. Credential ids, display names, wallet
   derivation preimages all live inside `metadata` (≤2048 bytes, opaque).
-- **A registration unit** is one group key plus 1..7 member passkeys
-  sharing one rpId and one metadata payload, appended atomically in ONE
-  `register` transaction (7 passkeys = 8 signatures). The group key is a
-  client-held software key — every unit has exactly one; it closes the unit
-  silently, no ceremony. Member passkeys sign the moment they are created:
-  any order, any device, no waiting. There is no nonce and nothing
-  consumable: identical content registers exactly once and altered content
-  invalidates the signatures. Units are indexed by their group key
-  (getUnitIdsByGroupKey); group semantics belong to the storer's schema.
+- **`register`** lands one group atomically (7 passkeys = 8 signatures in
+  one transaction). The group key is a client-held one-time software key —
+  it closes the group silently, no ceremony, and is discarded after.
+  Member passkeys sign the moment they are created: any order, any device,
+  no waiting. **`refer`** points one passkey at an existing group — the
+  later-added-device flow: pure discovery data, one reference per (group,
+  key) pair, the group's frozen record untouched. References are claims,
+  not authority: what a referenced key may do is decided by the reader's
+  schema against the wallet layer. There is no nonce and nothing
+  consumable; every write is idempotent by construction.
+- **Statistics are structural.** Entries are globally unique and group
+  keys single-use, so `getTotalEntries()` IS the passkey count,
+  `getTotalUnits()` IS the group count, and `getTotalReferences()` counts
+  references apart — no dedup logic anywhere.
 - **Reads are list-shaped and id-stable.** Entry ids are sequential and
   immutable — clients that remember their entry ids read in O(1) forever.
   Discovery without local state: recover the two candidate keys from any
@@ -48,10 +59,16 @@ first client, not its owner.
    `{rpId, groupPublicKey, publicKey, attestation?}`) — it depends only on
    the group key and the member's own fields, so any order, any device, no
    waiting. Two prompts per key.
-2. Once every key exists, finalize the unit and have the group key silently
-   sign the closing challenge (`POST /api/challenge` group mode:
-   `{rpId, metadata, groupPublicKey, members}` returns the contentHash and
-   the group challenge), then submit in one shot.
+2. Once every key exists, the group key silently signs the closing
+   challenge (`POST /api/challenge` group mode returns the contentHash and
+   the group challenge) and the client submits `POST /api/register` in one
+   shot. The group key is then discarded forever.
+3. Adding a device later: the new passkey does create + one get() over the
+   reference-binding challenge (`POST /api/challenge` with `"refer": true`)
+   and the client submits `POST /api/refer` — the group is never touched.
+   Discovery at login: recover the candidate keys from the signature,
+   `GET /api/query?publicKey=` returns the key's file plus its group and
+   reference ids.
 3. `POST /api/register` with the unit. The service verifies every proof
    (pure Rust mirror of the contract check — invalid proofs never reach the
    chain), durably queues the unit (Redis + Iggy, two-phase), and the worker
@@ -85,14 +102,15 @@ first client, not its owner.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| POST | /api/register | Verify proofs and durably enqueue one unit (1..7 members) |
+| POST | /api/register | Verify proofs and durably enqueue one group (1..7 members) |
+| POST | /api/refer | Verify the proof and durably enqueue one reference |
 | GET | /api/task/{id} | Task status (full disclosure; no proofs echoed) |
-| POST | /api/challenge | Member mode: one member's challenge; group mode: contentHash + closing challenge |
-| GET | /api/query?publicKey= | Paginated entries for a key (`_queue` marker pre-chain) |
-| GET | /api/query?entryId= | One entry by its immutable id |
-| GET | /api/stats/total | {totalEntries, totalUnits, totalRpIds} |
+| POST | /api/challenge | Member / reference / group modes: the binding challenge for each signing role |
+| GET | /api/query?publicKey= | The key's file + its group/reference ids (`_queue` marker pre-chain) |
+| GET | /api/query?entryId= | One passkey file by its immutable id |
+| GET | /api/stats/total | {totalEntries, totalUnits, totalReferences, totalRpIds} |
 | GET | /api/stats/sites | Paginated rpId list |
-| GET | /api/stats/keys?rpId= | Paginated entries under an rpId |
+| GET | /api/stats/keys?rpId= | Paginated groups under an rpId |
 | GET | /api/health | Health, RPC circuit, queue/DLQ metrics, registry address |
 
 Register body shape:

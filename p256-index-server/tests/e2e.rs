@@ -39,7 +39,7 @@ use p256_index_server::{
     store::RedisStore,
 };
 use p256_registrar::{
-    lookup::{Entry, Page, SiteItem},
+    lookup::{Entry, Page, SiteItem, Unit},
     protocol::{challenge_for, content_hash_for, member_binding_for},
     task::RegisterTask,
     verify::base64url_32,
@@ -84,28 +84,34 @@ impl ReadChain for FakeChain {
         Err(ChainError::Unavailable)
     }
 
-    async fn entries_by_key(
-        &self,
-        _: &str,
-        page: u64,
-        page_size: u64,
-        _: bool,
-    ) -> Result<Page<Entry>, ChainError> {
-        Ok(Page {
-            total: 0,
-            page,
-            page_size,
-            items: Vec::new(),
-        })
+    async fn unit(&self, _: u64) -> Result<Option<Unit>, ChainError> {
+        Err(ChainError::Unavailable)
     }
 
-    async fn entries_by_rp_id(
+    async fn key_profile(
         &self,
         _: &str,
         _: u64,
         _: u64,
         _: bool,
-    ) -> Result<Page<Entry>, ChainError> {
+    ) -> Result<Option<p256_index_server::chain::KeyProfile>, ChainError> {
+        Ok(None)
+    }
+
+    async fn groups_by_rp_id(
+        &self,
+        _: &str,
+        _: u64,
+        _: u64,
+        _: bool,
+    ) -> Result<Page<Unit>, ChainError> {
+        Err(ChainError::Unavailable)
+    }
+
+    async fn is_referenced(&self, _: Vec<u8>, _: Vec<u8>) -> Result<bool, ChainError> {
+        Err(ChainError::Unavailable)
+    }
+    async fn unit_by_group_key(&self, _: Vec<u8>) -> Result<Option<Unit>, ChainError> {
         Err(ChainError::Unavailable)
     }
 
@@ -113,7 +119,7 @@ impl ReadChain for FakeChain {
         Err(ChainError::Unavailable)
     }
 
-    async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
+    async fn totals(&self) -> Result<p256_index_server::chain::Totals, ChainError> {
         Err(ChainError::Unavailable)
     }
 
@@ -206,18 +212,19 @@ fn signed_unit(rp_id: &str, metadata_hex: &str) -> (Value, String) {
     let skeleton = p256_registrar::task::RegisterTask {
         id: String::new(),
         status: p256_registrar::task::TaskStatus::Pending,
+        kind: p256_registrar::task::TaskKind::Register,
         rp_id: rp_id.to_owned(),
         metadata: metadata_hex.to_owned(),
         content_hash: String::new(),
         group_public_key: group_public.clone(),
-        group_proof: p256_registrar::task::Proof {
+        group_proof: Some(p256_registrar::task::Proof {
             authenticator_data: String::new(),
             client_data_json: String::new(),
             challenge_index: 0,
             type_index: 0,
             r: String::new(),
             s: String::new(),
-        },
+        }),
         members: vec![p256_registrar::task::Member {
             public_key: member_public.clone(),
             attestation: String::new(),
@@ -231,7 +238,7 @@ fn signed_unit(rp_id: &str, metadata_hex: &str) -> (Value, String) {
             },
         }],
         tx_hash: None,
-        first_entry_id: None,
+        on_chain_id: None,
         error: None,
         retries: 0,
         created_at: 0,

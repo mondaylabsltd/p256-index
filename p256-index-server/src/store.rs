@@ -246,14 +246,14 @@ impl RedisStore {
         &self,
         id: &str,
         tx_hash: Option<String>,
-        first_entry_id: Option<u64>,
+        on_chain_id: Option<u64>,
     ) -> Result<Option<RegisterTask>, StoreError> {
         let Some(mut task) = self.get_task(id).await? else {
             return Ok(None);
         };
         task.status = TaskStatus::Done;
         task.tx_hash = tx_hash.or(task.tx_hash);
-        task.first_entry_id = first_entry_id.or(task.first_entry_id);
+        task.on_chain_id = on_chain_id.or(task.on_chain_id);
         task.error = None;
         task.admitted = true;
         self.transition_done(&task).await?;

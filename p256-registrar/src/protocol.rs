@@ -2,13 +2,16 @@
 //! challenge construction, and the single home for chain-error
 //! classification.
 //!
-//! The registry (`WebAuthnP256PublicKeyRegistry`) is an append-only log of
-//! possession-proven P-256 public keys. There is one write —
-//! `register(rpId, metadata, groupPublicKey, groupProof, members)` — and
-//! read views joined as `EntryView`. The group key's challenge binds the
-//! unit's content hash and every member's challenge binds (groupKey, own
-//! attestation), so registration is idempotent and nothing is consumable;
-//! a registration is one transaction.
+//! The registry (`WebAuthnP256PublicKeyRegistry`) is an append-only store
+//! of possession-proven P-256 public keys with two writes:
+//! `register(rpId, metadata, groupPublicKey, groupProof, members)` creates
+//! a frozen group (plus global entries for new keys), and
+//! `refer(groupPublicKey, metadata, member)` points one passkey at an
+//! existing group in the separate reference table. The group key's
+//! challenge binds the group's content hash, a member's binds (groupKey,
+//! own attestation), a referrer's binds (groupKey, own attestation,
+//! reference metadata) — everything is signature-covered and idempotent;
+//! nothing is consumable.
 
 use alloy::{
     primitives::{Address, B256, U256, keccak256},
@@ -18,31 +21,45 @@ use alloy::{
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::lookup::Entry;
+use crate::lookup::{Entry, ReferenceRecord, Unit};
 use crate::task::RegisterTask;
 
 pub const CHAIN_ID: u64 = 100;
 
 /// Revert selectors of the registry's terminal classifications.
-pub const SELECTOR_UNIT_ALREADY_REGISTERED: &str = "0x3cd13628";
+pub const SELECTOR_GROUP_KEY_ALREADY_USED: &str = "0x10eafb1a";
+pub const SELECTOR_ALREADY_REFERENCED: &str = "0x40709c5d";
+pub const SELECTOR_GROUP_NOT_FOUND: &str = "0xdec308b4";
 pub const SELECTOR_INVALID_PROOF: &str = "0x09bde339";
 
-/// keccak("UnitRegistered(uint256,bytes32,bytes32,uint256,uint256,bytes)")
-/// — the receipt log the shell parses to learn a confirmed unit's ids.
-pub const UNIT_REGISTERED_TOPIC: &str =
-    "0x1b3e4ada6f2d0c2dc918b19d2974f6d9fccf6c9fcb33a5712ba825917eaf43f8";
+/// keccak("GroupCreated(uint256,bytes32,bytes32,bytes,uint256)") — the
+/// receipt log the shell parses to learn a confirmed group's unit id.
+pub const GROUP_CREATED_TOPIC: &str =
+    "0xec8fb064abac351ab712c446266da8b3539b1c844ef0651babfc85a96f4f8186";
+/// keccak("ReferenceCreated(uint256,uint256,uint256,bytes32,bytes32)").
+pub const REFERENCE_CREATED_TOPIC: &str =
+    "0xac974b7eb67da8eca98f625293e583be13beee67950dcea8c78710b4964b118a";
 
 sol! {
-    struct EntryViewSol {
-        uint256 entryId;
-        uint256 unitId;
+    struct EntrySol {
         bytes publicKey;
         bytes attestation;
+        uint256 createdAt;
+    }
+
+    struct UnitSol {
         string rpId;
         bytes metadata;
         bytes groupPublicKey;
-        uint64 firstEntryId;
+        bytes32 contentHash;
         uint32 memberCount;
+        uint256 createdAt;
+    }
+
+    struct ReferenceSol {
+        uint256 entryId;
+        uint256 unitId;
+        bytes metadata;
         uint256 createdAt;
     }
 
@@ -63,21 +80,35 @@ sol! {
 
     interface WebAuthnP256PublicKeyRegistry {
         function register(string calldata rpId, bytes calldata metadata, bytes calldata groupPublicKey, ProofSol calldata groupProof, MemberSol[] calldata members) external;
-        function getTotalUnitsByGroupKey(bytes calldata publicKey) external view returns (uint256);
-        function getUnitIdsByGroupKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
+        function refer(bytes calldata groupPublicKey, bytes calldata metadata, MemberSol calldata member) external;
+        function getTotalEntries() external view returns (uint256);
+        function getEntry(uint256 entryId) external view returns (EntrySol memory);
+        function hasEntry(bytes calldata publicKey) external view returns (bool);
+        function getEntryByKey(bytes calldata publicKey) external view returns (bool exists, uint256 entryId, EntrySol memory entry);
+        function getTotalGroupsOfKey(bytes calldata publicKey) external view returns (uint256);
+        function getGroupsOfKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
             external view returns (uint256 total, uint256[] memory unitIds);
         function getTotalUnits() external view returns (uint256);
-        function getTotalEntries() external view returns (uint256);
-        function getEntry(uint256 entryId) external view returns (EntryViewSol memory);
-        function hasEntries(bytes calldata publicKey) external view returns (bool);
-        function getEntriesByKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
-            external view returns (uint256 total, EntryViewSol[] memory records);
-        function getEntriesByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
-            external view returns (uint256 total, EntryViewSol[] memory records);
+        function getUnit(uint256 unitId) external view returns (UnitSol memory);
+        function getUnitByGroupKey(bytes calldata publicKey) external view returns (bool exists, uint256 unitId, UnitSol memory unit);
+        function getUnitIdByContentHash(bytes32 contentHash) external view returns (bool exists, uint256 unitId);
+        function isContentRegistered(bytes32 contentHash) external view returns (bool);
+        function isMember(bytes calldata groupPublicKey, bytes calldata memberPublicKey) external view returns (bool);
+        function getTotalGroupMembers(uint256 unitId) external view returns (uint256);
+        function getGroupMembers(uint256 unitId, uint256 offset, uint256 limit, bool desc)
+            external view returns (uint256 total, uint256[] memory entryIds, EntrySol[] memory entries);
+        function getTotalReferences() external view returns (uint256);
+        function getReference(uint256 referenceId) external view returns (ReferenceSol memory);
+        function isReferenced(bytes calldata groupPublicKey, bytes calldata memberPublicKey) external view returns (bool);
+        function getTotalReferencesOfKey(bytes calldata publicKey) external view returns (uint256);
+        function getReferencesOfKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
+            external view returns (uint256 total, uint256[] memory referenceIds);
         function getTotalRpIds() external view returns (uint256);
+        function getTotalGroupsByRpId(string calldata rpId) external view returns (uint256);
+        function getGroupsByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
+            external view returns (uint256 total, uint256[] memory unitIds);
         function getRpIds(uint256 offset, uint256 limit, bool desc)
             external view returns (uint256 total, string[] memory rpIds, uint256[] memory counts, uint256[] memory createdAts);
-        function isContentRegistered(bytes32 contentHash) external view returns (bool);
     }
 }
 
@@ -113,14 +144,27 @@ pub fn is_revert(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     value.contains("execution reverted")
         || value.contains("revert")
-        || value.contains(SELECTOR_UNIT_ALREADY_REGISTERED)
+        || value.contains(SELECTOR_GROUP_KEY_ALREADY_USED)
+        || value.contains(SELECTOR_ALREADY_REFERENCED)
         || value.contains(SELECTOR_INVALID_PROOF)
 }
 
-/// Identical unit content already exists on-chain — retroactive success.
-pub fn is_content_registered_error(error: &ChainError) -> bool {
+/// The refer's target group is not (yet) on-chain: a refer can race its
+/// own group's registration through the pipeline, so this must retry, not
+/// poison.
+pub fn is_group_not_found_error(error: &ChainError) -> bool {
     matches!(error, ChainError::Reverted(value) | ChainError::Rejected(value)
-        if value.contains("UnitAlreadyRegistered") || value.contains(SELECTOR_UNIT_ALREADY_REGISTERED))
+        if value.contains("GroupNotFound") || value.contains(SELECTOR_GROUP_NOT_FOUND))
+}
+
+/// The write's target may already exist on-chain (a used group key, an
+/// existing reference): reconcile against the chain, then done or poison.
+pub fn is_already_exists_error(error: &ChainError) -> bool {
+    matches!(error, ChainError::Reverted(value) | ChainError::Rejected(value)
+        if value.contains("GroupKeyAlreadyUsed")
+            || value.contains(SELECTOR_GROUP_KEY_ALREADY_USED)
+            || value.contains("AlreadyReferenced")
+            || value.contains(SELECTOR_ALREADY_REFERENCED))
 }
 
 /// Whether the node saw a same-nonce replacement and refused it on price.
@@ -148,7 +192,8 @@ pub fn is_transient(error: &ChainError) -> bool {
         ChainError::Unavailable | ChainError::InvalidResponse => true,
         ChainError::Rejected(value) => {
             !is_revert(value)
-                && !value.contains("UnitAlreadyRegistered")
+                && !value.contains("GroupKeyAlreadyUsed")
+                && !value.contains("AlreadyReferenced")
                 && !value.contains("InvalidProof")
         }
         ChainError::Reverted(_) | ChainError::MissingSigner => false,
@@ -158,16 +203,16 @@ pub fn is_transient(error: &ChainError) -> bool {
 /// The three-way verdict for a failed chain write, in precedence order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorClass {
-    /// Identical content already on-chain: retroactive success.
-    ContentRegistered,
+    /// The target may already exist on-chain: reconcile, then done/poison.
+    AlreadyExists,
     Transient,
     Poison,
 }
 
 pub fn classify_chain_error(error: &ChainError) -> ErrorClass {
-    if is_content_registered_error(error) {
-        ErrorClass::ContentRegistered
-    } else if is_transient(error) {
+    if is_already_exists_error(error) {
+        ErrorClass::AlreadyExists
+    } else if is_group_not_found_error(error) || is_transient(error) {
         ErrorClass::Transient
     } else {
         ErrorClass::Poison
@@ -235,21 +280,52 @@ pub fn member_binding_for(group_public_key: &[u8], attestation: &[u8]) -> B256 {
     )
 }
 
-/// The duplicate-suppression content hash, mirroring the contract's
-/// `contentHashFor`: keccak256(abi.encode(rpId, metadata, groupPublicKey,
-/// memberHashes)). Params encoding throughout — see challenge_for.
+/// The binding a REFERRING passkey signs, mirroring the contract's
+/// `referenceBindingFor`: keccak256(abi.encode(groupPublicKey, attestation,
+/// metadata)) — all known the moment the key is created.
+pub fn reference_binding_for(group_public_key: &[u8], attestation: &[u8], metadata: &[u8]) -> B256 {
+    keccak256(
+        (
+            alloy::primitives::Bytes::from(group_public_key.to_vec()),
+            alloy::primitives::Bytes::from(attestation.to_vec()),
+            alloy::primitives::Bytes::from(metadata.to_vec()),
+        )
+            .abi_encode_params(),
+    )
+}
+
+/// The task's identity digest, mirroring the contract where one exists:
+/// for Register it is the contract's `contentHashFor` (rpId, metadata,
+/// groupPublicKey, memberHashes); for Refer it is a service-side
+/// idempotency digest over (groupPublicKey, memberHash, metadata) — the
+/// chain's own uniqueness is the (group, key) pair.
 pub fn content_hash_for(task: &RegisterTask) -> Result<B256> {
+    let group: alloy::primitives::Bytes = parse_hex_bytes(&task.group_public_key)?.into();
+    let metadata: alloy::primitives::Bytes = parse_hex_bytes(&task.metadata)?.into();
     let mut member_hashes = Vec::with_capacity(task.members.len());
     for member in &task.members {
         let public_key: alloy::primitives::Bytes = parse_hex_bytes(&member.public_key)?.into();
         let attestation: alloy::primitives::Bytes = parse_hex_bytes(&member.attestation)?.into();
         member_hashes.push(keccak256((public_key, attestation).abi_encode_params()));
     }
-    let metadata: alloy::primitives::Bytes = parse_hex_bytes(&task.metadata)?.into();
-    let group: alloy::primitives::Bytes = parse_hex_bytes(&task.group_public_key)?.into();
-    Ok(keccak256(
-        (task.rp_id.clone(), metadata, group, member_hashes).abi_encode_params(),
-    ))
+    match task.kind {
+        crate::task::TaskKind::Register => Ok(keccak256(
+            (task.rp_id.clone(), metadata, group, member_hashes).abi_encode_params(),
+        )),
+        crate::task::TaskKind::Refer => {
+            // Deliberately (group, key) ONLY — the chain's own uniqueness.
+            // A resubmission with different reference metadata maps to the
+            // SAME task, so the caller sees the record that actually
+            // exists instead of a doomed duplicate reported as done.
+            let member = task
+                .members
+                .first()
+                .ok_or_else(|| anyhow!("refer task has no member"))?;
+            let member_key: alloy::primitives::Bytes = parse_hex_bytes(&member.public_key)?.into();
+            let _ = (metadata, member_hashes);
+            Ok(keccak256((group, member_key).abi_encode_params()))
+        }
+    }
 }
 
 // ── Calldata builders ──────────────────────────────────────────────────────
@@ -273,31 +349,65 @@ fn member_sol(member: &crate::task::Member) -> Result<MemberSol> {
     })
 }
 
-/// One register() transaction for one task.
+/// One register() transaction for one Register task.
 pub fn register_calldata(task: &RegisterTask) -> Result<Vec<u8>> {
     let members = task
         .members
         .iter()
         .map(member_sol)
         .collect::<Result<Vec<_>>>()?;
+    let group_proof = task
+        .group_proof
+        .as_ref()
+        .ok_or_else(|| anyhow!("register task has no group proof"))?;
     Ok(WebAuthnP256PublicKeyRegistry::registerCall {
         rpId: task.rp_id.clone(),
         metadata: parse_hex_bytes(&task.metadata)?.into(),
         groupPublicKey: parse_hex_bytes(&task.group_public_key)?.into(),
-        groupProof: proof_sol(&task.group_proof)?,
+        groupProof: proof_sol(group_proof)?,
         members,
     }
     .abi_encode())
 }
 
+/// One refer() transaction for one Refer task.
+pub fn refer_calldata(task: &RegisterTask) -> Result<Vec<u8>> {
+    let member = task
+        .members
+        .first()
+        .ok_or_else(|| anyhow!("refer task has no member"))?;
+    Ok(WebAuthnP256PublicKeyRegistry::referCall {
+        groupPublicKey: parse_hex_bytes(&task.group_public_key)?.into(),
+        metadata: parse_hex_bytes(&task.metadata)?.into(),
+        member: member_sol(member)?,
+    }
+    .abi_encode())
+}
+
+/// The right write calldata for the task's kind.
+pub fn write_calldata(task: &RegisterTask) -> Result<Vec<u8>> {
+    match task.kind {
+        crate::task::TaskKind::Register => register_calldata(task),
+        crate::task::TaskKind::Refer => refer_calldata(task),
+    }
+}
+
 // ── Read calldata ──────────────────────────────────────────────────────────
+
+pub fn total_entries_calldata() -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getTotalEntriesCall {}.abi_encode()
+}
 
 pub fn total_units_calldata() -> Vec<u8> {
     WebAuthnP256PublicKeyRegistry::getTotalUnitsCall {}.abi_encode()
 }
 
-pub fn total_entries_calldata() -> Vec<u8> {
-    WebAuthnP256PublicKeyRegistry::getTotalEntriesCall {}.abi_encode()
+pub fn total_references_calldata() -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getTotalReferencesCall {}.abi_encode()
+}
+
+pub fn total_rp_ids_calldata() -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getTotalRpIdsCall {}.abi_encode()
 }
 
 pub fn get_entry_calldata(entry_id: u64) -> Vec<u8> {
@@ -307,20 +417,22 @@ pub fn get_entry_calldata(entry_id: u64) -> Vec<u8> {
     .abi_encode()
 }
 
-pub fn has_entries_calldata(public_key: Vec<u8>) -> Vec<u8> {
-    WebAuthnP256PublicKeyRegistry::hasEntriesCall {
+pub fn get_entry_by_key_calldata(public_key: Vec<u8>) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getEntryByKeyCall {
         publicKey: public_key.into(),
     }
     .abi_encode()
 }
 
-pub fn entries_by_key_calldata(
-    public_key: Vec<u8>,
-    offset: u64,
-    limit: u64,
-    desc: bool,
-) -> Vec<u8> {
-    WebAuthnP256PublicKeyRegistry::getEntriesByKeyCall {
+pub fn has_entry_calldata(public_key: Vec<u8>) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::hasEntryCall {
+        publicKey: public_key.into(),
+    }
+    .abi_encode()
+}
+
+pub fn groups_of_key_calldata(public_key: Vec<u8>, offset: u64, limit: u64, desc: bool) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getGroupsOfKeyCall {
         publicKey: public_key.into(),
         offset: U256::from(offset),
         limit: U256::from(limit),
@@ -329,18 +441,60 @@ pub fn entries_by_key_calldata(
     .abi_encode()
 }
 
-pub fn entries_by_rp_id_calldata(rp_id: String, offset: u64, limit: u64, desc: bool) -> Vec<u8> {
-    WebAuthnP256PublicKeyRegistry::getEntriesByRpIdCall {
+pub fn references_of_key_calldata(
+    public_key: Vec<u8>,
+    offset: u64,
+    limit: u64,
+    desc: bool,
+) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getReferencesOfKeyCall {
+        publicKey: public_key.into(),
+        offset: U256::from(offset),
+        limit: U256::from(limit),
+        desc,
+    }
+    .abi_encode()
+}
+
+pub fn get_unit_by_group_key_calldata(public_key: Vec<u8>) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getUnitByGroupKeyCall {
+        publicKey: public_key.into(),
+    }
+    .abi_encode()
+}
+
+pub fn get_unit_calldata(unit_id: u64) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getUnitCall {
+        unitId: U256::from(unit_id),
+    }
+    .abi_encode()
+}
+
+pub fn get_reference_calldata(reference_id: u64) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getReferenceCall {
+        referenceId: U256::from(reference_id),
+    }
+    .abi_encode()
+}
+
+pub fn get_group_members_calldata(unit_id: u64, offset: u64, limit: u64, desc: bool) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getGroupMembersCall {
+        unitId: U256::from(unit_id),
+        offset: U256::from(offset),
+        limit: U256::from(limit),
+        desc,
+    }
+    .abi_encode()
+}
+
+pub fn groups_by_rp_id_calldata(rp_id: String, offset: u64, limit: u64, desc: bool) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getGroupsByRpIdCall {
         rpId: rp_id,
         offset: U256::from(offset),
         limit: U256::from(limit),
         desc,
     }
     .abi_encode()
-}
-
-pub fn total_rp_ids_calldata() -> Vec<u8> {
-    WebAuthnP256PublicKeyRegistry::getTotalRpIdsCall {}.abi_encode()
 }
 
 pub fn rp_ids_calldata(offset: u64, limit: u64, desc: bool) -> Vec<u8> {
@@ -359,49 +513,126 @@ pub fn is_content_registered_calldata(content_hash: B256) -> Vec<u8> {
     .abi_encode()
 }
 
+pub fn is_referenced_calldata(group_public_key: Vec<u8>, member_public_key: Vec<u8>) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::isReferencedCall {
+        groupPublicKey: group_public_key.into(),
+        memberPublicKey: member_public_key.into(),
+    }
+    .abi_encode()
+}
+
 // ── Response decoders ──────────────────────────────────────────────────────
 
 pub type SiteEntry = (String, u64, u64);
 
-fn entry_from_sol(value: EntryViewSol) -> Result<Entry> {
-    Ok(Entry {
-        entry_id: u64::try_from(value.entryId).map_err(|_| anyhow!("entry id exceeds u64"))?,
-        unit_id: u64::try_from(value.unitId).map_err(|_| anyhow!("unit id exceeds u64"))?,
+fn entry_from_sol(entry_id: u64, value: EntrySol) -> Entry {
+    Entry {
+        entry_id,
         public_key: hex::encode(value.publicKey),
         attestation: hex::encode(value.attestation),
+        created_at: u64::try_from(value.createdAt)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1000),
+    }
+}
+
+fn unit_from_sol(unit_id: u64, value: UnitSol) -> Unit {
+    Unit {
+        unit_id,
         rp_id: value.rpId,
         metadata: hex::encode(value.metadata),
         group_public_key: hex::encode(value.groupPublicKey),
-        first_entry_id: value.firstEntryId,
+        content_hash: format!("{:#x}", value.contentHash),
         member_count: value.memberCount,
         created_at: u64::try_from(value.createdAt)
-            .map_err(|_| anyhow!("timestamp exceeds u64"))?
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1000),
+    }
+}
+
+pub fn decode_entry(entry_id: u64, bytes: &[u8]) -> Result<Entry> {
+    let value = WebAuthnP256PublicKeyRegistry::getEntryCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getEntry response"))?;
+    Ok(entry_from_sol(entry_id, value))
+}
+
+/// (exists, entryId, entry)
+pub fn decode_entry_by_key(bytes: &[u8]) -> Result<Option<Entry>> {
+    let value = WebAuthnP256PublicKeyRegistry::getEntryByKeyCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getEntryByKey response"))?;
+    if !value.exists {
+        return Ok(None);
+    }
+    let entry_id = u64::try_from(value.entryId).map_err(|_| anyhow!("entry id exceeds u64"))?;
+    Ok(Some(entry_from_sol(entry_id, value.entry)))
+}
+
+pub fn decode_unit_by_group_key(bytes: &[u8]) -> Result<Option<Unit>> {
+    let value = WebAuthnP256PublicKeyRegistry::getUnitByGroupKeyCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getUnitByGroupKey response"))?;
+    if !value.exists {
+        return Ok(None);
+    }
+    let unit_id = u64::try_from(value.unitId).map_err(|_| anyhow!("unit id exceeds u64"))?;
+    Ok(Some(unit_from_sol(unit_id, value.unit)))
+}
+
+pub fn decode_unit(unit_id: u64, bytes: &[u8]) -> Result<Unit> {
+    let value = WebAuthnP256PublicKeyRegistry::getUnitCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getUnit response"))?;
+    Ok(unit_from_sol(unit_id, value))
+}
+
+pub fn decode_reference(reference_id: u64, bytes: &[u8]) -> Result<ReferenceRecord> {
+    let value = WebAuthnP256PublicKeyRegistry::getReferenceCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getReference response"))?;
+    Ok(ReferenceRecord {
+        reference_id,
+        entry_id: u64::try_from(value.entryId).map_err(|_| anyhow!("entry id exceeds u64"))?,
+        unit_id: u64::try_from(value.unitId).map_err(|_| anyhow!("unit id exceeds u64"))?,
+        metadata: hex::encode(value.metadata),
+        created_at: u64::try_from(value.createdAt)
+            .unwrap_or(u64::MAX)
             .saturating_mul(1000),
     })
 }
 
-pub fn decode_entry(bytes: &[u8]) -> Result<Entry> {
-    let value = WebAuthnP256PublicKeyRegistry::getEntryCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid getEntry response"))?;
-    entry_from_sol(value)
-}
-
-pub fn decode_entries_page(bytes: &[u8]) -> Result<(u64, Vec<Entry>)> {
-    let value = WebAuthnP256PublicKeyRegistry::getEntriesByKeyCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid entries page response"))?;
+/// (total, ids) — shared by getGroupsOfKey / getReferencesOfKey /
+/// getGroupsByRpId, whose return shapes are identical.
+pub fn decode_id_page(bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
+    let value = WebAuthnP256PublicKeyRegistry::getGroupsOfKeyCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid id-page response"))?;
+    let ids = value
+        .unitIds
+        .into_iter()
+        .map(|id| u64::try_from(id).map_err(|_| anyhow!("id exceeds u64")))
+        .collect::<Result<Vec<_>>>()?;
     Ok((
         u64::try_from(value.total).map_err(|_| anyhow!("total exceeds u64"))?,
-        value
-            .records
-            .into_iter()
-            .map(entry_from_sol)
-            .collect::<Result<Vec<_>>>()?,
+        ids,
     ))
 }
 
-pub fn decode_has_entries(bytes: &[u8]) -> Result<bool> {
-    WebAuthnP256PublicKeyRegistry::hasEntriesCall::abi_decode_returns(bytes)
-        .map_err(|_| anyhow!("invalid hasEntries response"))
+/// (total, entryIds, entries) from getGroupMembers.
+pub fn decode_group_members(bytes: &[u8]) -> Result<(u64, Vec<Entry>)> {
+    let value = WebAuthnP256PublicKeyRegistry::getGroupMembersCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid getGroupMembers response"))?;
+    let mut entries = Vec::with_capacity(value.entries.len());
+    for (id, entry) in value.entryIds.into_iter().zip(value.entries) {
+        entries.push(entry_from_sol(
+            u64::try_from(id).map_err(|_| anyhow!("entry id exceeds u64"))?,
+            entry,
+        ));
+    }
+    Ok((
+        u64::try_from(value.total).map_err(|_| anyhow!("total exceeds u64"))?,
+        entries,
+    ))
+}
+
+pub fn decode_has_entry(bytes: &[u8]) -> Result<bool> {
+    WebAuthnP256PublicKeyRegistry::hasEntryCall::abi_decode_returns(bytes)
+        .map_err(|_| anyhow!("invalid hasEntry response"))
 }
 
 pub fn decode_bool(bytes: &[u8]) -> Result<bool> {
@@ -418,7 +649,6 @@ pub fn decode_total(bytes: &[u8]) -> Result<u64> {
 pub fn decode_rp_ids(bytes: &[u8]) -> Result<(u64, Vec<SiteEntry>)> {
     let value = WebAuthnP256PublicKeyRegistry::getRpIdsCall::abi_decode_returns(bytes)
         .map_err(|_| anyhow!("invalid getRpIds response"))?;
-    let total = u64::try_from(value.total).map_err(|_| anyhow!("total exceeds u64"))?;
     let mut sites = Vec::with_capacity(value.rpIds.len());
     for ((rp_id, count), created_at) in value
         .rpIds
@@ -434,13 +664,16 @@ pub fn decode_rp_ids(bytes: &[u8]) -> Result<(u64, Vec<SiteEntry>)> {
                 .saturating_mul(1000),
         ));
     }
-    Ok((total, sites))
+    Ok((
+        u64::try_from(value.total).map_err(|_| anyhow!("total exceeds u64"))?,
+        sites,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{Member, Proof, RegisterTask, TaskStatus};
+    use crate::task::{Member, Proof, RegisterTask, TaskKind, TaskStatus};
 
     const PK: &str = "041a8cc55e2d14a61c8f3f1bcf6f8e7e40fe09cc624a6b77f0539d5eebfafa7bc7880184f26b47cfc67b445168c34355416c93c73cb9b896b82be84486adf88ca0";
     const GROUP_PK: &str = "049e666db13bc6d0a76ec6801fbe24864030f15eca3b2d07ebcaf824bb2dc4f0aea8221dc27980b7c133a00d910c39723eb1523e88ad050a7303bba8bde07367fa";
@@ -449,18 +682,19 @@ mod tests {
         RegisterTask {
             id: "t1".into(),
             status: TaskStatus::Pending,
+            kind: TaskKind::Register,
             rp_id: "example.com".into(),
             metadata: "0xaa".into(),
             content_hash: String::new(),
             group_public_key: GROUP_PK.into(),
-            group_proof: Proof {
+            group_proof: Some(Proof {
                 authenticator_data: "00".repeat(37),
                 client_data_json: "{}".into(),
                 challenge_index: 23,
                 type_index: 1,
                 r: format!("0x{}", "44".repeat(32)),
                 s: format!("0x{}", "55".repeat(32)),
-            },
+            }),
             members: vec![Member {
                 public_key: PK.into(),
                 attestation: String::new(),
@@ -474,7 +708,7 @@ mod tests {
                 },
             }],
             tx_hash: None,
-            first_entry_id: None,
+            on_chain_id: None,
             error: None,
             retries: 0,
             created_at: 0,
@@ -494,14 +728,18 @@ mod tests {
     #[test]
     fn classification_precedence_matches_the_contract_vocabulary() {
         assert_eq!(
-            classify_chain_error(&ChainError::Rejected("UnitAlreadyRegistered".into())),
-            ErrorClass::ContentRegistered
+            classify_chain_error(&ChainError::Rejected("GroupKeyAlreadyUsed".into())),
+            ErrorClass::AlreadyExists
         );
         assert_eq!(
             classify_chain_error(&ChainError::Reverted(format!(
-                "data: {SELECTOR_UNIT_ALREADY_REGISTERED}"
+                "data: {SELECTOR_GROUP_KEY_ALREADY_USED}"
             ))),
-            ErrorClass::ContentRegistered
+            ErrorClass::AlreadyExists
+        );
+        assert_eq!(
+            classify_chain_error(&ChainError::Rejected("AlreadyReferenced".into())),
+            ErrorClass::AlreadyExists
         );
         assert_eq!(
             classify_chain_error(&ChainError::Unavailable),
@@ -575,6 +813,10 @@ mod tests {
             format!("{:#x}", member_binding_for(&group, &[])),
             "0x75a5d4ac7bfd9ba67dd55f90f5063062d6899090a46608ac1b10e9a51e359bc6"
         );
+        assert_eq!(
+            format!("{:#x}", reference_binding_for(&group, &[], &[0xaa])),
+            "0xd5213d11b1f268a3098df33fa192e334e92788516ca70f286167a1e89457c2a3"
+        );
         let content = content_hash_for(&task()).unwrap();
         assert_eq!(
             format!("{content:#x}"),
@@ -596,16 +838,30 @@ mod tests {
         assert_eq!(
             format!(
                 "{:#x}",
-                keccak256("UnitRegistered(uint256,bytes32,bytes32,uint256,uint256,bytes)")
+                keccak256("GroupCreated(uint256,bytes32,bytes32,bytes,uint256)")
             ),
-            UNIT_REGISTERED_TOPIC
+            GROUP_CREATED_TOPIC
+        );
+        assert_eq!(
+            format!(
+                "{:#x}",
+                keccak256("ReferenceCreated(uint256,uint256,uint256,bytes32,bytes32)")
+            ),
+            REFERENCE_CREATED_TOPIC
         );
         assert_eq!(
             format!(
                 "0x{}",
-                hex::encode(&keccak256("UnitAlreadyRegistered(bytes32)")[..4])
+                hex::encode(&keccak256("GroupKeyAlreadyUsed(bytes32)")[..4])
             ),
-            SELECTOR_UNIT_ALREADY_REGISTERED
+            SELECTOR_GROUP_KEY_ALREADY_USED
+        );
+        assert_eq!(
+            format!(
+                "0x{}",
+                hex::encode(&keccak256("AlreadyReferenced(uint256)")[..4])
+            ),
+            SELECTOR_ALREADY_REFERENCED
         );
         assert_eq!(
             format!("0x{}", hex::encode(&keccak256("InvalidProof()")[..4])),

@@ -26,9 +26,7 @@
 use crux_core::{App, Command, command::CommandContext, macros::effect};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{
-    ChainError, ErrorClass, classify_chain_error, content_hash_for, is_transient,
-};
+use crate::protocol::{ChainError, ErrorClass, classify_chain_error, content_hash_for};
 use crate::task::RegisterTask;
 
 // ── Shell protocol ─────────────────────────────────────────────────────────
@@ -47,6 +45,11 @@ pub enum SubmissionOperation {
     CheckContentRegistered {
         content_hash: String,
     },
+    /// isReferenced(groupPublicKey, memberPublicKey) on the registry.
+    CheckReferenced {
+        group_public_key: String,
+        member_public_key: String,
+    },
     /// One register() transaction: send + receipt wait + nonce/ledger
     /// bookkeeping happen shell-side; the outcome comes back as [`TxOutcome`].
     SubmitRegister {
@@ -55,7 +58,7 @@ pub enum SubmissionOperation {
     MarkDone {
         task_id: String,
         tx_hash: Option<String>,
-        first_entry_id: Option<u64>,
+        on_chain_id: Option<u64>,
     },
     MarkFailed {
         task_id: String,
@@ -93,8 +96,9 @@ impl FailureKind {
 pub enum TxOutcome {
     Confirmed {
         tx_hash: String,
-        /// Parsed from the receipt's UnitRegistered log when present.
-        first_entry_id: Option<u64>,
+        /// Parsed from the receipt's GroupCreated / ReferenceCreated log
+        /// when present: the unitId or referenceId.
+        on_chain_id: Option<u64>,
     },
     Reverted {
         tx_hash: String,
@@ -279,20 +283,30 @@ enum ContentState {
     Unencodable,
 }
 
-/// isContentRegistered with the worker's failure handling: a read failure
-/// records a transient retry on the task, then fails the whole batch.
+/// The task's kind-specific "is my write already on-chain?" check, with
+/// the worker's failure handling: a read failure records a transient retry
+/// on the task, then fails the whole batch.
 async fn check_content(ctx: &Ctx, task: &RegisterTask) -> Flow<ContentState> {
-    let Ok(content_hash) = content_hash_for(task) else {
-        return Ok(ContentState::Unencodable);
+    let operation = match task.kind {
+        crate::task::TaskKind::Register => {
+            let Ok(content_hash) = content_hash_for(task) else {
+                return Ok(ContentState::Unencodable);
+            };
+            SubmissionOperation::CheckContentRegistered {
+                content_hash: format!("{content_hash:#x}"),
+            }
+        }
+        crate::task::TaskKind::Refer => {
+            let Some(member) = task.members.first() else {
+                return Ok(ContentState::Unencodable);
+            };
+            SubmissionOperation::CheckReferenced {
+                group_public_key: task.group_public_key.clone(),
+                member_public_key: member.public_key.clone(),
+            }
+        }
     };
-    match request(
-        ctx,
-        SubmissionOperation::CheckContentRegistered {
-            content_hash: format!("{content_hash:#x}"),
-        },
-    )
-    .await
-    {
+    match request(ctx, operation).await {
         SubmissionResult::ContentChecked { registered: true } => Ok(ContentState::Registered),
         SubmissionResult::ContentChecked { registered: false } => Ok(ContentState::Absent),
         SubmissionResult::ChainReadFailed => {
@@ -300,14 +314,14 @@ async fn check_content(ctx: &Ctx, task: &RegisterTask) -> Flow<ContentState> {
                 ctx,
                 SubmissionOperation::RecordTransientFailure {
                     task_id: task.id.clone(),
-                    message: "isContentRegistered RPC temporarily unavailable".to_owned(),
+                    message: "chain reconciliation RPC temporarily unavailable".to_owned(),
                 },
                 "could not persist task retry",
             )
             .await?;
             Err(retry("chain reconciliation failed"))
         }
-        _ => Err(retry("unexpected shell result for CheckContentRegistered")),
+        _ => Err(retry("unexpected shell result for a reconciliation check")),
     }
 }
 
@@ -315,14 +329,14 @@ async fn mark_done(
     ctx: &Ctx,
     task: &RegisterTask,
     tx_hash: Option<String>,
-    first_entry_id: Option<u64>,
+    on_chain_id: Option<u64>,
 ) -> Flow<()> {
     persist(
         ctx,
         SubmissionOperation::MarkDone {
             task_id: task.id.clone(),
             tx_hash,
-            first_entry_id,
+            on_chain_id,
         },
         "could not persist done task",
     )
@@ -349,8 +363,8 @@ async fn submit_stage(ctx: &Ctx, task: &RegisterTask) -> Flow<()> {
     match submit(ctx, task).await? {
         TxOutcome::Confirmed {
             tx_hash,
-            first_entry_id,
-        } => mark_done(ctx, task, Some(tx_hash), first_entry_id).await,
+            on_chain_id,
+        } => mark_done(ctx, task, Some(tx_hash), on_chain_id).await,
         TxOutcome::Reverted { .. } => register_reverted(ctx, task).await,
         TxOutcome::ReceiptUncertain { error } => {
             classify_task(ctx, task, &error).await?;
@@ -358,7 +372,10 @@ async fn submit_stage(ctx: &Ctx, task: &RegisterTask) -> Flow<()> {
         }
         TxOutcome::SendFailed { error } => {
             classify_task(ctx, task, &error).await?;
-            if is_transient(&error) {
+            // The retry gate must agree with the classification: a
+            // GroupNotFound revert is transient (the group may still be in
+            // flight) even though generic reverts are not.
+            if classify_chain_error(&error) == ErrorClass::Transient {
                 return Err(retry("register temporarily failed"));
             }
             Ok(())
@@ -379,8 +396,8 @@ async fn register_reverted(ctx: &Ctx, task: &RegisterTask) -> Flow<()> {
     match submit(ctx, task).await? {
         TxOutcome::Confirmed {
             tx_hash,
-            first_entry_id,
-        } => mark_done(ctx, task, Some(tx_hash), first_entry_id).await,
+            on_chain_id,
+        } => mark_done(ctx, task, Some(tx_hash), on_chain_id).await,
         TxOutcome::Reverted { .. } => {
             persist(
                 ctx,
@@ -399,7 +416,10 @@ async fn register_reverted(ctx: &Ctx, task: &RegisterTask) -> Flow<()> {
         }
         TxOutcome::SendFailed { error } => {
             classify_task(ctx, task, &error).await?;
-            if is_transient(&error) {
+            // The retry gate must agree with the classification: a
+            // GroupNotFound revert is transient (the group may still be in
+            // flight) even though generic reverts are not.
+            if classify_chain_error(&error) == ErrorClass::Transient {
                 return Err(retry("register temporarily failed"));
             }
             Ok(())
@@ -413,7 +433,24 @@ async fn register_reverted(ctx: &Ctx, task: &RegisterTask) -> Flow<()> {
 async fn classify_task(ctx: &Ctx, task: &RegisterTask, error: &ChainError) -> Flow<()> {
     let message = format!("register: {error}");
     match classify_chain_error(error) {
-        ErrorClass::ContentRegistered => mark_done(ctx, task, task.tx_hash.clone(), None).await,
+        // A used group key or an existing reference: if the chain confirms
+        // OUR write is there (a lost receipt or a producer duplicate),
+        // done; otherwise someone else holds the slot — poison.
+        ErrorClass::AlreadyExists => match check_content(ctx, task).await? {
+            ContentState::Registered => mark_done(ctx, task, task.tx_hash.clone(), None).await,
+            ContentState::Absent | ContentState::Unencodable => {
+                persist(
+                    ctx,
+                    SubmissionOperation::MarkFailed {
+                        task_id: task.id.clone(),
+                        kind: FailureKind::Poison,
+                        message,
+                    },
+                    "could not persist poison task",
+                )
+                .await
+            }
+        },
         ErrorClass::Transient => {
             persist(
                 ctx,
@@ -447,7 +484,7 @@ mod tests {
     use crux_core::{Core, Request};
 
     use super::*;
-    use crate::task::{Member, Proof, TaskStatus};
+    use crate::task::{Member, Proof, TaskKind, TaskStatus};
 
     struct Driver {
         core: Core<SubmissionApp>,
@@ -504,18 +541,19 @@ mod tests {
         RegisterTask {
             id: id.to_owned(),
             status,
+            kind: TaskKind::Register,
             rp_id: format!("{id}.example"),
             metadata: "0xaa".into(),
             content_hash: String::new(),
             group_public_key: "049e666db13bc6d0a76ec6801fbe24864030f15eca3b2d07ebcaf824bb2dc4f0aea8221dc27980b7c133a00d910c39723eb1523e88ad050a7303bba8bde07367fa".into(),
-            group_proof: Proof {
+            group_proof: Some(Proof {
                 authenticator_data: String::new(),
                 client_data_json: String::new(),
                 challenge_index: 0,
                 type_index: 0,
                 r: String::new(),
                 s: String::new(),
-            },
+            }),
             members: vec![Member {
                 public_key: PK.into(),
                 attestation: String::new(),
@@ -529,7 +567,7 @@ mod tests {
                 },
             }],
             tx_hash: None,
-            first_entry_id: None,
+            on_chain_id: None,
             error: None,
             retries: 0,
             created_at: 0,
@@ -573,6 +611,94 @@ mod tests {
         }
     }
 
+    fn refer_task(id: &str, status: TaskStatus) -> RegisterTask {
+        let mut refer = task(id, status);
+        refer.kind = TaskKind::Refer;
+        refer.group_proof = None;
+        refer.metadata = "0xcafe".into();
+        refer
+    }
+
+    fn refer_check(task: &RegisterTask) -> SubmissionOperation {
+        SubmissionOperation::CheckReferenced {
+            group_public_key: task.group_public_key.clone(),
+            member_public_key: task.members[0].public_key.clone(),
+        }
+    }
+
+    #[test]
+    fn refer_reconciles_through_is_referenced() {
+        // The refer kind uses its own reconcile op end to end.
+        let pending = refer_task("a", TaskStatus::Pending);
+        let mut driver = Driver::start(&["a"]);
+        driver.step(load(&["a"]), loaded(&[&pending]));
+        driver.step(refer_check(&pending), registered(true));
+        driver.step(
+            SubmissionOperation::MarkDone {
+                task_id: "a".into(),
+                tx_hash: None,
+                on_chain_id: None,
+            },
+            SubmissionResult::Persisted,
+        );
+        driver.assert_settled(advance());
+    }
+
+    #[test]
+    fn refer_already_referenced_reconciles_to_done() {
+        let pending = refer_task("a", TaskStatus::Pending);
+        let mut driver = Driver::start(&["a"]);
+        driver.step(load(&["a"]), loaded(&[&pending]));
+        driver.step(refer_check(&pending), registered(false));
+        driver.step(
+            SubmissionOperation::SubmitRegister {
+                task: pending.clone(),
+            },
+            SubmissionResult::Tx(TxOutcome::SendFailed {
+                error: ChainError::Rejected("AlreadyReferenced".into()),
+            }),
+        );
+        driver.step(refer_check(&pending), registered(true));
+        driver.step(
+            SubmissionOperation::MarkDone {
+                task_id: "a".into(),
+                tx_hash: None,
+                on_chain_id: None,
+            },
+            SubmissionResult::Persisted,
+        );
+        driver.assert_settled(advance());
+    }
+
+    #[test]
+    fn refer_racing_its_group_retries_instead_of_poisoning() {
+        // GroupNotFound means the target group has not been mined YET — a
+        // refer can legitimately race its own group's registration, so
+        // this must be a transient retry, never poison.
+        let pending = refer_task("a", TaskStatus::Pending);
+        let mut driver = Driver::start(&["a"]);
+        driver.step(load(&["a"]), loaded(&[&pending]));
+        driver.step(refer_check(&pending), registered(false));
+        driver.step(
+            SubmissionOperation::SubmitRegister {
+                task: pending.clone(),
+            },
+            SubmissionResult::Tx(TxOutcome::SendFailed {
+                error: ChainError::Reverted("GroupNotFound(0x1234)".into()),
+            }),
+        );
+        driver.step(
+            SubmissionOperation::RecordTransientFailure {
+                task_id: "a".into(),
+                message: "register: EVM execution reverted".into(),
+            },
+            SubmissionResult::Persisted,
+        );
+        // The envelope must NOT be consumed: the group may land any block
+        // now, and the retry re-delivers this refer.
+        driver.assert_settled(retry_verdict("register temporarily failed"));
+    }
+
     #[test]
     fn empty_batch_advances_without_loading() {
         let driver = Driver::start(&[]);
@@ -603,7 +729,7 @@ mod tests {
             SubmissionOperation::MarkDone {
                 task_id: "a".into(),
                 tx_hash: None,
-                first_entry_id: None,
+                on_chain_id: None,
             },
             SubmissionResult::Persisted,
         );
@@ -629,14 +755,14 @@ mod tests {
             },
             SubmissionResult::Tx(TxOutcome::Confirmed {
                 tx_hash: "0xabc".into(),
-                first_entry_id: Some(42),
+                on_chain_id: Some(42),
             }),
         );
         driver.step(
             SubmissionOperation::MarkDone {
                 task_id: "a".into(),
                 tx_hash: Some("0xabc".into()),
-                first_entry_id: Some(42),
+                on_chain_id: Some(42),
             },
             SubmissionResult::Persisted,
         );
@@ -654,7 +780,7 @@ mod tests {
             SubmissionOperation::MarkDone {
                 task_id: "a".into(),
                 tx_hash: Some("0xprev".into()),
-                first_entry_id: None,
+                on_chain_id: None,
             },
             SubmissionResult::Persisted,
         );
@@ -670,7 +796,7 @@ mod tests {
         driver.step(
             SubmissionOperation::RecordTransientFailure {
                 task_id: "a".into(),
-                message: "isContentRegistered RPC temporarily unavailable".into(),
+                message: "chain reconciliation RPC temporarily unavailable".into(),
             },
             SubmissionResult::Persisted,
         );
@@ -730,7 +856,7 @@ mod tests {
             SubmissionOperation::MarkDone {
                 task_id: "a".into(),
                 tx_hash: None,
-                first_entry_id: None,
+                on_chain_id: None,
             },
             SubmissionResult::Persisted,
         );
@@ -738,7 +864,9 @@ mod tests {
     }
 
     #[test]
-    fn content_registered_send_failure_is_retroactive_success() {
+    fn already_exists_send_failure_reconciles_to_done() {
+        // A used group key with OUR content on-chain: a lost receipt or a
+        // producer duplicate — retroactive success after reconciling.
         let pending = task("a", TaskStatus::Pending);
         let mut driver = Driver::start(&["a"]);
         driver.step(load(&["a"]), loaded(&[&pending]));
@@ -748,14 +876,43 @@ mod tests {
                 task: pending.clone(),
             },
             SubmissionResult::Tx(TxOutcome::SendFailed {
-                error: ChainError::Rejected("UnitAlreadyRegistered".into()),
+                error: ChainError::Rejected("GroupKeyAlreadyUsed".into()),
             }),
         );
+        driver.step(check(&pending), registered(true));
         driver.step(
             SubmissionOperation::MarkDone {
                 task_id: "a".into(),
                 tx_hash: None,
-                first_entry_id: None,
+                on_chain_id: None,
+            },
+            SubmissionResult::Persisted,
+        );
+        driver.assert_settled(advance());
+    }
+
+    #[test]
+    fn already_exists_with_foreign_content_is_poison() {
+        // Someone else holds the group key and our content is absent: the
+        // task can never land.
+        let pending = task("a", TaskStatus::Pending);
+        let mut driver = Driver::start(&["a"]);
+        driver.step(load(&["a"]), loaded(&[&pending]));
+        driver.step(check(&pending), registered(false));
+        driver.step(
+            SubmissionOperation::SubmitRegister {
+                task: pending.clone(),
+            },
+            SubmissionResult::Tx(TxOutcome::SendFailed {
+                error: ChainError::Rejected("GroupKeyAlreadyUsed".into()),
+            }),
+        );
+        driver.step(check(&pending), registered(false));
+        driver.step(
+            SubmissionOperation::MarkFailed {
+                task_id: "a".into(),
+                kind: FailureKind::Poison,
+                message: "register: chain RPC rejected the request".into(),
             },
             SubmissionResult::Persisted,
         );
@@ -838,14 +995,14 @@ mod tests {
             SubmissionOperation::SubmitRegister { task: two.clone() },
             SubmissionResult::Tx(TxOutcome::Confirmed {
                 tx_hash: "0xok".into(),
-                first_entry_id: Some(7),
+                on_chain_id: Some(7),
             }),
         );
         driver.step(
             SubmissionOperation::MarkDone {
                 task_id: "t2".into(),
                 tx_hash: Some("0xok".into()),
-                first_entry_id: Some(7),
+                on_chain_id: Some(7),
             },
             SubmissionResult::Persisted,
         );
@@ -877,7 +1034,7 @@ mod tests {
             SubmissionOperation::MarkDone {
                 task_id: "a".into(),
                 tx_hash: None,
-                first_entry_id: None,
+                on_chain_id: None,
             },
             SubmissionResult::StoreUnavailable,
         );

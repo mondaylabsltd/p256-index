@@ -19,13 +19,15 @@ use serde_json::{Value, json};
 
 use p256_registrar::{
     gas::{self, FeePlan, FeeVerdict},
-    lookup::{Entry, Page, SiteItem},
+    lookup::{Entry, Page, SiteItem, Unit},
     protocol::{
-        CHAIN_ID, UNIT_REGISTERED_TOPIC, decode_bool, decode_entries_page, decode_entry,
-        decode_has_entries, decode_rp_ids, decode_total, entries_by_key_calldata,
-        entries_by_rp_id_calldata, get_entry_calldata, has_entries_calldata,
-        is_content_registered_calldata, is_revert, register_calldata, rp_ids_calldata,
-        total_entries_calldata, total_rp_ids_calldata, total_units_calldata,
+        CHAIN_ID, GROUP_CREATED_TOPIC, REFERENCE_CREATED_TOPIC, decode_bool, decode_entry,
+        decode_entry_by_key, decode_id_page, decode_rp_ids, decode_total, decode_unit,
+        decode_unit_by_group_key, get_entry_by_key_calldata, get_entry_calldata,
+        get_unit_by_group_key_calldata, get_unit_calldata, groups_by_rp_id_calldata,
+        groups_of_key_calldata, is_content_registered_calldata, is_referenced_calldata, is_revert,
+        references_of_key_calldata, rp_ids_calldata, total_entries_calldata,
+        total_references_calldata, total_rp_ids_calldata, total_units_calldata, write_calldata,
     },
     roster::{Lane, Roster},
     task::RegisterTask,
@@ -102,11 +104,33 @@ pub struct Broadcast {
     pub fees_wei: Option<(u128, u128)>,
 }
 
+/// The registry's public counters, fetched together for /api/stats/total.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Totals {
+    /// Entries are globally unique: this IS the passkey count.
+    pub entries: u64,
+    /// Group keys are single-use: this IS the group count.
+    pub units: u64,
+    /// References live in their own table, counted apart from groups.
+    pub references: u64,
+    pub rp_ids: u64,
+}
+
+/// A key's global file plus one page of its group and reference ids.
+#[derive(Clone, Debug)]
+pub struct KeyProfile {
+    pub entry: Entry,
+    pub group_total: u64,
+    pub group_ids: Vec<u64>,
+    pub reference_total: u64,
+    pub reference_ids: Vec<u64>,
+}
+
 /// A definite receipt verdict. On success the receipt's UnitRegistered log
 /// yields the unit's first entry id (absent for non-register transactions).
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum ReceiptOutcome {
-    Success { first_entry_id: Option<u64> },
+    Success { on_chain_id: Option<u64> },
     Reverted,
 }
 
@@ -119,29 +143,35 @@ pub trait ReadChain: Send + Sync {
     /// The configured registry address, EIP-55 checksummed.
     fn registry_address(&self) -> String;
     async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError>;
-    async fn entries_by_key(
+    async fn unit(&self, unit_id: u64) -> Result<Option<Unit>, ChainError>;
+    async fn key_profile(
         &self,
         public_key: &str,
         page: u64,
         page_size: u64,
         descending: bool,
-    ) -> Result<Page<Entry>, ChainError>;
-    async fn entries_by_rp_id(
+    ) -> Result<Option<KeyProfile>, ChainError>;
+    async fn groups_by_rp_id(
         &self,
         rp_id: &str,
         page: u64,
         page_size: u64,
         descending: bool,
-    ) -> Result<Page<Entry>, ChainError>;
+    ) -> Result<Page<Unit>, ChainError>;
     async fn rp_ids(
         &self,
         page: u64,
         page_size: u64,
         descending: bool,
     ) -> Result<Page<SiteItem>, ChainError>;
-    /// (total entries, total units, total rpIds)
-    async fn totals(&self) -> Result<(u64, u64, u64), ChainError>;
+    async fn totals(&self) -> Result<Totals, ChainError>;
     async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError>;
+    async fn is_referenced(
+        &self,
+        group_public_key: Vec<u8>,
+        member_public_key: Vec<u8>,
+    ) -> Result<bool, ChainError>;
+    async fn unit_by_group_key(&self, public_key: Vec<u8>) -> Result<Option<Unit>, ChainError>;
 }
 
 impl Chain {
@@ -186,6 +216,10 @@ impl Chain {
         CHAIN_ID
     }
 
+    pub fn registry_address(&self) -> String {
+        self.registry_address.to_checksum(None)
+    }
+
     // ── Reads ──────────────────────────────────────────────────────────────
 
     pub async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError> {
@@ -193,7 +227,7 @@ impl Chain {
             .call_contract(self.registry_address, get_entry_calldata(entry_id))
             .await
         {
-            Ok(bytes) => decode_entry(&bytes)
+            Ok(bytes) => decode_entry(entry_id, &bytes)
                 .map(Some)
                 .map_err(|_| ChainError::InvalidResponse),
             Err(ChainError::Reverted(_)) => Ok(None),
@@ -201,48 +235,91 @@ impl Chain {
         }
     }
 
-    pub async fn entries_by_key(
+    pub async fn unit(&self, unit_id: u64) -> Result<Option<Unit>, ChainError> {
+        match self
+            .call_contract(self.registry_address, get_unit_calldata(unit_id))
+            .await
+        {
+            Ok(bytes) => decode_unit(unit_id, &bytes)
+                .map(Some)
+                .map_err(|_| ChainError::InvalidResponse),
+            Err(ChainError::Reverted(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Everything a key's holder wants in one read: the global file, plus
+    /// one page of the groups it belongs to and of the references it holds.
+    pub async fn key_profile(
         &self,
         public_key: &str,
         page: u64,
         page_size: u64,
         descending: bool,
-    ) -> Result<Page<Entry>, ChainError> {
+    ) -> Result<Option<KeyProfile>, ChainError> {
         let key = hex::decode(public_key.strip_prefix("0x").unwrap_or(public_key))
             .map_err(|_| ChainError::InvalidResponse)?;
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                get_entry_by_key_calldata(key.clone()),
+            )
+            .await?;
+        let Some(entry) = decode_entry_by_key(&bytes).map_err(|_| ChainError::InvalidResponse)?
+        else {
+            return Ok(None);
+        };
+
         let offset = page.saturating_sub(1).saturating_mul(page_size);
         let bytes = self
             .call_contract(
                 self.registry_address,
-                entries_by_key_calldata(key, offset, page_size, descending),
+                groups_of_key_calldata(key.clone(), offset, page_size, descending),
             )
             .await?;
-        let (total, items) =
-            decode_entries_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
-        Ok(Page {
-            total,
-            page,
-            page_size,
-            items,
-        })
+        let (group_total, group_ids) =
+            decode_id_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                references_of_key_calldata(key, offset, page_size, descending),
+            )
+            .await?;
+        let (reference_total, reference_ids) =
+            decode_id_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        Ok(Some(KeyProfile {
+            entry,
+            group_total,
+            group_ids,
+            reference_total,
+            reference_ids,
+        }))
     }
 
-    pub async fn entries_by_rp_id(
+    /// One page of the groups under an rpId, joined with their frozen
+    /// records (one getUnit per id — pages are capped by the HTTP layer).
+    pub async fn groups_by_rp_id(
         &self,
         rp_id: &str,
         page: u64,
         page_size: u64,
         descending: bool,
-    ) -> Result<Page<Entry>, ChainError> {
+    ) -> Result<Page<Unit>, ChainError> {
         let offset = page.saturating_sub(1).saturating_mul(page_size);
         let bytes = self
             .call_contract(
                 self.registry_address,
-                entries_by_rp_id_calldata(rp_id.to_owned(), offset, page_size, descending),
+                groups_by_rp_id_calldata(rp_id.to_owned(), offset, page_size, descending),
             )
             .await?;
-        let (total, items) =
-            decode_entries_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        let (total, ids) = decode_id_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        let mut items = Vec::with_capacity(ids.len());
+        for unit_id in ids {
+            let bytes = self
+                .call_contract(self.registry_address, get_unit_calldata(unit_id))
+                .await?;
+            items.push(decode_unit(unit_id, &bytes).map_err(|_| ChainError::InvalidResponse)?);
+        }
         Ok(Page {
             total,
             page,
@@ -280,29 +357,42 @@ impl Chain {
         })
     }
 
-    pub async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
-        let entries = self
-            .call_contract(self.registry_address, total_entries_calldata())
-            .await
-            .and_then(|bytes| decode_total(&bytes).map_err(|_| ChainError::InvalidResponse))?;
-        let units = self
-            .call_contract(self.registry_address, total_units_calldata())
-            .await
-            .and_then(|bytes| decode_total(&bytes).map_err(|_| ChainError::InvalidResponse))?;
-        let rp_ids = self
-            .call_contract(self.registry_address, total_rp_ids_calldata())
-            .await
-            .and_then(|bytes| decode_total(&bytes).map_err(|_| ChainError::InvalidResponse))?;
-        Ok((entries, units, rp_ids))
+    pub async fn unit_by_group_key(&self, public_key: Vec<u8>) -> Result<Option<Unit>, ChainError> {
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                get_unit_by_group_key_calldata(public_key),
+            )
+            .await?;
+        decode_unit_by_group_key(&bytes).map_err(|_| ChainError::InvalidResponse)
     }
 
-    pub async fn has_entries(&self, public_key: &str) -> Result<bool, ChainError> {
-        let key = hex::decode(public_key.strip_prefix("0x").unwrap_or(public_key))
-            .map_err(|_| ChainError::InvalidResponse)?;
+    pub async fn is_referenced(
+        &self,
+        group_public_key: Vec<u8>,
+        member_public_key: Vec<u8>,
+    ) -> Result<bool, ChainError> {
         let bytes = self
-            .call_contract(self.registry_address, has_entries_calldata(key))
+            .call_contract(
+                self.registry_address,
+                is_referenced_calldata(group_public_key, member_public_key),
+            )
             .await?;
-        decode_has_entries(&bytes).map_err(|_| ChainError::InvalidResponse)
+        decode_bool(&bytes).map_err(|_| ChainError::InvalidResponse)
+    }
+
+    pub async fn totals(&self) -> Result<Totals, ChainError> {
+        let read = async |calldata: Vec<u8>| {
+            self.call_contract(self.registry_address, calldata)
+                .await
+                .and_then(|bytes| decode_total(&bytes).map_err(|_| ChainError::InvalidResponse))
+        };
+        Ok(Totals {
+            entries: read(total_entries_calldata()).await?,
+            units: read(total_units_calldata()).await?,
+            references: read(total_references_calldata()).await?,
+            rp_ids: read(total_rp_ids_calldata()).await?,
+        })
     }
 
     pub async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError> {
@@ -362,7 +452,7 @@ impl Chain {
 
     /// One register() transaction for one task.
     pub async fn register(&self, task: &RegisterTask, nonce: u64) -> Result<Broadcast, ChainError> {
-        let data = register_calldata(task)
+        let data = write_calldata(task)
             .map_err(|_| ChainError::Rejected("could not encode a register call".into()))?;
         self.send_contract_transaction(WalletRole::Register, self.registry_address, data, nonce)
             .await
@@ -391,7 +481,7 @@ impl Chain {
                 .ok_or(ChainError::InvalidResponse)?;
             return match status {
                 "0x1" | "0x01" => Ok(ReceiptOutcome::Success {
-                    first_entry_id: parse_first_entry_id(&value),
+                    on_chain_id: parse_on_chain_id(&value),
                 }),
                 _ => Ok(ReceiptOutcome::Reverted),
             };
@@ -615,23 +705,20 @@ impl Chain {
     }
 }
 
-/// Extract the unit's first entry id from a register receipt's
-/// UnitRegistered(uint256 indexed unitId, bytes32 indexed rpIdHash,
-/// bytes32 indexed groupKeyHash, uint256 firstEntryId, uint256 memberCount,
-/// bytes groupPublicKey) log — firstEntryId is the first data word.
-fn parse_first_entry_id(receipt: &Value) -> Option<u64> {
+/// Extract the confirmed write's on-chain id from the receipt: the unitId
+/// from a GroupCreated log, or the referenceId from a ReferenceCreated log
+/// — both are topics[1] (the first indexed field).
+fn parse_on_chain_id(receipt: &Value) -> Option<u64> {
     let logs = receipt.get("logs")?.as_array()?;
     for log in logs {
         let topics = log.get("topics")?.as_array()?;
-        if topics.first()?.as_str()? != UNIT_REGISTERED_TOPIC {
+        let event = topics.first()?.as_str()?;
+        if event != GROUP_CREATED_TOPIC && event != REFERENCE_CREATED_TOPIC {
             continue;
         }
-        let data = log.get("data")?.as_str()?;
-        let raw = data.strip_prefix("0x").unwrap_or(data);
-        if raw.len() < 64 {
-            return None;
-        }
-        return u64::from_str_radix(raw[..64].trim_start_matches('0'), 16)
+        let id = topics.get(1)?.as_str()?;
+        let raw = id.strip_prefix("0x").unwrap_or(id);
+        return u64::from_str_radix(raw.trim_start_matches('0'), 16)
             .ok()
             .or(Some(0));
     }
@@ -645,31 +732,35 @@ impl ReadChain for Chain {
     }
 
     fn registry_address(&self) -> String {
-        self.registry_address.to_checksum(None)
+        Chain::registry_address(self)
     }
 
     async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError> {
         Chain::entry(self, entry_id).await
     }
 
-    async fn entries_by_key(
+    async fn unit(&self, unit_id: u64) -> Result<Option<Unit>, ChainError> {
+        Chain::unit(self, unit_id).await
+    }
+
+    async fn key_profile(
         &self,
         public_key: &str,
         page: u64,
         page_size: u64,
         descending: bool,
-    ) -> Result<Page<Entry>, ChainError> {
-        Chain::entries_by_key(self, public_key, page, page_size, descending).await
+    ) -> Result<Option<KeyProfile>, ChainError> {
+        Chain::key_profile(self, public_key, page, page_size, descending).await
     }
 
-    async fn entries_by_rp_id(
+    async fn groups_by_rp_id(
         &self,
         rp_id: &str,
         page: u64,
         page_size: u64,
         descending: bool,
-    ) -> Result<Page<Entry>, ChainError> {
-        Chain::entries_by_rp_id(self, rp_id, page, page_size, descending).await
+    ) -> Result<Page<Unit>, ChainError> {
+        Chain::groups_by_rp_id(self, rp_id, page, page_size, descending).await
     }
 
     async fn rp_ids(
@@ -681,12 +772,24 @@ impl ReadChain for Chain {
         Chain::rp_ids(self, page, page_size, descending).await
     }
 
-    async fn totals(&self) -> Result<(u64, u64, u64), ChainError> {
+    async fn totals(&self) -> Result<Totals, ChainError> {
         Chain::totals(self).await
     }
 
     async fn is_content_registered(&self, content_hash: B256) -> Result<bool, ChainError> {
         Chain::is_content_registered(self, content_hash).await
+    }
+
+    async fn is_referenced(
+        &self,
+        group_public_key: Vec<u8>,
+        member_public_key: Vec<u8>,
+    ) -> Result<bool, ChainError> {
+        Chain::is_referenced(self, group_public_key, member_public_key).await
+    }
+
+    async fn unit_by_group_key(&self, public_key: Vec<u8>) -> Result<Option<Unit>, ChainError> {
+        Chain::unit_by_group_key(self, public_key).await
     }
 }
 
@@ -843,7 +946,7 @@ mod tests {
     use alloy::primitives::U256;
     use serde_json::json;
 
-    use super::{parse_first_entry_id, parse_quantity_value, parse_u256_value};
+    use super::{parse_on_chain_id, parse_quantity_value, parse_u256_value};
 
     #[test]
     fn parses_json_rpc_hex_quantities_without_precision_loss() {
@@ -855,27 +958,44 @@ mod tests {
     }
 
     #[test]
-    fn extracts_the_first_entry_id_from_a_register_receipt() {
-        let receipt = json!({
+    fn extracts_the_on_chain_id_from_a_confirmed_receipt() {
+        let group = json!({
             "logs": [
                 { "topics": ["0xdead"], "data": "0x" },
                 {
-                    "topics": [p256_registrar::protocol::UNIT_REGISTERED_TOPIC, "0x01", "0x02"],
-                    // firstEntryId = 0x2a, memberCount = 3
-                    "data": format!("0x{:064x}{:064x}", 0x2a, 3),
+                    "topics": [
+                        p256_registrar::protocol::GROUP_CREATED_TOPIC,
+                        format!("0x{:064x}", 0x2a),
+                        "0x02",
+                    ],
+                    "data": "0x",
                 },
             ]
         });
-        assert_eq!(parse_first_entry_id(&receipt), Some(42));
-        // firstEntryId zero decodes as zero, not None.
-        let zero = json!({
+        assert_eq!(parse_on_chain_id(&group), Some(42));
+
+        let reference = json!({
             "logs": [{
-                "topics": [p256_registrar::protocol::UNIT_REGISTERED_TOPIC],
-                "data": format!("0x{:064x}{:064x}", 0, 1),
+                "topics": [
+                    p256_registrar::protocol::REFERENCE_CREATED_TOPIC,
+                    format!("0x{:064x}", 7),
+                ],
+                "data": "0x",
             }]
         });
-        assert_eq!(parse_first_entry_id(&zero), Some(0));
-        assert_eq!(parse_first_entry_id(&json!({"logs": []})), None);
+        assert_eq!(parse_on_chain_id(&reference), Some(7));
+        // Id zero decodes as zero, not None.
+        let zero = json!({
+            "logs": [{
+                "topics": [
+                    p256_registrar::protocol::GROUP_CREATED_TOPIC,
+                    format!("0x{:064x}", 0),
+                ],
+                "data": "0x",
+            }]
+        });
+        assert_eq!(parse_on_chain_id(&zero), Some(0));
+        assert_eq!(parse_on_chain_id(&json!({"logs": []})), None);
     }
 
     use std::time::Duration;
@@ -904,7 +1024,6 @@ mod tests {
 
     #[test]
     fn registry_address_renders_eip55_checksummed() {
-        use super::ReadChain as _;
         let chain = super::Chain::new(&offline_config(None)).expect("read-only chain");
         assert_eq!(
             chain.registry_address(),

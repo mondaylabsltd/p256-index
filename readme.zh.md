@@ -7,23 +7,30 @@
 
 ## 信任模型
 
-- **公钥是主键,持有与内容是被验证的东西——在链上验证。**每条存储都要求
-  签名者自己的 WebAuthn 格式 P-256 assertion,签在存储授权挑战
+- **三张表、两个写操作。**ENTRY 是 passkey 的全局档案(一把钥匙恰好
+  一行,attestation 首见定格、由钥匙亲签);UNIT 是组(一把一次性组
+  密钥恰好一个组,rpId、metadata、成员集创建即冻结——**组成员永不可
+  变,也刻意不存在任何能改它的操作**);REFERENCE 是"一把 passkey 指
+  向一个既有组"——独立的表、独立的计数,与组永不混淆。
+- **持有与内容是被验证的东西——在链上验证。**每个签名者的 WebAuthn 格
+  式 P-256 assertion 签在
   `keccak256(abi.encode(chainid, registry, rpId, publicKey, binding))`
-  上,合约通过 EIP-7951/RIP-7212 预编译验签。binding 按角色而定:
-  **组密钥**签单元 contentHash(覆盖 rpId、metadata、组公钥、全部成员),
-  **成员 passkey** 签 `memberBindingFor(组公钥, 自己的attestation)`。
-  合起来每个字节都在签名覆盖之下:没有人能往不持有的钥匙下挂数据,
-  也没有人能改动任何字段——抢跑、重放、内容替换在协议层不存在。
+  上,由 EIP-7951/RIP-7212 预编译验签。binding 按角色:组密钥签组的
+  contentHash;成员签 `memberBindingFor(组公钥, 自己的attestation)`;
+  引用者签 `referenceBindingFor(组公钥, attestation, 引用metadata)`。
+  每个字节都在签名覆盖之下——抢跑、重放、内容替换在协议层不存在。
 - **除此之外零独占、零解释。**一把钥匙可以出现在任意多个注册单元里;
   查询返回列表,读方按自己的 metadata schema 过滤。credentialId、显示
   名、钱包派生前像,全部编码在 `metadata`(≤2048 字节,不透明)里。
-- **注册单元** = 一把组密钥 + 1..7 把成员 passkey,共享一个 rpId、一份
-  metadata,一笔 `register` 交易原子落地(7 把 passkey = 8 个签名)。
-  组密钥是客户端软件密钥,每个单元必有且仅有一把,静默收尾签名、零
-  弹窗;成员 passkey 在创建那一刻即可签名,完全乱序、互不等待。没有
-  nonce、没有任何可消耗品:相同内容注册天然幂等,不同内容使签名失效。
-  单元按组公钥反查(getUnitIdsByGroupKey);组语义归使用方 schema。
+- **`register`** 一笔交易原子落地一个组(7 passkey = 8 个签名):组密
+  钥静默收尾、用完即弃;成员 passkey 创建即签、乱序、互不等待。
+  **`refer`** 让一把 passkey 指向既有组——后加设备的路径:纯发现数据,
+  每 (组, 钥匙) 一条,组的冻结记录零触碰。**引用是声明不是授权**:被
+  引用的钥匙能做什么,由读取方 schema 对照钱包层裁定。无 nonce、无消
+  耗品,一切写入天然幂等。
+- **统计是结构性的**:Entry 全局唯一、组密钥一次性,所以
+  `getTotalEntries()` 就是 passkey 数,`getTotalUnits()` 就是组数,
+  `getTotalReferences()` 独立计引用——没有任何去重逻辑。
 - **读取是列表形态且 id 恒定。**entry id 顺序分配、永不变化——记住
   自己的 entry id 就能永远 O(1) 直读。无本地状态时的发现:从任意一次
   登录签名恢复两个候选公钥、各查一次——只有被持有的钥匙才可能有条目,
@@ -33,12 +40,14 @@
 
 1. enrollment 开始时客户端生成一次性组密钥(软件 P-256)。每把
    passkey:`create()` 收集公钥,然后一次 `get()`,其挑战 = 成员绑定
-   挑战(`POST /api/challenge` 成员模式:`{rpId, groupPublicKey,
-   publicKey, attestation?}`)——只依赖组公钥和自己的字段,顺序任意、
-   设备任意、互不等待。每把钥匙两次弹窗。
-2. 全部钥匙就位后定稿单元,组密钥静默签收尾挑战(`POST /api/challenge`
-   组模式:`{rpId, metadata, groupPublicKey, members}` 返回 contentHash
-   与组挑战),然后一笔提交。
+   挑战(`POST /api/challenge` 成员模式)——只依赖组公钥和自己的字段,
+   顺序任意、设备任意、互不等待。每把钥匙两次弹窗。
+2. 全部钥匙就位后,组密钥静默签收尾挑战(组模式返回 contentHash 与组
+   挑战),`POST /api/register` 一笔提交,组私钥随即永久销毁。
+3. 日后加设备:新 passkey create + 一次 get()(挑战带 `"refer": true`
+   的引用模式),`POST /api/refer` 提交——组本体永不被触碰。登录发
+   现:签名恢复候选公钥,`GET /api/query?publicKey=` 返回档案 + 组/引
+   用 id 列表。
 3. `POST /api/register` 提交单元。服务端逐个验签(合约校验的纯 Rust
    镜像——无效证明永远到不了链上)、双阶段持久化入队(Redis + Iggy),
    worker 一笔交易落链。轮询 `GET /api/task/{id}`。
@@ -65,14 +74,15 @@
 
 | 方法 | 路由 | 用途 |
 | --- | --- | --- |
-| POST | /api/register | 验签并持久化入队一个单元(1..7 成员) |
+| POST | /api/register | 验签并持久化入队一个组(1..7 成员) |
+| POST | /api/refer | 验签并持久化入队一条引用 |
 | GET | /api/task/{id} | 任务状态(全量披露;不回显证明) |
-| POST | /api/challenge | 成员模式算成员挑战;组模式算 contentHash+组挑战 |
-| GET | /api/query?publicKey= | 某公钥的分页条目(上链前带 `_queue` 标记) |
+| POST | /api/challenge | 成员/引用/组三模式,按角色算绑定挑战 |
+| GET | /api/query?publicKey= | 该钥匙档案 + 组/引用 id(上链前带 `_queue` 标记) |
 | GET | /api/query?entryId= | 按恒定 id 取单条 |
-| GET | /api/stats/total | {totalEntries, totalUnits, totalRpIds} |
+| GET | /api/stats/total | {totalEntries, totalUnits, totalReferences, totalRpIds} |
 | GET | /api/stats/sites | 分页 rpId 列表 |
-| GET | /api/stats/keys?rpId= | 某 rpId 下的分页条目 |
+| GET | /api/stats/keys?rpId= | 某 rpId 下的分页组列表 |
 | GET | /api/health | 健康、RPC 熔断、队列/DLQ 指标、registry 地址 |
 
 `attestation` 为 20 字节版本化注册期信号(版本、AAGUID、authData flags、

@@ -22,19 +22,37 @@ use serde_json::{Value, json};
 
 use crate::task::{RegisterTask, TaskStatus};
 
-/// One registry entry joined with its unit, as served to clients.
+/// One passkey's global file, as served to clients.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
     pub entry_id: u64,
-    pub unit_id: u64,
     pub public_key: String,
     pub attestation: String,
+    pub created_at: u64,
+}
+
+/// One group's frozen record, as served to clients.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unit {
+    pub unit_id: u64,
     pub rp_id: String,
     pub metadata: String,
     pub group_public_key: String,
-    pub first_entry_id: u64,
+    pub content_hash: String,
     pub member_count: u32,
+    pub created_at: u64,
+}
+
+/// One reference row, as served to clients.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceRecord {
+    pub reference_id: u64,
+    pub entry_id: u64,
+    pub unit_id: u64,
+    pub metadata: String,
     pub created_at: u64,
 }
 
@@ -68,6 +86,7 @@ pub fn task_status_body(task: &RegisterTask) -> Value {
     json!({
         "id": task.id,
         "status": task.status,
+        "kind": task.kind,
         "rpId": task.rp_id,
         "metadata": task.metadata,
         "contentHash": task.content_hash,
@@ -77,7 +96,7 @@ pub fn task_status_body(task: &RegisterTask) -> Value {
             "attestation": member.attestation,
         })).collect::<Vec<_>>(),
         "txHash": task.tx_hash,
-        "firstEntryId": task.first_entry_id,
+        "onChainId": task.on_chain_id,
         "error": task.error,
         "createdAt": task.created_at,
     })
@@ -496,32 +515,6 @@ async fn entries_by_key_flow(
     .await
     {
         LookupResult::Chain { value } => {
-            let empty = value
-                .get("total")
-                .and_then(Value::as_u64)
-                .is_some_and(|total| total == 0);
-            if empty {
-                // Pre-chain visibility: an in-flight task for this key
-                // answers instead of an empty page.
-                match request(
-                    ctx,
-                    LookupOperation::FindTaskByKey {
-                        key_hash: public_key.clone(),
-                    },
-                )
-                .await
-                {
-                    LookupResult::TaskFound { task: Some(task) }
-                        if is_active_placeholder(&task) =>
-                    {
-                        return Ok(LookupOutcome::QueuePending {
-                            value: queue_pending_body(&task, &public_key),
-                        });
-                    }
-                    LookupResult::TaskFound { .. } => {}
-                    _ => return Err(redis_down()),
-                }
-            }
             let _ = request(
                 ctx,
                 LookupOperation::WriteCache {
@@ -533,12 +526,44 @@ async fn entries_by_key_flow(
             .await;
             Ok(LookupOutcome::Ok { value })
         }
+        // The key has no on-chain file (yet). Pre-chain visibility: an
+        // in-flight task for this key answers instead of an empty body,
+        // so "submitted to p256-index" is never invisible.
+        LookupResult::ChainNotFound => {
+            match request(
+                ctx,
+                LookupOperation::FindTaskByKey {
+                    key_hash: public_key.clone(),
+                },
+            )
+            .await
+            {
+                LookupResult::TaskFound { task: Some(task) } if is_active_placeholder(&task) => {
+                    Ok(LookupOutcome::QueuePending {
+                        value: queue_pending_body(&task, &public_key),
+                    })
+                }
+                LookupResult::TaskFound { .. } => Ok(LookupOutcome::Ok {
+                    value: empty_key_profile_body(),
+                }),
+                _ => Err(redis_down()),
+            }
+        }
         LookupResult::ChainFailed => match stale {
             Some((value, age_ms)) => Ok(LookupOutcome::StaleOk { value, age_ms }),
             None => Err(rpc_down()),
         },
         _ => Err(rpc_down()),
     }
+}
+
+/// The stable shape for "this key has no file yet and no in-flight task".
+fn empty_key_profile_body() -> Value {
+    json!({
+        "entry": Value::Null,
+        "groups": { "total": 0, "unitIds": [] },
+        "references": { "total": 0, "referenceIds": [] },
+    })
 }
 
 async fn entry_flow(ctx: &Ctx, entry_id: u64) -> Flow<LookupOutcome> {
@@ -733,18 +758,19 @@ mod tests {
         RegisterTask {
             id: "t1".into(),
             status,
+            kind: crate::task::TaskKind::Register,
             rp_id: "example.com".into(),
             metadata: "0xaa".into(),
             content_hash: format!("0x{}", "11".repeat(32)),
             group_public_key: "049e666db13bc6d0a76ec6801fbe24864030f15eca3b2d07ebcaf824bb2dc4f0aea8221dc27980b7c133a00d910c39723eb1523e88ad050a7303bba8bde07367fa".into(),
-            group_proof: Proof {
+            group_proof: Some(Proof {
                 authenticator_data: String::new(),
                 client_data_json: String::new(),
                 challenge_index: 0,
                 type_index: 0,
                 r: String::new(),
                 s: String::new(),
-            },
+            }),
             members: vec![Member {
                 public_key: KEY.into(),
                 attestation: String::new(),
@@ -758,7 +784,7 @@ mod tests {
                 },
             }],
             tx_hash: None,
-            first_entry_id: None,
+            on_chain_id: None,
             error: None,
             retries: 0,
             created_at: 7,
@@ -810,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_chain_page_with_active_task_answers_queue_pending() {
+    fn missing_file_with_active_task_answers_queue_pending() {
         let mut driver = Driver::start(by_key());
         driver.step(
             LookupOperation::ReadCache { key: key_cache() },
@@ -820,12 +846,7 @@ mod tests {
             LookupOperation::AllowRead,
             LookupResult::Allowed { allowed: true },
         );
-        driver.step(
-            key_fetch(),
-            LookupResult::Chain {
-                value: json!({"total": 0, "items": []}),
-            },
-        );
+        driver.step(key_fetch(), LookupResult::ChainNotFound);
         driver.step(
             LookupOperation::FindTaskByKey {
                 key_hash: KEY.into(),
@@ -840,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_chain_page_without_task_caches_and_serves_empty() {
+    fn missing_file_without_task_serves_the_empty_profile() {
         let mut driver = Driver::start(by_key());
         driver.step(
             LookupOperation::ReadCache { key: key_cache() },
@@ -850,28 +871,20 @@ mod tests {
             LookupOperation::AllowRead,
             LookupResult::Allowed { allowed: true },
         );
-        let empty = json!({"total": 0, "items": []});
-        driver.step(
-            key_fetch(),
-            LookupResult::Chain {
-                value: empty.clone(),
-            },
-        );
+        driver.step(key_fetch(), LookupResult::ChainNotFound);
         driver.step(
             LookupOperation::FindTaskByKey {
                 key_hash: KEY.into(),
             },
             LookupResult::TaskFound { task: None },
         );
-        driver.step(
-            LookupOperation::WriteCache {
-                key: key_cache(),
-                value: empty.clone(),
-                negative: false,
-            },
-            LookupResult::Persisted,
-        );
-        driver.assert_settled(LookupOutcome::Ok { value: empty });
+        driver.assert_settled(LookupOutcome::Ok {
+            value: json!({
+                "entry": Value::Null,
+                "groups": { "total": 0, "unitIds": [] },
+                "references": { "total": 0, "referenceIds": [] },
+            }),
+        });
     }
 
     #[test]
@@ -885,13 +898,7 @@ mod tests {
             LookupOperation::AllowRead,
             LookupResult::Allowed { allowed: true },
         );
-        let empty = json!({"total": 0, "items": []});
-        driver.step(
-            key_fetch(),
-            LookupResult::Chain {
-                value: empty.clone(),
-            },
-        );
+        driver.step(key_fetch(), LookupResult::ChainNotFound);
         driver.step(
             LookupOperation::FindTaskByKey {
                 key_hash: KEY.into(),
@@ -900,15 +907,13 @@ mod tests {
                 task: Some(task(TaskStatus::Failed)),
             },
         );
-        driver.step(
-            LookupOperation::WriteCache {
-                key: key_cache(),
-                value: empty.clone(),
-                negative: false,
-            },
-            LookupResult::Persisted,
-        );
-        driver.assert_settled(LookupOutcome::Ok { value: empty });
+        driver.assert_settled(LookupOutcome::Ok {
+            value: json!({
+                "entry": Value::Null,
+                "groups": { "total": 0, "unitIds": [] },
+                "references": { "total": 0, "referenceIds": [] },
+            }),
+        });
     }
 
     #[test]

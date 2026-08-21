@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use p256_registrar::{
     gas::FeeVerdict,
-    protocol::parse_b256,
+    protocol::{parse_b256, parse_hex_bytes},
     submission::{
         BatchVerdict, SubmissionApp, SubmissionEffect, SubmissionEvent, SubmissionOperation,
         SubmissionResult, TxOutcome,
@@ -273,16 +273,31 @@ impl CreateWorker {
                     Err(_) => SubmissionResult::ChainReadFailed,
                 }
             }
+            SubmissionOperation::CheckReferenced {
+                group_public_key,
+                member_public_key,
+            } => {
+                let (Ok(group), Ok(member)) = (
+                    parse_hex_bytes(group_public_key),
+                    parse_hex_bytes(member_public_key),
+                ) else {
+                    return SubmissionResult::ChainReadFailed;
+                };
+                match self.chain.is_referenced(group, member).await {
+                    Ok(registered) => SubmissionResult::ContentChecked { registered },
+                    Err(_) => SubmissionResult::ChainReadFailed,
+                }
+            }
             SubmissionOperation::SubmitRegister { task } => {
                 SubmissionResult::Tx(self.submit(task).await)
             }
             SubmissionOperation::MarkDone {
                 task_id,
                 tx_hash,
-                first_entry_id,
+                on_chain_id,
             } => store_ack(
                 self.store
-                    .mark_done(task_id, tx_hash.clone(), *first_entry_id)
+                    .mark_done(task_id, tx_hash.clone(), *on_chain_id)
                     .await,
             ),
             SubmissionOperation::MarkFailed {
@@ -315,11 +330,11 @@ impl CreateWorker {
             Ok(Broadcast { hash, fees_wei }) => {
                 self.record_pending(nonce, &hash, fees_wei).await;
                 match self.chain.wait_for_receipt(&hash, RECEIPT_TIMEOUT).await {
-                    Ok(ReceiptOutcome::Success { first_entry_id }) => {
+                    Ok(ReceiptOutcome::Success { on_chain_id }) => {
                         self.clear_pending(nonce).await;
                         TxOutcome::Confirmed {
                             tx_hash: hash,
-                            first_entry_id,
+                            on_chain_id,
                         }
                     }
                     Ok(ReceiptOutcome::Reverted) => {
@@ -472,7 +487,7 @@ mod e2e_chain_tests {
     use crate::{chain::Chain, config::Config, store::RedisStore};
     use p256_registrar::{
         protocol::{challenge_for, content_hash_for, member_binding_for},
-        task::{Member, Proof, RegisterTask, TaskStatus},
+        task::{Member, Proof, RegisterTask, TaskKind, TaskStatus},
         verify::base64url_32,
     };
 
@@ -577,25 +592,26 @@ mod e2e_chain_tests {
         let mut task = RegisterTask {
             id: format!("e2e-chain-{suffix}"),
             status: TaskStatus::Pending,
+            kind: TaskKind::Register,
             rp_id: rp_id.clone(),
             metadata: "0xe2e0".into(),
             content_hash: String::new(),
             group_public_key: group_public_key.clone(),
-            group_proof: Proof {
+            group_proof: Some(Proof {
                 authenticator_data: String::new(),
                 client_data_json: String::new(),
                 challenge_index: 23,
                 type_index: 1,
                 r: String::new(),
                 s: String::new(),
-            },
+            }),
             members: vec![Member {
                 public_key: public_key.clone(),
                 attestation: String::new(),
                 proof: sign_proof(&member_signing, member_challenge, &rp_id),
             }],
             tx_hash: None,
-            first_entry_id: None,
+            on_chain_id: None,
             error: None,
             retries: 0,
             created_at: now_ms() as i64,
@@ -610,7 +626,7 @@ mod e2e_chain_tests {
             &hex::decode(&group_public_key).unwrap(),
             content_hash,
         );
-        task.group_proof = sign_proof(&group_signing, group_challenge, &rp_id);
+        task.group_proof = Some(sign_proof(&group_signing, group_challenge, &rp_id));
         store.admit(&task).await.expect("admit task");
 
         let worker = CreateWorker {
@@ -636,15 +652,23 @@ mod e2e_chain_tests {
         assert!(stored.tx_hash.is_some());
         eprintln!(
             "on-chain e2e complete: tx {:?}, first entry {:?}",
-            stored.tx_hash, stored.first_entry_id
+            stored.tx_hash, stored.on_chain_id
         );
 
-        // The entry is now readable by its key.
-        let page = chain
-            .entries_by_key(&public_key, 1, 10, false)
+        // The key's global file and its group membership are now readable.
+        let profile = chain
+            .key_profile(&public_key, 1, 10, false)
             .await
-            .expect("entries by key");
-        assert_eq!(page.total, 1);
-        assert_eq!(page.items[0].metadata, "e2e0");
+            .expect("key profile")
+            .expect("entry exists");
+        assert_eq!(profile.entry.public_key, public_key);
+        assert_eq!(profile.group_total, 1);
+        let unit = chain
+            .unit(profile.group_ids[0])
+            .await
+            .expect("unit read")
+            .expect("unit exists");
+        assert_eq!(unit.metadata, "e2e0");
+        assert_eq!(unit.group_public_key, group_public_key);
     }
 }
