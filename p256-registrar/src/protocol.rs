@@ -44,6 +44,9 @@ sol! {
     struct EntrySol {
         bytes publicKey;
         bytes attestation;
+        bytes credentialId;
+        bytes authenticatorAttachment;
+        bytes transports;
         uint256 createdAt;
     }
 
@@ -75,6 +78,9 @@ sol! {
     struct MemberSol {
         bytes publicKey;
         bytes attestation;
+        bytes credentialId;
+        bytes authenticatorAttachment;
+        bytes transports;
         ProofSol proof;
     }
 
@@ -348,6 +354,10 @@ fn member_sol(member: &crate::task::Member) -> Result<MemberSol> {
     Ok(MemberSol {
         publicKey: parse_hex_bytes(&member.public_key)?.into(),
         attestation: parse_hex_bytes(&member.attestation)?.into(),
+        credentialId: parse_hex_bytes(&member.credential_id)?.into(),
+        // Browser-reported display hints: opaque UTF-8 tokens, stored as-is.
+        authenticatorAttachment: member.authenticator_attachment.clone().into_bytes().into(),
+        transports: member.transports.clone().into_bytes().into(),
         proof: proof_sol(&member.proof)?,
     })
 }
@@ -548,6 +558,9 @@ fn entry_from_sol(entry_id: u64, value: EntrySol) -> Entry {
         entry_id,
         public_key: hex::encode(value.publicKey),
         attestation: hex::encode(value.attestation),
+        credential_id: hex::encode(value.credentialId),
+        authenticator_attachment: String::from_utf8_lossy(&value.authenticatorAttachment).into_owned(),
+        transports: String::from_utf8_lossy(&value.transports).into_owned(),
         created_at: u64::try_from(value.createdAt)
             .unwrap_or(u64::MAX)
             .saturating_mul(1000),
@@ -717,6 +730,9 @@ mod tests {
             members: vec![Member {
                 public_key: PK.into(),
                 attestation: String::new(),
+                credential_id: String::new(),
+                authenticator_attachment: String::new(),
+                transports: String::new(),
                 proof: Proof {
                     authenticator_data: "00".repeat(37),
                     client_data_json: "{}".into(),

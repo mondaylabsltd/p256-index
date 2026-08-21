@@ -91,12 +91,19 @@ fn register_body(
         group_proof: None,
         members: members
             .iter()
-            .map(|key| {
+            .enumerate()
+            .map(|(i, key)| {
                 let binding = member_binding_for(&group.bytes(), &[]);
                 let challenge = challenge_for(chain_id, registry, rp_id, &key.bytes(), binding);
+                let (credential_id, attachment, transports) = member_hints(i);
                 Member {
                     public_key: key.public_hex.clone(),
                     attestation: String::new(),
+                    // Store-only WebAuthn signals — not part of any binding or
+                    // the contentHash, so these values never alter a signature.
+                    credential_id,
+                    authenticator_attachment: attachment,
+                    transports,
                     proof: sign_proof(&key.signing, challenge, rp_id),
                 }
             })
@@ -119,10 +126,32 @@ fn register_body(
         "groupProof": serde_json::to_value(&group_proof).expect("proof json"),
         "members": task.members.iter().map(|member| json!({
             "publicKey": member.public_key,
+            "credentialId": member.credential_id,
+            "authenticatorAttachment": member.authenticator_attachment,
+            "transports": member.transports,
             "proof": serde_json::to_value(&member.proof).expect("proof json"),
         })).collect::<Vec<_>>(),
     });
     (body, content)
+}
+
+/// Realistic, per-member WebAuthn display hints, mirroring what a browser's
+/// `PublicKeyCredential` exposes: (credentialId hex, authenticatorAttachment,
+/// transports). Distinct per member so the probe can prove they are stored
+/// per-entry, not smeared across the group.
+fn member_hints(index: usize) -> (String, String, String) {
+    match index {
+        0 => (
+            "0x0102030405060708".to_owned(),
+            "platform".to_owned(),
+            "hybrid,internal".to_owned(),
+        ),
+        _ => (
+            "0x0a0b0c0d".to_owned(),
+            "cross-platform".to_owned(),
+            "usb,nfc".to_owned(),
+        ),
+    }
 }
 
 /// The signed refer REQUEST BODY.
@@ -409,6 +438,31 @@ async fn main() {
             && profile["groups"]["total"] == 1
             && profile["groups"]["unitIds"][0] == unit_id,
         format!("{status} {profile}"),
+    );
+    // The three store-only WebAuthn signals must round-trip on member_1's entry:
+    // credentialId comes back as bare hex (no 0x); the hints as their UTF-8 text.
+    api.check(
+        "member_1 entry carries credentialId + authenticatorAttachment + transports",
+        profile["entry"]["credentialId"] == "0102030405060708"
+            && profile["entry"]["authenticatorAttachment"] == "platform"
+            && profile["entry"]["transports"] == "hybrid,internal",
+        format!(
+            "credentialId={} attachment={} transports={}",
+            profile["entry"]["credentialId"],
+            profile["entry"]["authenticatorAttachment"],
+            profile["entry"]["transports"]
+        ),
+    );
+    // member_2's entry must carry ITS OWN distinct signals (proving per-entry storage).
+    let (_, profile_2, _) = api
+        .get(&format!("/api/query?publicKey={}", member_2.public_hex))
+        .await;
+    api.check(
+        "member_2 entry carries its OWN distinct signals",
+        profile_2["entry"]["credentialId"] == "0a0b0c0d"
+            && profile_2["entry"]["authenticatorAttachment"] == "cross-platform"
+            && profile_2["entry"]["transports"] == "usb,nfc",
+        format!("{profile_2}"),
     );
     let (_, _, cache) = api
         .get(&format!("/api/query?publicKey={}", member_1.public_hex))

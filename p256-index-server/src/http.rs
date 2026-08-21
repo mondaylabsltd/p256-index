@@ -381,6 +381,9 @@ async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Res
         skeleton_members.push(p256_registrar::task::Member {
             public_key,
             attestation,
+            credential_id: String::new(),
+            authenticator_attachment: String::new(),
+            transports: String::new(),
             proof: p256_registrar::task::Proof {
                 authenticator_data: String::new(),
                 client_data_json: String::new(),
@@ -1298,6 +1301,9 @@ mod tests {
             members: vec![p256_registrar::task::Member {
                 public_key: member_public.clone(),
                 attestation: String::new(),
+                credential_id: String::new(),
+                authenticator_attachment: String::new(),
+                transports: String::new(),
                 proof: p256_registrar::task::Proof {
                     authenticator_data: String::new(),
                     client_data_json: String::new(),
@@ -1354,6 +1360,9 @@ mod tests {
                 entry_id: 7,
                 public_key: "04cd".into(),
                 attestation: String::new(),
+                credential_id: String::new(),
+                authenticator_attachment: String::new(),
+                transports: String::new(),
                 created_at: 1_000,
             }],
             reference_total: 1,

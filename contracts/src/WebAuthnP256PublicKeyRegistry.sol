@@ -98,11 +98,28 @@ contract WebAuthnP256PublicKeyRegistry {
     uint256 public constant UNCOMPRESSED_P256_KEY_LENGTH = 65; // 04 || x(32) || y(32)
     /// Opaque caller-defined bytes; the registry never reads them.
     uint256 public constant MAX_METADATA_LENGTH = 2048;
-    /// version(1) || AAGUID(16) || authData flags(1) || attachment(1) || transports(1)
+    /// The 20-byte versioned attestation, layout:
+    ///   version(1) || AAGUID(16) || authenticatorData flags(1) || reserved(2)
+    /// All of it is derived from the WebAuthn attestation object's authData
+    /// and interpretable by the standard: the AAGUID identifies the
+    /// authenticator model (FIDO Metadata Service), the flags byte carries the
+    /// UP/UV/BE/BS/AT/ED bits. The two reserved bytes are 0x0000. Note that
+    /// authenticatorAttachment and transports are NOT authData fields (they
+    /// come from the PublicKeyCredential response), so they are deliberately
+    /// not packed here — a lossy single-byte encoding of them would be
+    /// Vela-specific and not standard-interpretable.
     uint256 public constant ATTESTATION_LENGTH = 20;
     uint8 public constant ATTESTATION_VERSION = 1;
     /// Upper bound on the stored WebAuthn credential id (spec max is 1023).
     uint256 public constant MAX_CREDENTIAL_ID_LENGTH = 1023;
+    /// Upper bounds on the stored PublicKeyCredential response hints. These
+    /// come from the browser (authenticatorAttachment string, transports
+    /// array), not from authData, so they are store-only display metadata —
+    /// captured at first sight and never contested. Attachment holds a short
+    /// token ("platform" / "cross-platform"); transports holds the transport
+    /// tokens joined however the writer chooses (e.g. "hybrid,internal").
+    uint256 public constant MAX_AUTHENTICATOR_ATTACHMENT_LENGTH = 32;
+    uint256 public constant MAX_TRANSPORTS_LENGTH = 255;
     /// Member passkeys per group (the group key is on top of these).
     uint256 public constant MAX_MEMBERS = 7;
 
@@ -120,6 +137,11 @@ contract WebAuthnP256PublicKeyRegistry {
         /// writer at first sight. Stored for local lookup and display; it is
         /// NOT part of the signed content (a local handle, not authority).
         bytes credentialId;
+        /// PublicKeyCredential response hints (browser-reported, not authData,
+        /// not signed): the authenticatorAttachment token and the transports
+        /// list. Captured at first sight for display; first write wins.
+        bytes authenticatorAttachment;
+        bytes transports;
         uint256 createdAt;
     }
 
@@ -163,6 +185,10 @@ contract WebAuthnP256PublicKeyRegistry {
         bytes attestation;
         /// The WebAuthn credential id (stored on the entry, not signed).
         bytes credentialId;
+        /// PublicKeyCredential response hints (stored on the entry, not
+        /// signed): authenticatorAttachment token and transports list.
+        bytes authenticatorAttachment;
+        bytes transports;
         Proof proof;
     }
 
@@ -225,6 +251,8 @@ contract WebAuthnP256PublicKeyRegistry {
     error InvalidAttestation(uint256 length);
     error CredentialIdTooLong(uint256 length);
     error CredentialIdMismatch(uint256 entryId);
+    error AuthenticatorAttachmentTooLong(uint256 length);
+    error TransportsTooLong(uint256 length);
     error AttestationMismatch(uint256 entryId);
     error InvalidMemberCount(uint256 count);
     error DuplicateMemberKey(uint256 index);
@@ -461,7 +489,14 @@ contract WebAuthnP256PublicKeyRegistry {
     ) internal {
         (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
 
-        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation, member.credentialId);
+        uint256 entryId = _resolveEntry(
+            keyHash,
+            member.publicKey,
+            member.attestation,
+            member.credentialId,
+            member.authenticatorAttachment,
+            member.transports
+        );
         _isMemberLink[unitId][entryId] = true;
         _groupEntryIds[unitId].push(entryId);
         _entryUnitIds[entryId].push(unitId);
@@ -478,7 +513,9 @@ contract WebAuthnP256PublicKeyRegistry {
         bytes32 keyHash,
         bytes memory publicKey,
         bytes memory attestation,
-        bytes memory credentialId
+        bytes memory credentialId,
+        bytes memory authenticatorAttachment,
+        bytes memory transports
     ) internal returns (uint256 entryId) {
         uint256 plusOne = _entryIdPlusOneByKey[keyHash];
         if (plusOne != 0) {
@@ -489,11 +526,20 @@ contract WebAuthnP256PublicKeyRegistry {
             if (keccak256(_entries[entryId].credentialId) != keccak256(credentialId)) {
                 revert CredentialIdMismatch(entryId);
             }
+            // authenticatorAttachment / transports are display hints: the
+            // first write wins and later writes leave them untouched, so a
+            // browser that reports them differently never blocks a re-refer.
             return entryId;
         }
         _validateAttestation(attestation);
         if (credentialId.length > MAX_CREDENTIAL_ID_LENGTH) {
             revert CredentialIdTooLong(credentialId.length);
+        }
+        if (authenticatorAttachment.length > MAX_AUTHENTICATOR_ATTACHMENT_LENGTH) {
+            revert AuthenticatorAttachmentTooLong(authenticatorAttachment.length);
+        }
+        if (transports.length > MAX_TRANSPORTS_LENGTH) {
+            revert TransportsTooLong(transports.length);
         }
         entryId = _entries.length;
         _entries.push(
@@ -501,6 +547,8 @@ contract WebAuthnP256PublicKeyRegistry {
                 publicKey: publicKey,
                 attestation: attestation,
                 credentialId: credentialId,
+                authenticatorAttachment: authenticatorAttachment,
+                transports: transports,
                 createdAt: block.timestamp
             })
         );
@@ -534,7 +582,14 @@ contract WebAuthnP256PublicKeyRegistry {
         bytes32 keyHash = keccak256(member.publicKey);
         if (keyHash == groupKeyHash) revert DuplicateMemberKey(0);
         (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
-        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation, member.credentialId);
+        uint256 entryId = _resolveEntry(
+            keyHash,
+            member.publicKey,
+            member.attestation,
+            member.credentialId,
+            member.authenticatorAttachment,
+            member.transports
+        );
         uint256 linkPlusOne = _referenceIdPlusOneByLink[unitId][entryId];
         if (linkPlusOne != 0) revert AlreadyReferenced(linkPlusOne - 1);
 

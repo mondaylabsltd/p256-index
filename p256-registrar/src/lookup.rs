@@ -31,6 +31,13 @@ pub struct Entry {
     pub entry_id: u64,
     pub public_key: String,
     pub attestation: String,
+    /// The WebAuthn credential id (hex), stored on the entry.
+    pub credential_id: String,
+    /// Browser-reported display hints (UTF-8 tokens), stored on the entry:
+    /// authenticatorAttachment ("platform" / "cross-platform") and the
+    /// transports list (e.g. "hybrid,internal").
+    pub authenticator_attachment: String,
+    pub transports: String,
     pub created_at: u64,
 }
 
@@ -96,6 +103,9 @@ pub fn task_status_body(task: &RegisterTask) -> Value {
         "members": task.members.iter().map(|member| json!({
             "publicKey": member.public_key,
             "attestation": member.attestation,
+            "credentialId": member.credential_id,
+            "authenticatorAttachment": member.authenticator_attachment,
+            "transports": member.transports,
         })).collect::<Vec<_>>(),
         "txHash": task.tx_hash,
         "onChainId": task.on_chain_id,
@@ -989,6 +999,9 @@ mod tests {
             members: vec![Member {
                 public_key: KEY.into(),
                 attestation: String::new(),
+                credential_id: String::new(),
+                authenticator_attachment: String::new(),
+                transports: String::new(),
                 proof: Proof {
                     authenticator_data: String::new(),
                     client_data_json: String::new(),

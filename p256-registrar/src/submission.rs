@@ -557,6 +557,9 @@ mod tests {
             members: vec![Member {
                 public_key: PK.into(),
                 attestation: String::new(),
+                credential_id: String::new(),
+                authenticator_attachment: String::new(),
+                transports: String::new(),
                 proof: Proof {
                     authenticator_data: "00".repeat(37),
                     client_data_json: "{}".into(),

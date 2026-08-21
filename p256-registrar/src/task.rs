@@ -47,6 +47,17 @@ pub struct Member {
     /// Empty, or 20 versioned bytes of registration-time WebAuthn signals.
     #[serde(default)]
     pub attestation: String,
+    /// The WebAuthn credential id (hex), stored on the entry. Not signed.
+    #[serde(default)]
+    pub credential_id: String,
+    /// PublicKeyCredential response hints (browser-reported, not signed),
+    /// stored on the entry for display. Opaque UTF-8 tokens: the
+    /// authenticatorAttachment ("platform" / "cross-platform") and the
+    /// transports list joined however the writer chooses (e.g. "hybrid,internal").
+    #[serde(default)]
+    pub authenticator_attachment: String,
+    #[serde(default)]
+    pub transports: String,
     pub proof: Proof,
 }
 

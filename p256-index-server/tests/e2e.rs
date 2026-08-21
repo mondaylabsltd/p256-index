@@ -248,6 +248,9 @@ fn signed_unit(rp_id: &str, metadata_hex: &str) -> (Value, String) {
         members: vec![p256_registrar::task::Member {
             public_key: member_public.clone(),
             attestation: String::new(),
+            credential_id: String::new(),
+            authenticator_attachment: String::new(),
+            transports: String::new(),
             proof: p256_registrar::task::Proof {
                 authenticator_data: String::new(),
                 client_data_json: String::new(),

@@ -86,7 +86,7 @@ contract GasProfileTest is Test {
             for (uint256 m = 0; m < n; m++) {
                 bytes32 binding = registry.memberBindingFor(gpub, "");
                 members[m] = WebAuthnP256PublicKeyRegistry.Member(
-                    PUBS[m], "", "", _proofOver(PRIVS[m], registry.challengeFor("rp.example.com", PUBS[m], binding))
+                    PUBS[m], "", "", "", "", _proofOver(PRIVS[m], registry.challengeFor("rp.example.com", PUBS[m], binding))
                 );
             }
             bytes32 contentHash = registry.contentHashFor("rp.example.com", metadata, gpub, members);
@@ -108,7 +108,7 @@ contract GasProfileTest is Test {
         {
             bytes32 binding = registry.referenceBindingFor(GPUB, "", hex"cafe");
             referrer = WebAuthnP256PublicKeyRegistry.Member(
-                PUBS[0], "", "", _proofOver(PRIVS[0], registry.challengeFor("rp.example.com", PUBS[0], binding))
+                PUBS[0], "", "", "", "", _proofOver(PRIVS[0], registry.challengeFor("rp.example.com", PUBS[0], binding))
             );
         }
         uint256 beforeRefer = gasleft();

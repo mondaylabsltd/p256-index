@@ -128,6 +128,9 @@ fn register_task(
                 Member {
                     public_key: key.public_hex.clone(),
                     attestation: (*attestation).to_owned(),
+                    credential_id: String::new(),
+                    authenticator_attachment: String::new(),
+                    transports: String::new(),
                     proof: sign_proof(&key.signing, challenge, rp_id),
                 }
             })
@@ -176,6 +179,9 @@ fn refer_task(
         members: vec![Member {
             public_key: referrer.public_hex.clone(),
             attestation: attestation.to_owned(),
+            credential_id: String::new(),
+            authenticator_attachment: String::new(),
+            transports: String::new(),
             proof: sign_proof(&referrer.signing, challenge, group_rp_id),
         }],
         tx_hash: None,

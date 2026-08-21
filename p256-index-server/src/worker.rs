@@ -608,6 +608,9 @@ mod e2e_chain_tests {
             members: vec![Member {
                 public_key: public_key.clone(),
                 attestation: String::new(),
+                credential_id: String::new(),
+                authenticator_attachment: String::new(),
+                transports: String::new(),
                 proof: sign_proof(&member_signing, member_challenge, &rp_id),
             }],
             tx_hash: None,

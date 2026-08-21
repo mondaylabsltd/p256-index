@@ -61,6 +61,9 @@ pub struct ProofRequest {
 pub struct MemberRequest {
     pub public_key: Option<String>,
     pub attestation: Option<String>,
+    pub credential_id: Option<String>,
+    pub authenticator_attachment: Option<String>,
+    pub transports: Option<String>,
     pub proof: Option<ProofRequest>,
 }
 
@@ -753,13 +756,51 @@ fn parse_member(member: MemberRequest) -> Result<Member, String> {
 
     let attestation = validate_attestation_hex(&member.attestation.unwrap_or_default())?;
 
+    let credential_id = normalize_credential_id(&member.credential_id.unwrap_or_default())?;
+
+    let authenticator_attachment = normalize_hint(
+        &member.authenticator_attachment.unwrap_or_default(),
+        32,
+        "authenticatorAttachment",
+    )?;
+    let transports = normalize_hint(&member.transports.unwrap_or_default(), 255, "transports")?;
+
     let proof = parse_proof(member.proof)?;
 
     Ok(Member {
         public_key,
         attestation,
+        credential_id,
+        authenticator_attachment,
+        transports,
         proof,
     })
+}
+
+/// The credential id as stored: hex bytes, `0x`-normalized, bounded to the
+/// contract's 1023-byte cap. Empty is allowed.
+fn normalize_credential_id(value: &str) -> Result<String, String> {
+    let bytes =
+        parse_hex_bytes(value).map_err(|_| "credentialId must be a valid hex string".to_owned())?;
+    if bytes.len() > 1023 {
+        return Err("credentialId exceeds 1023 bytes".to_owned());
+    }
+    Ok(if bytes.is_empty() {
+        String::new()
+    } else {
+        format!("0x{}", hex::encode(&bytes))
+    })
+}
+
+/// A browser-reported display hint (authenticatorAttachment / transports):
+/// an opaque UTF-8 token, trimmed and bounded to the contract's byte cap so
+/// the calldata can never revert. Its truthfulness is the writer's claim.
+fn normalize_hint(value: &str, max_bytes: usize, field: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.len() > max_bytes {
+        return Err(format!("{field} exceeds {max_bytes} bytes"));
+    }
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -853,6 +894,9 @@ mod tests {
             members: vec![Member {
                 public_key: public,
                 attestation: String::new(),
+                credential_id: String::new(),
+                authenticator_attachment: String::new(),
+                transports: String::new(),
                 proof: Proof {
                     authenticator_data: String::new(),
                     client_data_json: String::new(),
@@ -888,6 +932,9 @@ mod tests {
         MemberRequest {
             public_key: Some(public),
             attestation: None,
+            credential_id: None,
+            authenticator_attachment: None,
+            transports: None,
             proof: Some(proof_over(&signing, challenge, rp_id)),
         }
     }
@@ -938,6 +985,9 @@ mod tests {
             member: Some(MemberRequest {
                 public_key: Some(public),
                 attestation: None,
+                credential_id: None,
+                authenticator_attachment: None,
+                transports: None,
                 proof: Some(proof_over(&signing, challenge, "example.com")),
             }),
         }
