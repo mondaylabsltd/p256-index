@@ -82,7 +82,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
     {
         bytes32 binding = registry.memberBindingFor(gpub, attestation);
         return WebAuthnP256PublicKeyRegistry.Member(
-            pubkey, attestation, _proofOver(priv, registry.challengeFor(rpId, pubkey, binding), rpId, 0x05)
+            pubkey, attestation, "", _proofOver(priv, registry.challengeFor(rpId, pubkey, binding), rpId, 0x05)
         );
     }
 
@@ -117,7 +117,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
     ) internal view returns (WebAuthnP256PublicKeyRegistry.Member memory) {
         bytes32 binding = registry.referenceBindingFor(gpub, attestation, metadata);
         return WebAuthnP256PublicKeyRegistry.Member(
-            pubkey, attestation, _proofOver(priv, registry.challengeFor(rpId, pubkey, binding), rpId, 0x05)
+            pubkey, attestation, "", _proofOver(priv, registry.challengeFor(rpId, pubkey, binding), rpId, 0x05)
         );
     }
 
@@ -136,7 +136,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", hex"aa", members);
 
         vm.expectEmit(true, true, false, true);
-        emit WebAuthnP256PublicKeyRegistry.EntryCreated(0, keccak256(PUB1), PUB1, ATTESTATION);
+        emit WebAuthnP256PublicKeyRegistry.EntryCreated(0, keccak256(PUB1), PUB1, ATTESTATION, "");
         vm.expectEmit(true, true, true, true);
         emit WebAuthnP256PublicKeyRegistry.MemberJoined(0, 0, keccak256(PUB1));
         vm.expectEmit(true, true, true, true);
@@ -284,7 +284,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
         bytes32 binding = registry.memberBindingFor(GPUB, "");
         members[0] = WebAuthnP256PublicKeyRegistry.Member(
-            PUB1, "", _proofOver(PRIV2, registry.challengeFor("rp1", PUB1, binding), "rp1", 0x05)
+            PUB1, "", "", _proofOver(PRIV2, registry.challengeFor("rp1", PUB1, binding), "rp1", 0x05)
         );
         WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
@@ -303,7 +303,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
         bytes32 binding = registry.memberBindingFor(GPUB, "");
         members[0] = WebAuthnP256PublicKeyRegistry.Member(
-            PUB1, "", _proofOver(PRIV1, registry.challengeFor("rp1", PUB1, binding), "rp1", 0x04)
+            PUB1, "", "", _proofOver(PRIV1, registry.challengeFor("rp1", PUB1, binding), "rp1", 0x04)
         );
         WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
@@ -319,7 +319,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         bytes32 digest = sha256(abi.encodePacked(authData, sha256(bytes(clientData))));
         (bytes32 r, bytes32 s) = vm.signP256(PRIV1, digest);
         members[0] = WebAuthnP256PublicKeyRegistry.Member(
-            PUB1, "", WebAuthnP256PublicKeyRegistry.Proof(authData, clientData, 26, 1, uint256(r), uint256(s))
+            PUB1, "", "", WebAuthnP256PublicKeyRegistry.Proof(authData, clientData, 26, 1, uint256(r), uint256(s))
         );
         WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
@@ -390,7 +390,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
 
         WebAuthnP256PublicKeyRegistry.Member[] memory eight = new WebAuthnP256PublicKeyRegistry.Member[](8);
         for (uint256 i = 0; i < 8; i++) {
-            eight[i] = WebAuthnP256PublicKeyRegistry.Member(PUB1, "", _emptyProof());
+            eight[i] = WebAuthnP256PublicKeyRegistry.Member(PUB1, "", "", _emptyProof());
         }
         vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.InvalidMemberCount.selector, 8));
         registry.register("rp1", "", GPUB, _emptyProof(), eight);
@@ -454,7 +454,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
 
     function test_attestationShape() public {
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
-        members[0] = WebAuthnP256PublicKeyRegistry.Member(PUB1, new bytes(19), _emptyProof());
+        members[0] = WebAuthnP256PublicKeyRegistry.Member(PUB1, new bytes(19), "", _emptyProof());
         WebAuthnP256PublicKeyRegistry.Proof memory gp1 = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.InvalidAttestation.selector, 19));
         registry.register("rp1", "", GPUB, gp1, members);
@@ -471,14 +471,14 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         WebAuthnP256PublicKeyRegistry.Proof memory dummy = _emptyProof();
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
 
-        members[0] = WebAuthnP256PublicKeyRegistry.Member(hex"0400", "", dummy);
+        members[0] = WebAuthnP256PublicKeyRegistry.Member(hex"0400", "", "", dummy);
         WebAuthnP256PublicKeyRegistry.Proof memory gp1 = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.InvalidPublicKeyLength.selector, 2));
         registry.register("rp1", "", GPUB, gp1, members);
 
         bytes memory badPrefix = PUB1;
         badPrefix[0] = 0x02;
-        members[0] = WebAuthnP256PublicKeyRegistry.Member(badPrefix, "", dummy);
+        members[0] = WebAuthnP256PublicKeyRegistry.Member(badPrefix, "", "", dummy);
         WebAuthnP256PublicKeyRegistry.Proof memory gp2 = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(
             abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.InvalidPublicKeyPrefix.selector, bytes1(0x02))
@@ -486,13 +486,13 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         registry.register("rp1", "", GPUB, gp2, members);
 
         bytes memory offCurve = bytes.concat(hex"04", bytes32(uint256(1)), bytes32(uint256(1)));
-        members[0] = WebAuthnP256PublicKeyRegistry.Member(offCurve, "", dummy);
+        members[0] = WebAuthnP256PublicKeyRegistry.Member(offCurve, "", "", dummy);
         WebAuthnP256PublicKeyRegistry.Proof memory gp3 = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidPublicKeyPoint.selector);
         registry.register("rp1", "", GPUB, gp3, members);
 
         bytes memory outOfField = bytes.concat(hex"04", bytes32(type(uint256).max), bytes32(uint256(1)));
-        members[0] = WebAuthnP256PublicKeyRegistry.Member(outOfField, "", dummy);
+        members[0] = WebAuthnP256PublicKeyRegistry.Member(outOfField, "", "", dummy);
         WebAuthnP256PublicKeyRegistry.Proof memory gp4 = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidPublicKeyCoordinate.selector);
         registry.register("rp1", "", GPUB, gp4, members);
@@ -632,7 +632,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
     /// are asserted in p256-registrar/src/protocol.rs.
     function test_pinnedVectors_matchIndependentEncoding() public view {
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
-        members[0] = WebAuthnP256PublicKeyRegistry.Member(PUB1, "", _emptyProof());
+        members[0] = WebAuthnP256PublicKeyRegistry.Member(PUB1, "", "", _emptyProof());
 
         assertEq(
             registry.memberBindingFor(GPUB, ""),
@@ -869,7 +869,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         WebAuthnP256PublicKeyRegistry.Member[] memory third = new WebAuthnP256PublicKeyRegistry.Member[](1);
         bytes32 binding = registry.memberBindingFor(PUB1, "");
         third[0] = WebAuthnP256PublicKeyRegistry.Member(
-            PUB2, "", _proofOver(PRIV2, registry.challengeFor("rp1", PUB2, binding), "rp1", 0x05)
+            PUB2, "", "", _proofOver(PRIV2, registry.challengeFor("rp1", PUB2, binding), "rp1", 0x05)
         );
         bytes32 contentHash = registry.contentHashFor("rp1", hex"03", PUB1, third);
         WebAuthnP256PublicKeyRegistry.Proof memory closer =

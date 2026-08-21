@@ -92,7 +92,7 @@ import {Base64Url} from "./Base64Url.sol";
 ///         Deployment requires a chain with the P256VERIFY precompile
 ///         (EIP-7951 / RIP-7212) at address 0x100.
 contract WebAuthnP256PublicKeyRegistry {
-    uint8 public constant VERSION = 10;
+    uint8 public constant VERSION = 11;
 
     uint256 public constant MAX_RPID_LENGTH = 253;
     uint256 public constant UNCOMPRESSED_P256_KEY_LENGTH = 65; // 04 || x(32) || y(32)
@@ -101,6 +101,8 @@ contract WebAuthnP256PublicKeyRegistry {
     /// version(1) || AAGUID(16) || authData flags(1) || attachment(1) || transports(1)
     uint256 public constant ATTESTATION_LENGTH = 20;
     uint8 public constant ATTESTATION_VERSION = 1;
+    /// Upper bound on the stored WebAuthn credential id (spec max is 1023).
+    uint256 public constant MAX_CREDENTIAL_ID_LENGTH = 1023;
     /// Member passkeys per group (the group key is on top of these).
     uint256 public constant MAX_MEMBERS = 7;
 
@@ -114,6 +116,10 @@ contract WebAuthnP256PublicKeyRegistry {
     struct Entry {
         bytes publicKey;
         bytes attestation;
+        /// The WebAuthn credential id, as supplied by the possession-proving
+        /// writer at first sight. Stored for local lookup and display; it is
+        /// NOT part of the signed content (a local handle, not authority).
+        bytes credentialId;
         uint256 createdAt;
     }
 
@@ -155,6 +161,8 @@ contract WebAuthnP256PublicKeyRegistry {
     struct Member {
         bytes publicKey;
         bytes attestation;
+        /// The WebAuthn credential id (stored on the entry, not signed).
+        bytes credentialId;
         Proof proof;
     }
 
@@ -185,7 +193,9 @@ contract WebAuthnP256PublicKeyRegistry {
     mapping(string => uint256) private _rpCreatedAt;
     mapping(string => uint256[]) private _unitIdsByRpId;
 
-    event EntryCreated(uint256 indexed entryId, bytes32 indexed keyHash, bytes publicKey, bytes attestation);
+    event EntryCreated(
+        uint256 indexed entryId, bytes32 indexed keyHash, bytes publicKey, bytes attestation, bytes credentialId
+    );
 
     event GroupCreated(
         uint256 indexed unitId,
@@ -213,6 +223,8 @@ contract WebAuthnP256PublicKeyRegistry {
     error InvalidPublicKeyPoint();
     error MetadataTooLong(uint256 length);
     error InvalidAttestation(uint256 length);
+    error CredentialIdTooLong(uint256 length);
+    error CredentialIdMismatch(uint256 entryId);
     error AttestationMismatch(uint256 entryId);
     error InvalidMemberCount(uint256 count);
     error DuplicateMemberKey(uint256 index);
@@ -449,7 +461,7 @@ contract WebAuthnP256PublicKeyRegistry {
     ) internal {
         (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
 
-        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation);
+        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation, member.credentialId);
         _isMemberLink[unitId][entryId] = true;
         _groupEntryIds[unitId].push(entryId);
         _entryUnitIds[entryId].push(unitId);
@@ -462,23 +474,38 @@ contract WebAuthnP256PublicKeyRegistry {
 
     /// @dev The key's global entry id — created on first sight (fixing the
     ///      attestation forever), matched against the file after.
-    function _resolveEntry(bytes32 keyHash, bytes memory publicKey, bytes memory attestation)
-        internal
-        returns (uint256 entryId)
-    {
+    function _resolveEntry(
+        bytes32 keyHash,
+        bytes memory publicKey,
+        bytes memory attestation,
+        bytes memory credentialId
+    ) internal returns (uint256 entryId) {
         uint256 plusOne = _entryIdPlusOneByKey[keyHash];
         if (plusOne != 0) {
             entryId = plusOne - 1;
             if (keccak256(_entries[entryId].attestation) != keccak256(attestation)) {
                 revert AttestationMismatch(entryId);
             }
+            if (keccak256(_entries[entryId].credentialId) != keccak256(credentialId)) {
+                revert CredentialIdMismatch(entryId);
+            }
             return entryId;
         }
         _validateAttestation(attestation);
+        if (credentialId.length > MAX_CREDENTIAL_ID_LENGTH) {
+            revert CredentialIdTooLong(credentialId.length);
+        }
         entryId = _entries.length;
-        _entries.push(Entry({publicKey: publicKey, attestation: attestation, createdAt: block.timestamp}));
+        _entries.push(
+            Entry({
+                publicKey: publicKey,
+                attestation: attestation,
+                credentialId: credentialId,
+                createdAt: block.timestamp
+            })
+        );
         _entryIdPlusOneByKey[keyHash] = entryId + 1;
-        emit EntryCreated(entryId, keyHash, publicKey, attestation);
+        emit EntryCreated(entryId, keyHash, publicKey, attestation, credentialId);
     }
 
     // ── Write 2: refer a passkey to a group ────────────────────────────────
@@ -507,7 +534,7 @@ contract WebAuthnP256PublicKeyRegistry {
         bytes32 keyHash = keccak256(member.publicKey);
         if (keyHash == groupKeyHash) revert DuplicateMemberKey(0);
         (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
-        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation);
+        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation, member.credentialId);
         uint256 linkPlusOne = _referenceIdPlusOneByLink[unitId][entryId];
         if (linkPlusOne != 0) revert AlreadyReferenced(linkPlusOne - 1);
 
