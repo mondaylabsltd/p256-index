@@ -35,7 +35,7 @@ use p256_index_server::{
     chain::{ChainError, ReadChain},
     config::Config,
     http::{AppState, router},
-    queue::{CreateQueue, STREAM_NAME, TOPIC_NAME},
+    queue::{CreateQueue, DEFAULT_STREAM_NAME, DEFAULT_TOPIC_NAME},
     store::RedisStore,
 };
 use p256_registrar::{
@@ -63,6 +63,8 @@ fn test_config(redis_url: &str, iggy_url: &str) -> Config {
         global_write_limit: 10_000,
         iggy_enqueue_timeout: Duration::from_secs(5),
         iggy_consumer_group: format!("e2e-{}", uuid::Uuid::new_v4()),
+        iggy_stream: DEFAULT_STREAM_NAME.into(),
+        iggy_topic: DEFAULT_TOPIC_NAME.into(),
         contract_address: REGISTRY.into(),
     }
 }
@@ -308,6 +310,8 @@ async fn http_contract_over_real_redis_and_iggy() {
     let queue = CreateQueue::connect(
         &config.iggy_url,
         &config.iggy_provisioner_url,
+        &config.iggy_stream,
+        &config.iggy_topic,
         config.iggy_enqueue_timeout,
     )
     .await
@@ -351,8 +355,8 @@ async fn http_contract_over_real_redis_and_iggy() {
     // The durable envelope is consumable from Iggy.
     let client = IggyClient::from_connection_string(&iggy_url).expect("iggy client");
     client.connect().await.expect("iggy connect");
-    let stream: Identifier = STREAM_NAME.try_into().unwrap();
-    let topic: Identifier = TOPIC_NAME.try_into().unwrap();
+    let stream: Identifier = DEFAULT_STREAM_NAME.try_into().unwrap();
+    let topic: Identifier = DEFAULT_TOPIC_NAME.try_into().unwrap();
     let consumer = Consumer::default();
     let mut found = false;
     let mut offset = 0u64;

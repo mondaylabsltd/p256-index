@@ -1134,6 +1134,8 @@ mod tests {
             global_write_limit: 10_000,
             iggy_enqueue_timeout: Duration::from_secs(1),
             iggy_consumer_group: "test".into(),
+            iggy_stream: "p256-index".into(),
+            iggy_topic: "create".into(),
             contract_address: "0x1111111111111111111111111111111111111111".into(),
         }
     }

@@ -27,6 +27,8 @@ async fn main() -> Result<()> {
     let queue = CreateQueue::connect(
         &config.iggy_url,
         &config.iggy_provisioner_url,
+        &config.iggy_stream,
+        &config.iggy_topic,
         config.iggy_enqueue_timeout,
     )
     .await?;
@@ -108,6 +110,8 @@ fn start_worker_if_enabled(
         chain,
         config.iggy_consumer_url.clone(),
         config.iggy_consumer_group.clone(),
+        config.iggy_stream.clone(),
+        config.iggy_topic.clone(),
     ))
 }
 

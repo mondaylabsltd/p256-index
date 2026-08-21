@@ -8,8 +8,8 @@ use iggy::prelude::{
 
 use p256_registrar::task::RegisterTask;
 
-pub const STREAM_NAME: &str = "p256-index";
-pub const TOPIC_NAME: &str = "create";
+pub const DEFAULT_STREAM_NAME: &str = "p256-index";
+pub const DEFAULT_TOPIC_NAME: &str = "create";
 pub const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -18,6 +18,8 @@ pub struct CreateQueue {
     client: Arc<IggyClient>,
     provisioner: Arc<IggyClient>,
     provision_lock: Arc<tokio::sync::Mutex<()>>,
+    stream_name: String,
+    topic_name: String,
     stream: Identifier,
     topic: Identifier,
     enqueue_timeout: Duration,
@@ -43,6 +45,8 @@ impl CreateQueue {
     pub async fn connect(
         producer_url: &str,
         provisioner_url: &str,
+        stream_name: &str,
+        topic_name: &str,
         enqueue_timeout: Duration,
     ) -> Result<Self, QueueError> {
         let client = IggyClient::from_connection_string(producer_url)
@@ -63,12 +67,14 @@ impl CreateQueue {
             client: Arc::new(client),
             provisioner: Arc::new(provisioner),
             provision_lock: Arc::new(tokio::sync::Mutex::new(())),
-            stream: STREAM_NAME
+            stream: stream_name
                 .try_into()
                 .map_err(|_| QueueError("invalid Iggy stream name"))?,
-            topic: TOPIC_NAME
+            topic: topic_name
                 .try_into()
                 .map_err(|_| QueueError("invalid Iggy topic name"))?,
+            stream_name: stream_name.to_owned(),
+            topic_name: topic_name.to_owned(),
             enqueue_timeout,
         })
     }
@@ -135,7 +141,12 @@ impl CreateQueue {
     }
 
     async fn create_stream_if_missing(&self) -> Result<(), QueueError> {
-        if self.provisioner.create_stream(STREAM_NAME).await.is_ok() {
+        if self
+            .provisioner
+            .create_stream(&self.stream_name)
+            .await
+            .is_ok()
+        {
             return Ok(());
         }
         if self
@@ -156,7 +167,7 @@ impl CreateQueue {
             .provisioner
             .create_topic(
                 &self.stream,
-                TOPIC_NAME,
+                &self.topic_name,
                 1,
                 CompressionAlgorithm::None,
                 None,
@@ -192,15 +203,21 @@ impl RegisterTaskQueue for CreateQueue {
 mod tests {
     use std::{env, time::Duration};
 
-    use super::CreateQueue;
+    use super::{CreateQueue, DEFAULT_STREAM_NAME, DEFAULT_TOPIC_NAME};
 
     #[tokio::test]
     #[ignore = "requires P256_INDEX_TEST_IGGY_URL"]
     async fn authenticates_to_the_configured_iggy_endpoint() {
         let url = env::var("P256_INDEX_TEST_IGGY_URL")
             .expect("P256_INDEX_TEST_IGGY_URL is required for this integration test");
-        CreateQueue::connect(&url, &url, Duration::from_secs(5))
-            .await
-            .expect("Iggy producer and provisioner connection");
+        CreateQueue::connect(
+            &url,
+            &url,
+            DEFAULT_STREAM_NAME,
+            DEFAULT_TOPIC_NAME,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Iggy producer and provisioner connection");
     }
 }

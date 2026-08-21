@@ -2,6 +2,8 @@ use std::{env, net::SocketAddr, time::Duration};
 
 use anyhow::{Result, bail};
 
+use crate::queue::{DEFAULT_STREAM_NAME, DEFAULT_TOPIC_NAME};
+
 pub const DEFAULT_PORT: u16 = 11256;
 
 #[derive(Clone)]
@@ -22,6 +24,10 @@ pub struct Config {
     pub max_gas_price_wei: u128,
     pub iggy_enqueue_timeout: Duration,
     pub iggy_consumer_group: String,
+    /// Iggy stream this deployment owns. Multiple applications sharing one
+    /// Iggy server are isolated by stream name, not by connection URL.
+    pub iggy_stream: String,
+    pub iggy_topic: String,
     /// The deployed registry address (P256_INDEX_CONTRACT_ADDRESS). Always
     /// required — the service is meaningless without a registry to read.
     pub contract_address: String,
@@ -86,6 +92,10 @@ impl Config {
             ),
             iggy_consumer_group: optional("P256_INDEX_IGGY_CONSUMER_GROUP")
                 .unwrap_or_else(|| "p256-index-server-v1".into()),
+            iggy_stream: optional("P256_INDEX_IGGY_STREAM")
+                .unwrap_or_else(|| DEFAULT_STREAM_NAME.into()),
+            iggy_topic: optional("P256_INDEX_IGGY_TOPIC")
+                .unwrap_or_else(|| DEFAULT_TOPIC_NAME.into()),
         })
     }
 }

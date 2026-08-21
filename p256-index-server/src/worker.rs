@@ -28,7 +28,6 @@ use p256_registrar::{
 
 use crate::{
     chain::{Broadcast, Chain, ReceiptOutcome, WalletRole},
-    queue::{STREAM_NAME, TOPIC_NAME},
     store::RedisStore,
 };
 
@@ -58,6 +57,8 @@ pub struct CreateWorker {
     chain: Chain,
     consumer_url: String,
     consumer_group: String,
+    stream_name: String,
+    topic_name: String,
     nonces: Arc<NonceManager>,
 }
 
@@ -71,6 +72,8 @@ impl CreateWorker {
         chain: Chain,
         consumer_url: String,
         consumer_group: String,
+        stream_name: String,
+        topic_name: String,
     ) -> WorkerHandle {
         let shutdown = CancellationToken::new();
         let worker = Self {
@@ -78,6 +81,8 @@ impl CreateWorker {
             chain,
             consumer_url,
             consumer_group,
+            stream_name,
+            topic_name,
             nonces: Arc::new(NonceManager {
                 value: Mutex::new(None),
             }),
@@ -101,10 +106,14 @@ impl CreateWorker {
             .map_err(|_| WorkerError::new("Iggy consumer connection timed out"))?
             .map_err(|_| WorkerError::new("could not connect Iggy consumer"))?;
 
-        let stream: Identifier = STREAM_NAME
+        let stream: Identifier = self
+            .stream_name
+            .as_str()
             .try_into()
             .map_err(|_| WorkerError::new("invalid Iggy stream name"))?;
-        let topic: Identifier = TOPIC_NAME
+        let topic: Identifier = self
+            .topic_name
+            .as_str()
             .try_into()
             .map_err(|_| WorkerError::new("invalid Iggy topic name"))?;
         let group: Identifier = self
@@ -120,7 +129,7 @@ impl CreateWorker {
 
         let consumer = Consumer::group(group.clone());
         let polling = PollingStrategy::next();
-        tracing::info!(stream = STREAM_NAME, topic = TOPIC_NAME, group = %self.consumer_group, "Iggy create worker started");
+        tracing::info!(stream = %self.stream_name, topic = %self.topic_name, group = %self.consumer_group, "Iggy create worker started");
 
         // Consecutive transient batch failures drive an exponential re-poll backoff so a chain/RPC
         // outage is not hammered every 2s. Clamped to 60s: the poll loop is the whole queue's
@@ -637,6 +646,8 @@ mod e2e_chain_tests {
             chain: chain.clone(),
             consumer_url: String::new(),
             consumer_group: String::new(),
+            stream_name: String::new(),
+            topic_name: String::new(),
             nonces: Arc::new(NonceManager {
                 value: Mutex::new(None),
             }),
