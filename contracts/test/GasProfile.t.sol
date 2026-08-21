@@ -74,30 +74,45 @@ contract GasProfileTest is Test {
 
     function test_gasProfile_register() public {
         uint256[4] memory sizes = [uint256(1), 3, 5, 7];
+        // Group keys are single-use: one fresh group per size (a key used
+        // as a group elsewhere may still be a member here).
+        uint256[4] memory gprivs = [PRIVS[4], PRIVS[5], PRIVS[6], GPRIV];
         for (uint256 i = 0; i < sizes.length; i++) {
             uint256 n = sizes[i];
-            // Distinct metadata per unit so content dedup never trips;
-            // Vela-sized payload (~487B for a 7-key derivation preimage).
+            bytes memory gpub = i == 3 ? GPUB : PUBS[4 + i];
+            // Distinct metadata per unit; Vela-sized payload (~487B).
             bytes memory metadata = abi.encodePacked(uint256(i), new bytes(480));
             WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](n);
             for (uint256 m = 0; m < n; m++) {
-                bytes32 binding = registry.memberBindingFor(GPUB, "");
+                bytes32 binding = registry.memberBindingFor(gpub, "");
                 members[m] = WebAuthnP256PublicKeyRegistry.Member(
                     PUBS[m], "", _proofOver(PRIVS[m], registry.challengeFor("rp.example.com", PUBS[m], binding))
                 );
             }
-            bytes32 contentHash = registry.contentHashFor("rp.example.com", metadata, GPUB, members);
+            bytes32 contentHash = registry.contentHashFor("rp.example.com", metadata, gpub, members);
             WebAuthnP256PublicKeyRegistry.Proof memory groupProof =
-                _proofOver(GPRIV, registry.challengeFor("rp.example.com", GPUB, contentHash));
+                _proofOver(gprivs[i], registry.challengeFor("rp.example.com", gpub, contentHash));
             bytes memory callData = abi.encodeCall(
-                WebAuthnP256PublicKeyRegistry.register, ("rp.example.com", metadata, GPUB, groupProof, members)
+                WebAuthnP256PublicKeyRegistry.register, ("rp.example.com", metadata, gpub, groupProof, members)
             );
             uint256 before = gasleft();
-            registry.register("rp.example.com", metadata, GPUB, groupProof, members);
+            registry.register("rp.example.com", metadata, gpub, groupProof, members);
             uint256 execGas = before - gasleft();
             console2.log("members:", n);
             console2.log("  exec gas (mock verifier):", execGas);
             console2.log("  approx full tx gas:", 21_000 + callData.length * 16 + execGas);
         }
+
+        // One reference on top of the last group.
+        WebAuthnP256PublicKeyRegistry.Member memory referrer;
+        {
+            bytes32 binding = registry.referenceBindingFor(GPUB, "", hex"cafe");
+            referrer = WebAuthnP256PublicKeyRegistry.Member(
+                PUBS[0], "", _proofOver(PRIVS[0], registry.challengeFor("rp.example.com", PUBS[0], binding))
+            );
+        }
+        uint256 beforeRefer = gasleft();
+        registry.refer(GPUB, hex"cafe", referrer);
+        console2.log("refer exec gas (mock verifier):", beforeRefer - gasleft());
     }
 }

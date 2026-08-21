@@ -6,82 +6,93 @@ import {Base64Url} from "./Base64Url.sol";
 /// @title WebAuthnP256PublicKeyRegistry
 /// @author Built by Vela Wallet (https://getvela.app)
 /// @notice A neutral, permissionless, append-only registry of P-256 passkey
-///         public keys. Anyone may store data about keys THEY HOLD; what the
-///         keys are for — deriving a wallet, assembling an identity,
-///         anything else — is entirely the storer's business, carried in the
-///         unit's opaque `metadata`.
+///         public keys, organised as three plain tables and TWO write
+///         operations:
 ///
-///         A registration UNIT is one GROUP KEY plus 1..7 member passkeys
-///         sharing one rpId and one metadata payload, appended atomically
-///         in ONE transaction. The group key is a client-held P-256 key
-///         (typically generated per enrollment and discarded after); every
-///         unit has exactly one, whether it carries one passkey or seven.
-///         Each signer proves possession with a WebAuthn-formatted P-256
-///         assertion over its storage-authorization challenge
+///         - ENTRY — the global file of one passkey: exactly one row per
+///           public key, ever. Created the first time the key appears; its
+///           attestation is fixed there, signed by the key itself,
+///           immutable after.
+///         - UNIT (group), written by `register` — one row per group key,
+///           ever. Its whole content (rpId, opaque metadata, the group key
+///           and the member set, digested as contentHash) is FROZEN at
+///           creation: a group's members can never change. What a group
+///           means — a wallet, an identity, anything — is entirely the
+///           storer's business, carried in the opaque `metadata`.
+///         - REFERENCE, written by `refer` — one passkey pointing at one
+///           existing group, in its own table with its own counters,
+///           never mixed with groups. A reference is DISCOVERY data, not
+///           authority: it lets a later-added device find its group, and
+///           it never touches the group's frozen record or indexes.
+///           Whether a referenced key means anything is the reader's
+///           schema's decision (e.g. against the wallet layer's own owner
+///           set).
+///
+///         Every signature is a WebAuthn-formatted P-256 assertion over a
+///         storage-authorization challenge
 ///
 ///           keccak256(abi.encode(
 ///               block.chainid, address(registry), rpId,
 ///               signer.publicKey, binding))
 ///
 ///         verified on-chain via the EIP-7951 / RIP-7212 P256VERIFIER
-///         precompile at 0x100 — where `binding` depends on the signer's
+///         precompile at 0x100, where `binding` depends on the signer's
 ///         role:
 ///
-///         - the GROUP KEY binds the unit's contentHash, covering the rpId,
-///           the metadata, the group key itself and every member's
-///           (publicKey, attestation). It vouches for the whole unit, so it
-///           signs after the content is final — silently, since it is a
-///           software key, never a ceremony;
-///         - each MEMBER passkey binds memberBindingFor(groupPublicKey,
-///           ownAttestation): it signs the moment it is created, knowing
-///           only the group key and its own stored fields — independent of
-///           every other member and of the metadata.
+///         - the GROUP KEY (a client-held software key, generated for the
+///           one register call and discarded after — group keys are
+///           single-use) binds the group's contentHash, vouching for the
+///           whole frozen record, silently, never a ceremony;
+///         - a MEMBER passkey binds memberBindingFor(groupPublicKey,
+///           ownAttestation) — signable the moment the key is created,
+///           independent of the metadata and of every other member;
+///         - a REFERRING passkey binds referenceBindingFor(groupPublicKey,
+///           ownAttestation, referenceMetadata) — also signable the moment
+///           the key is created.
 ///
-///         Together the signatures cover every byte: altering the metadata
-///         or the member set invalidates the group signature; altering a
-///         member's attestation invalidates that member; re-pairing a
-///         member with a different group invalidates it; and reusing
-///         proofs under the same group requires a fresh group signature
-///         only the group key's holder can produce. Nothing is consumable
-///         and nothing can be front-run: replaying a mined unit's public
-///         proofs can only recreate the identical unit, which the
-///         content-hash dedup rejects. Registration is idempotent, proofs
-///         never need to be re-collected, and a mempool observer can do
-///         nothing but pay the submitter's gas.
+///         Every byte is signature-covered, so nothing is consumable and
+///         nothing can be front-run: altering any field invalidates its
+///         signature, and replaying a mined call can only recreate state
+///         that already exists (group keys are single-use, memberships and
+///         references are unique per pair). Nobody can create an entry, a
+///         membership or a reference for a key they do not hold.
 ///
 ///         Nothing else is exclusive or interpreted:
-///         - a passkey may appear in any number of units, and a group key
-///           may index any number of units (readers get lists and filter by
-///           their own schema);
-///         - `metadata` (≤2048 bytes) is opaque: credential ids, display
-///           names, wallet derivation preimages, group semantics — all
-///           caller-defined;
-///         - `attestation` per member (when present) is shape-checked: 20
-///           versioned bytes of registration-time WebAuthn signals (AAGUID,
-///           authData flags, attachment, transports); truthfulness is the
-///           storer's claim;
+///         - a passkey ENTRY is global and reusable: the same key may be a
+///           member of any number of groups and hold any number of
+///           references, yet is always one row — getTotalEntries() IS the
+///           passkey count, getTotalUnits() IS the group count,
+///           getTotalReferences() IS the reference count, three
+///           independent tables;
+///         - `metadata` (≤2048 bytes, on groups and on references) is
+///           opaque; `attestation` (empty or 20 versioned bytes of
+///           registration-time WebAuthn signals) is shape-checked, its
+///           truthfulness the storer's claim;
 ///         - rpId is checked against every proof's authenticatorData
-///           rpIdHash;
-///         - identical unit content registers once, and the group key and
-///           member keys within a unit are pairwise distinct: no
-///           duplicates, and replay is inert by construction.
+///           rpIdHash, but synthetic (non-WebAuthn) signers choose their
+///           own rpId — treat rpId aggregates as cosmetic. Likewise,
+///           anyone holding any key can refer it to any group, so a
+///           group's incoming-reference list is cosmetic too; the
+///           authenticated directions are per-key;
+///         - key ROLES are separate namespaces, distinct only within one
+///           call: a used group key may later hold an entry (by joining
+///           another group as a member, or referring), and an
+///           entry-holding key may open a group as its group key. The
+///           structural counters are unaffected — entries stay unique per
+///           key, groups unique per group key.
 ///
-///         Readers locate data by public key: recover candidate keys from a
-///         live assertion signature (one signature yields two; only a held
-///         key can have entries, so at most one candidate's bucket is
-///         non-empty), then read that bucket. Units are also indexed by
-///         their group key (getUnitIdsByGroupKey). Entry and unit ids are
-///         sequential and immutable — remember them for O(1) reads. A
-///         unit's STABLE identity, computable offline before submission, is
-///         its content hash (contentHashFor / getUnitIdByContentHash);
-///         derive from that, never from the sequential unitId, which is
-///         assigned only at mining time and can be shifted by concurrent
-///         registrations.
+///         Readers locate data by public key: recover candidate keys from
+///         a live assertion signature (one signature yields two; only a
+///         held key can have an entry, so at most one candidate resolves),
+///         then getEntryByKey → getGroupsOfKey / getReferencesOfKey →
+///         getUnit. Entry, unit and reference ids are sequential and
+///         immutable; a group's stable identity is its group public key
+///         (equivalently its contentHash), never the sequential unitId.
 ///
 ///         Deployment requires a chain with the P256VERIFY precompile
 ///         (EIP-7951 / RIP-7212) at address 0x100.
 contract WebAuthnP256PublicKeyRegistry {
-    uint8 public constant VERSION = 8;
+    uint8 public constant VERSION = 10;
 
     uint256 public constant MAX_RPID_LENGTH = 253;
     uint256 public constant UNCOMPRESSED_P256_KEY_LENGTH = 65; // 04 || x(32) || y(32)
@@ -90,7 +101,7 @@ contract WebAuthnP256PublicKeyRegistry {
     /// version(1) || AAGUID(16) || authData flags(1) || attachment(1) || transports(1)
     uint256 public constant ATTESTATION_LENGTH = 20;
     uint8 public constant ATTESTATION_VERSION = 1;
-    /// Member passkeys per unit (the group key is on top of these).
+    /// Member passkeys per group (the group key is on top of these).
     uint256 public constant MAX_MEMBERS = 7;
 
     /// EIP-7951 / RIP-7212 secp256r1 signature verification precompile.
@@ -99,34 +110,30 @@ contract WebAuthnP256PublicKeyRegistry {
     uint256 private constant _P256_P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff;
     uint256 private constant _P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b;
 
-    /// One registration unit: the shared payload of its member entries.
+    /// The global file of one passkey: one row per public key, ever.
+    struct Entry {
+        bytes publicKey;
+        bytes attestation;
+        uint256 createdAt;
+    }
+
+    /// One group: frozen at creation, never modified.
     struct Unit {
         string rpId;
         bytes metadata;
         bytes groupPublicKey;
-        uint64 firstEntryId;
+        /// keccak over (rpId, metadata, groupPublicKey, member hashes) —
+        /// the group's stable, offline-computable identity.
+        bytes32 contentHash;
         uint32 memberCount;
         uint256 createdAt;
     }
 
-    /// One stored entry: a member passkey within a unit.
-    struct Entry {
-        uint256 unitId;
-        bytes publicKey;
-        bytes attestation;
-    }
-
-    /// An entry joined with its unit, as returned by every read.
-    struct EntryView {
+    /// One passkey pointing at one group: discovery data in its own table.
+    struct Reference {
         uint256 entryId;
         uint256 unitId;
-        bytes publicKey;
-        bytes attestation;
-        string rpId;
         bytes metadata;
-        bytes groupPublicKey;
-        uint64 firstEntryId;
-        uint32 memberCount;
         uint256 createdAt;
     }
 
@@ -144,41 +151,58 @@ contract WebAuthnP256PublicKeyRegistry {
         uint256 s;
     }
 
-    /// One member passkey of a registration unit.
+    /// One member passkey of a group.
     struct Member {
         bytes publicKey;
         bytes attestation;
         Proof proof;
     }
 
-    Unit[] private _units;
     Entry[] private _entries;
+    Unit[] private _units;
+    Reference[] private _references;
 
-    // Indexes: entry ids per member key and per rpId; unit ids per group key.
-    mapping(bytes32 => uint256[]) private _entriesByKey;
-    mapping(string => uint256[]) private _entriesByRpId;
-    mapping(bytes32 => uint256[]) private _unitsByGroupKey;
-
-    /// Registered unit content, contentHash => unitId + 1 (0 = absent):
-    /// identical unit content registers once, and the content hash doubles
-    /// as the unit's stable, offline-computable identity.
+    // Single-valued identity indexes (value = id + 1; 0 = absent).
+    mapping(bytes32 => uint256) private _entryIdPlusOneByKey;
+    mapping(bytes32 => uint256) private _unitIdPlusOneByGroupKey;
     mapping(bytes32 => uint256) private _unitIdPlusOneByContent;
 
-    // Enumeration support.
+    // The membership relation, written once per group at register time,
+    // indexed both ways, plus an O(1) existence check.
+    mapping(uint256 => uint256[]) private _groupEntryIds;
+    mapping(uint256 => uint256[]) private _entryUnitIds;
+    mapping(uint256 => mapping(uint256 => bool)) private _isMemberLink;
+
+    // The reference relation: its own table and indexes, never mixed with
+    // groups or memberships. One reference per (group, key) pair; the link
+    // mapping stores referenceId + 1 (0 = absent).
+    mapping(uint256 => uint256[]) private _referenceIdsByEntry;
+    mapping(uint256 => uint256[]) private _referenceIdsByUnit;
+    mapping(uint256 => mapping(uint256 => uint256)) private _referenceIdPlusOneByLink;
+
+    // rpId enumeration (cosmetic browse/stats: groups per rpId).
     string[] private _rpIds;
     mapping(string => uint256) private _rpCreatedAt;
+    mapping(string => uint256[]) private _unitIdsByRpId;
 
-    event UnitRegistered(
+    event EntryCreated(uint256 indexed entryId, bytes32 indexed keyHash, bytes publicKey, bytes attestation);
+
+    event GroupCreated(
         uint256 indexed unitId,
         bytes32 indexed rpIdHash,
         bytes32 indexed groupKeyHash,
-        uint256 firstEntryId,
-        uint256 memberCount,
-        bytes groupPublicKey
+        bytes groupPublicKey,
+        uint256 memberCount
     );
 
-    event EntryCreated(
-        uint256 indexed entryId, bytes32 indexed keyHash, uint256 indexed unitId, bytes publicKey, bytes attestation
+    event MemberJoined(uint256 indexed unitId, uint256 indexed entryId, bytes32 indexed keyHash);
+
+    event ReferenceCreated(
+        uint256 indexed referenceId,
+        uint256 indexed entryId,
+        uint256 indexed unitId,
+        bytes32 keyHash,
+        bytes32 groupKeyHash
     );
 
     error EmptyRpId();
@@ -189,24 +213,30 @@ contract WebAuthnP256PublicKeyRegistry {
     error InvalidPublicKeyPoint();
     error MetadataTooLong(uint256 length);
     error InvalidAttestation(uint256 length);
+    error AttestationMismatch(uint256 entryId);
     error InvalidMemberCount(uint256 count);
     error DuplicateMemberKey(uint256 index);
+    error GroupKeyAlreadyUsed(bytes32 groupKeyHash);
+    error GroupNotFound(bytes32 groupKeyHash);
+    error AlreadyReferenced(uint256 referenceId);
     error InvalidProof();
     error RpIdMismatch();
-    error UnitAlreadyRegistered(bytes32 contentHash);
     error EntryNotFound(uint256 entryId);
     error UnitNotFound(uint256 unitId);
+    error ReferenceNotFound(uint256 referenceId);
 
     // ── Validation ─────────────────────────────────────────────────────────
 
-    function _validatePublicKey(bytes calldata publicKey) internal pure returns (uint256 x, uint256 y) {
+    function _validatePublicKey(bytes memory publicKey) internal pure returns (uint256 x, uint256 y) {
         if (publicKey.length != UNCOMPRESSED_P256_KEY_LENGTH) {
             revert InvalidPublicKeyLength(publicKey.length);
         }
         if (publicKey[0] != 0x04) revert InvalidPublicKeyPrefix(publicKey[0]);
 
-        x = uint256(bytes32(publicKey[1:33]));
-        y = uint256(bytes32(publicKey[33:65]));
+        assembly ("memory-safe") {
+            x := mload(add(publicKey, 33))
+            y := mload(add(publicKey, 65))
+        }
 
         if (x >= _P256_P || y >= _P256_P) revert InvalidPublicKeyCoordinate();
 
@@ -233,22 +263,21 @@ contract WebAuthnP256PublicKeyRegistry {
 
     /// @dev Empty (not recorded) or exactly 20 bytes starting with the
     ///      version byte. Content truthfulness is the storer's claim.
-    function _validateAttestation(bytes calldata attestation) internal pure {
+    function _validateAttestation(bytes memory attestation) internal pure {
         if (attestation.length == 0) return;
         if (attestation.length != ATTESTATION_LENGTH || uint8(attestation[0]) != ATTESTATION_VERSION) {
             revert InvalidAttestation(attestation.length);
         }
     }
 
-    // ── Possession proofs ──────────────────────────────────────────────────
+    // ── Challenges and digests ─────────────────────────────────────────────
 
     /// @notice The storage-authorization challenge one key signs: it binds
     ///         this chain, this registry, the rpId, the signer's own key
-    ///         and a role-dependent `binding` — the unit's contentHash
-    ///         (contentHashFor) for the group key, and
-    ///         memberBindingFor(groupKey, ownAttestation) for member
-    ///         passkeys, so members sign the moment their key exists.
-    function challengeFor(string calldata rpId, bytes calldata publicKey, bytes32 binding)
+    ///         and a role-dependent `binding` — the group's contentHash for
+    ///         the group key, memberBindingFor for a member passkey,
+    ///         referenceBindingFor for a referring passkey.
+    function challengeFor(string memory rpId, bytes memory publicKey, bytes32 binding)
         public
         view
         returns (bytes32)
@@ -257,10 +286,10 @@ contract WebAuthnP256PublicKeyRegistry {
     }
 
     /// @notice The binding a MEMBER passkey signs into its challenge: the
-    ///         unit's group key plus the member's own attestation — both
-    ///         known the moment the member's key is created, so no member
-    ///         ever waits on another.
-    function memberBindingFor(bytes calldata groupPublicKey, bytes calldata attestation)
+    ///         group key plus the member's own attestation — both known the
+    ///         moment the member's key is created, so no member ever waits
+    ///         on another.
+    function memberBindingFor(bytes memory groupPublicKey, bytes memory attestation)
         public
         pure
         returns (bytes32)
@@ -268,20 +297,19 @@ contract WebAuthnP256PublicKeyRegistry {
         return keccak256(abi.encode(groupPublicKey, attestation));
     }
 
-    /// @notice Whether identical unit content has already been registered.
-    function isContentRegistered(bytes32 contentHash) external view returns (bool) {
-        return _unitIdPlusOneByContent[contentHash] != 0;
+    /// @notice The binding a REFERRING passkey signs: the target group key
+    ///         plus the passkey's own attestation and the reference's
+    ///         opaque metadata — all known the moment the key is created.
+    function referenceBindingFor(bytes memory groupPublicKey, bytes memory attestation, bytes memory metadata)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(groupPublicKey, attestation, metadata));
     }
 
-    /// @notice Resolve a unit by its stable identity, the content hash.
-    function getUnitIdByContentHash(bytes32 contentHash) external view returns (bool exists, uint256 unitId) {
-        uint256 idPlusOne = _unitIdPlusOneByContent[contentHash];
-        if (idPlusOne == 0) return (false, 0);
-        return (true, idPlusOne - 1);
-    }
-
-    /// @notice The content hash used for duplicate suppression — the unit's
-    ///         stable identity, and what the group key signs.
+    /// @notice The group's frozen founding digest — its stable, offline-
+    ///         computable identity, and what the group key signs.
     function contentHashFor(
         string calldata rpId,
         bytes calldata metadata,
@@ -310,7 +338,7 @@ contract WebAuthnP256PublicKeyRegistry {
     ///        `"challenge":"<base64url(challenge)>"` at the given offsets;
     ///      - (r, s) verifies over sha256(authData || sha256(clientDataJSON))
     ///        under (x, y) via the P256VERIFY precompile.
-    function _verifyProof(Proof calldata proof, bytes32 challenge, string calldata rpId, uint256 x, uint256 y)
+    function _verifyProof(Proof calldata proof, bytes32 challenge, string memory rpId, uint256 x, uint256 y)
         internal
         view
     {
@@ -335,15 +363,13 @@ contract WebAuthnP256PublicKeyRegistry {
         }
     }
 
-    // ── Write ──────────────────────────────────────────────────────────────
+    // ── Write 1: register a group ──────────────────────────────────────────
 
-    /// @notice The one write entrypoint: append one unit — a group key plus
-    ///         1..7 member passkeys — atomically. The group key authorizes
-    ///         the whole unit (its assertion binds the contentHash); every
-    ///         member authorizes the storage of its own key under this
-    ///         group (binding the group key and its own attestation).
-    ///         Identical content registers only once, making resubmission
-    ///         idempotent.
+    /// @notice Create one group: its frozen record (rpId, metadata, group
+    ///         key, member set) plus one membership row per member. The
+    ///         group key must never have been used; brand-new passkeys get
+    ///         their global entry created on the way. Immutable after —
+    ///         there is deliberately no way to change a group's members.
     function register(
         string calldata rpId,
         bytes calldata metadata,
@@ -357,32 +383,32 @@ contract WebAuthnP256PublicKeyRegistry {
             revert InvalidMemberCount(members.length);
         }
 
-        bytes32 contentHash = contentHashFor(rpId, metadata, groupPublicKey, members);
-        if (_unitIdPlusOneByContent[contentHash] != 0) revert UnitAlreadyRegistered(contentHash);
+        bytes32 groupKeyHash = keccak256(groupPublicKey);
+        if (_unitIdPlusOneByGroupKey[groupKeyHash] != 0) revert GroupKeyAlreadyUsed(groupKeyHash);
 
+        bytes32 contentHash = contentHashFor(rpId, metadata, groupPublicKey, members);
         uint256 unitId = _units.length;
-        _unitIdPlusOneByContent[contentHash] = unitId + 1;
-        uint256 firstEntryId = _entries.length;
         _units.push(
             Unit({
                 rpId: rpId,
                 metadata: metadata,
                 groupPublicKey: groupPublicKey,
-                firstEntryId: uint64(firstEntryId),
+                contentHash: contentHash,
                 memberCount: uint32(members.length),
                 createdAt: block.timestamp
             })
         );
-        if (_entriesByRpId[rpId].length == 0) {
+        _unitIdPlusOneByGroupKey[groupKeyHash] = unitId + 1;
+        _unitIdPlusOneByContent[contentHash] = unitId + 1;
+        if (_unitIdsByRpId[rpId].length == 0) {
             _rpIds.push(rpId);
             _rpCreatedAt[rpId] = block.timestamp;
         }
+        _unitIdsByRpId[rpId].push(unitId);
 
-        bytes32 groupKeyHash = keccak256(groupPublicKey);
-        _unitsByGroupKey[groupKeyHash].push(unitId);
         _verifyGroup(rpId, groupPublicKey, groupProof, contentHash);
 
-        // First pass: the group key and all member keys pairwise distinct.
+        // Pairwise-distinct member keys, none equal to the group key.
         bytes32[] memory keyHashes = new bytes32[](members.length);
         for (uint256 i = 0; i < members.length; i++) {
             bytes32 keyHash = keccak256(members[i].publicKey);
@@ -392,31 +418,18 @@ contract WebAuthnP256PublicKeyRegistry {
             }
             keyHashes[i] = keyHash;
         }
-
-        // Second pass: verify each member's group-scoped possession proof
-        // and append the entry.
         for (uint256 i = 0; i < members.length; i++) {
-            Member calldata member = members[i];
-            (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
-            _validateAttestation(member.attestation);
-            bytes32 binding = memberBindingFor(groupPublicKey, member.attestation);
-            _verifyProof(member.proof, challengeFor(rpId, member.publicKey, binding), rpId, x, y);
-
-            uint256 entryId = _entries.length;
-            _entries.push(Entry({unitId: unitId, publicKey: member.publicKey, attestation: member.attestation}));
-            _entriesByKey[keyHashes[i]].push(entryId);
-            _entriesByRpId[rpId].push(entryId);
-
-            emit EntryCreated(entryId, keyHashes[i], unitId, member.publicKey, member.attestation);
+            _admitMember(unitId, rpId, groupPublicKey, keyHashes[i], members[i]);
         }
 
-        emit UnitRegistered(unitId, keccak256(bytes(rpId)), groupKeyHash, firstEntryId, members.length, groupPublicKey);
+        emit GroupCreated(unitId, keccak256(bytes(rpId)), groupKeyHash, groupPublicKey, members.length);
     }
 
-    /// @dev The group key's content-bound authorization for the whole unit.
+    /// @dev The group key's content-bound authorization for the frozen
+    ///      record.
     function _verifyGroup(
-        string calldata rpId,
-        bytes calldata groupPublicKey,
+        string memory rpId,
+        bytes memory groupPublicKey,
         Proof calldata groupProof,
         bytes32 contentHash
     ) internal view {
@@ -424,105 +437,313 @@ contract WebAuthnP256PublicKeyRegistry {
         _verifyProof(groupProof, challengeFor(rpId, groupPublicKey, contentHash), rpId, x, y);
     }
 
-    // ── Read ───────────────────────────────────────────────────────────────
+    /// @dev One member joining the group being registered: resolve or
+    ///      create its global entry, verify the group-scoped proof, link
+    ///      membership both ways.
+    function _admitMember(
+        uint256 unitId,
+        string memory rpId,
+        bytes calldata groupPublicKey,
+        bytes32 keyHash,
+        Member calldata member
+    ) internal {
+        (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
 
-    /// @notice Total number of units ever registered.
-    function getTotalUnits() external view returns (uint256) {
-        return _units.length;
+        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation);
+        _isMemberLink[unitId][entryId] = true;
+        _groupEntryIds[unitId].push(entryId);
+        _entryUnitIds[entryId].push(unitId);
+
+        bytes32 binding = memberBindingFor(groupPublicKey, member.attestation);
+        _verifyProof(member.proof, challengeFor(rpId, member.publicKey, binding), rpId, x, y);
+
+        emit MemberJoined(unitId, entryId, keyHash);
     }
 
-    /// @notice Total number of entries ever appended.
+    /// @dev The key's global entry id — created on first sight (fixing the
+    ///      attestation forever), matched against the file after.
+    function _resolveEntry(bytes32 keyHash, bytes memory publicKey, bytes memory attestation)
+        internal
+        returns (uint256 entryId)
+    {
+        uint256 plusOne = _entryIdPlusOneByKey[keyHash];
+        if (plusOne != 0) {
+            entryId = plusOne - 1;
+            if (keccak256(_entries[entryId].attestation) != keccak256(attestation)) {
+                revert AttestationMismatch(entryId);
+            }
+            return entryId;
+        }
+        _validateAttestation(attestation);
+        entryId = _entries.length;
+        _entries.push(Entry({publicKey: publicKey, attestation: attestation, createdAt: block.timestamp}));
+        _entryIdPlusOneByKey[keyHash] = entryId + 1;
+        emit EntryCreated(entryId, keyHash, publicKey, attestation);
+    }
+
+    // ── Write 2: refer a passkey to a group ────────────────────────────────
+
+    /// @notice One passkey points at one EXISTING group: discovery data in
+    ///         its own table, one reference per (group, key) pair. The
+    ///         group's frozen record and indexes are untouched. The
+    ///         referring key signs (group key, own attestation, reference
+    ///         metadata) — so it can sign the moment it is created — and a
+    ///         brand-new key gets its global entry created on the way.
+    ///         References are claims, not authority: readers decide what a
+    ///         referenced key means.
+    function refer(
+        bytes calldata groupPublicKey,
+        bytes calldata metadata,
+        Member calldata member
+    ) external {
+        _validateMetadata(metadata);
+
+        bytes32 groupKeyHash = keccak256(groupPublicKey);
+        uint256 unitPlusOne = _unitIdPlusOneByGroupKey[groupKeyHash];
+        if (unitPlusOne == 0) revert GroupNotFound(groupKeyHash);
+        uint256 unitId = unitPlusOne - 1;
+        string memory rpId = _units[unitId].rpId;
+
+        bytes32 keyHash = keccak256(member.publicKey);
+        if (keyHash == groupKeyHash) revert DuplicateMemberKey(0);
+        (uint256 x, uint256 y) = _validatePublicKey(member.publicKey);
+        uint256 entryId = _resolveEntry(keyHash, member.publicKey, member.attestation);
+        uint256 linkPlusOne = _referenceIdPlusOneByLink[unitId][entryId];
+        if (linkPlusOne != 0) revert AlreadyReferenced(linkPlusOne - 1);
+
+        bytes32 binding = referenceBindingFor(groupPublicKey, member.attestation, metadata);
+        _verifyProof(member.proof, challengeFor(rpId, member.publicKey, binding), rpId, x, y);
+
+        uint256 referenceId = _references.length;
+        _references.push(
+            Reference({entryId: entryId, unitId: unitId, metadata: metadata, createdAt: block.timestamp})
+        );
+        _referenceIdPlusOneByLink[unitId][entryId] = referenceId + 1;
+        _referenceIdsByEntry[entryId].push(referenceId);
+        _referenceIdsByUnit[unitId].push(referenceId);
+
+        emit ReferenceCreated(referenceId, entryId, unitId, keyHash, groupKeyHash);
+    }
+
+    // ── Reads: passkeys ────────────────────────────────────────────────────
+
+    /// @notice Total passkeys ever registered — entries are globally
+    ///         unique, so this IS the distinct key count.
     function getTotalEntries() external view returns (uint256) {
         return _entries.length;
     }
 
-    /// @notice One unit by its id.
+    /// @notice One passkey's global file by its immutable id.
+    function getEntry(uint256 entryId) external view returns (Entry memory) {
+        if (entryId >= _entries.length) revert EntryNotFound(entryId);
+        return _entries[entryId];
+    }
+
+    /// @notice Whether a public key has a file. With possession gating, at
+    ///         most one of a signature's recovered candidate keys can.
+    function hasEntry(bytes calldata publicKey) external view returns (bool) {
+        return _entryIdPlusOneByKey[keccak256(publicKey)] != 0;
+    }
+
+    /// @notice One passkey's global file by its public key.
+    function getEntryByKey(bytes calldata publicKey)
+        external
+        view
+        returns (bool exists, uint256 entryId, Entry memory entry)
+    {
+        uint256 plusOne = _entryIdPlusOneByKey[keccak256(publicKey)];
+        if (plusOne == 0) {
+            return (false, 0, entry);
+        }
+        entryId = plusOne - 1;
+        return (true, entryId, _entries[entryId]);
+    }
+
+    /// @notice Number of groups a passkey is a member of.
+    function getTotalGroupsOfKey(bytes calldata publicKey) external view returns (uint256) {
+        uint256 plusOne = _entryIdPlusOneByKey[keccak256(publicKey)];
+        if (plusOne == 0) return 0;
+        return _entryUnitIds[plusOne - 1].length;
+    }
+
+    /// @notice Paginated unit ids of the groups a passkey is a MEMBER of
+    ///         (frozen founding memberships), in creation order.
+    function getGroupsOfKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
+        external
+        view
+        returns (uint256 total, uint256[] memory unitIds)
+    {
+        uint256 plusOne = _entryIdPlusOneByKey[keccak256(publicKey)];
+        if (plusOne == 0) {
+            return (0, new uint256[](0));
+        }
+        return _pageIds(_entryUnitIds[plusOne - 1], offset, limit, desc);
+    }
+
+    // ── Reads: groups ──────────────────────────────────────────────────────
+
+    /// @notice Total groups ever created — group keys are single-use, so
+    ///         this IS the distinct group count.
+    function getTotalUnits() external view returns (uint256) {
+        return _units.length;
+    }
+
+    /// @notice One group's frozen record by its immutable id.
     function getUnit(uint256 unitId) external view returns (Unit memory) {
         if (unitId >= _units.length) revert UnitNotFound(unitId);
         return _units[unitId];
     }
 
-    /// @notice One entry (joined with its unit) by entry id. Ids are
-    ///         sequential and never change: clients that remember their
-    ///         entry ids read in O(1) forever.
-    function getEntry(uint256 entryId) external view returns (EntryView memory) {
-        if (entryId >= _entries.length) revert EntryNotFound(entryId);
-        return _view(entryId);
-    }
-
-    /// @notice Whether a public key has any member entries. With possession
-    ///         gating, at most one of a signature's recovered candidate
-    ///         keys can.
-    function hasEntries(bytes calldata publicKey) external view returns (bool) {
-        return _entriesByKey[keccak256(publicKey)].length != 0;
-    }
-
-    /// @notice Number of member entries under a public key.
-    function getTotalEntriesByKey(bytes calldata publicKey) external view returns (uint256) {
-        return _entriesByKey[keccak256(publicKey)].length;
-    }
-
-    /// @notice Paginated member entries under a public key, in registration
-    ///         order. Every one of them was written with that key's
-    ///         signature.
-    function getEntriesByKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
+    /// @notice One group's frozen record by its group public key — the
+    ///         group's stable identity.
+    function getUnitByGroupKey(bytes calldata publicKey)
         external
         view
-        returns (uint256 total, EntryView[] memory records)
+        returns (bool exists, uint256 unitId, Unit memory unit)
     {
-        return _page(_entriesByKey[keccak256(publicKey)], offset, limit, desc);
-    }
-
-    /// @notice Number of units under a group key.
-    function getTotalUnitsByGroupKey(bytes calldata publicKey) external view returns (uint256) {
-        return _unitsByGroupKey[keccak256(publicKey)].length;
-    }
-
-    /// @notice Paginated unit ids under a group key, in registration order.
-    ///         Every listed unit carries that key's content-bound
-    ///         signature; fetch bodies with getUnit.
-    function getUnitIdsByGroupKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
-        external
-        view
-        returns (uint256 total, uint256[] memory unitIds)
-    {
-        uint256[] storage ids = _unitsByGroupKey[keccak256(publicKey)];
-        total = ids.length;
-        if (offset >= total) {
-            return (total, new uint256[](0));
+        uint256 plusOne = _unitIdPlusOneByGroupKey[keccak256(publicKey)];
+        if (plusOne == 0) {
+            return (false, 0, unit);
         }
-        uint256 remaining = total - offset;
-        uint256 count = remaining < limit ? remaining : limit;
-        unitIds = new uint256[](count);
-        for (uint256 i = 0; i < count; i++) {
-            uint256 idx = desc ? total - 1 - offset - i : offset + i;
-            unitIds[i] = ids[idx];
+        unitId = plusOne - 1;
+        return (true, unitId, _units[unitId]);
+    }
+
+    /// @notice Resolve a group by its frozen content hash.
+    function getUnitIdByContentHash(bytes32 contentHash) external view returns (bool exists, uint256 unitId) {
+        uint256 plusOne = _unitIdPlusOneByContent[contentHash];
+        if (plusOne == 0) return (false, 0);
+        return (true, plusOne - 1);
+    }
+
+    /// @notice Whether group content has already been registered.
+    function isContentRegistered(bytes32 contentHash) external view returns (bool) {
+        return _unitIdPlusOneByContent[contentHash] != 0;
+    }
+
+    /// @notice Whether a passkey is a (frozen, founding) member of a group.
+    function isMember(bytes calldata groupPublicKey, bytes calldata memberPublicKey) external view returns (bool) {
+        uint256 unitPlusOne = _unitIdPlusOneByGroupKey[keccak256(groupPublicKey)];
+        uint256 entryPlusOne = _entryIdPlusOneByKey[keccak256(memberPublicKey)];
+        if (unitPlusOne == 0 || entryPlusOne == 0) return false;
+        return _isMemberLink[unitPlusOne - 1][entryPlusOne - 1];
+    }
+
+    /// @notice Number of members of a group (frozen at creation).
+    function getTotalGroupMembers(uint256 unitId) external view returns (uint256) {
+        if (unitId >= _units.length) revert UnitNotFound(unitId);
+        return _groupEntryIds[unitId].length;
+    }
+
+    /// @notice Paginated members of a group in founding order, joined with
+    ///         their global files.
+    function getGroupMembers(uint256 unitId, uint256 offset, uint256 limit, bool desc)
+        external
+        view
+        returns (uint256 total, uint256[] memory entryIds, Entry[] memory entries)
+    {
+        if (unitId >= _units.length) revert UnitNotFound(unitId);
+        (total, entryIds) = _pageIds(_groupEntryIds[unitId], offset, limit, desc);
+        entries = new Entry[](entryIds.length);
+        for (uint256 i = 0; i < entryIds.length; i++) {
+            entries[i] = _entries[entryIds[i]];
         }
     }
 
-    /// @notice Number of member entries under an rpId.
-    function getTotalEntriesByRpId(string calldata rpId) external view returns (uint256) {
-        return _entriesByRpId[rpId].length;
+    // ── Reads: references ──────────────────────────────────────────────────
+
+    /// @notice Total references ever created — counted apart from groups,
+    ///         always.
+    function getTotalReferences() external view returns (uint256) {
+        return _references.length;
     }
 
-    /// @notice Paginated member entries under an rpId, in registration
-    ///         order. Browse/stats convenience — synthetic (non-WebAuthn)
-    ///         signers choose their own rpId, so treat aggregate views as
-    ///         cosmetic.
-    function getEntriesByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
+    /// @notice One reference by its immutable id.
+    function getReference(uint256 referenceId) external view returns (Reference memory) {
+        if (referenceId >= _references.length) revert ReferenceNotFound(referenceId);
+        return _references[referenceId];
+    }
+
+    /// @notice Whether a passkey holds a reference to a group.
+    function isReferenced(bytes calldata groupPublicKey, bytes calldata memberPublicKey)
         external
         view
-        returns (uint256 total, EntryView[] memory records)
+        returns (bool)
     {
-        return _page(_entriesByRpId[rpId], offset, limit, desc);
+        uint256 unitPlusOne = _unitIdPlusOneByGroupKey[keccak256(groupPublicKey)];
+        uint256 entryPlusOne = _entryIdPlusOneByKey[keccak256(memberPublicKey)];
+        if (unitPlusOne == 0 || entryPlusOne == 0) return false;
+        return _referenceIdPlusOneByLink[unitPlusOne - 1][entryPlusOne - 1] != 0;
     }
+
+    /// @notice Number of references a passkey holds.
+    function getTotalReferencesOfKey(bytes calldata publicKey) external view returns (uint256) {
+        uint256 plusOne = _entryIdPlusOneByKey[keccak256(publicKey)];
+        if (plusOne == 0) return 0;
+        return _referenceIdsByEntry[plusOne - 1].length;
+    }
+
+    /// @notice Paginated reference ids a passkey holds — the authenticated
+    ///         direction: every one carries this key's own signature.
+    function getReferencesOfKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
+        external
+        view
+        returns (uint256 total, uint256[] memory referenceIds)
+    {
+        uint256 plusOne = _entryIdPlusOneByKey[keccak256(publicKey)];
+        if (plusOne == 0) {
+            return (0, new uint256[](0));
+        }
+        return _pageIds(_referenceIdsByEntry[plusOne - 1], offset, limit, desc);
+    }
+
+    /// @notice Number of references pointing at a group.
+    function getTotalReferencesToGroup(bytes calldata groupPublicKey) external view returns (uint256) {
+        uint256 plusOne = _unitIdPlusOneByGroupKey[keccak256(groupPublicKey)];
+        if (plusOne == 0) return 0;
+        return _referenceIdsByUnit[plusOne - 1].length;
+    }
+
+    /// @notice Paginated reference ids pointing at a group. COSMETIC: any
+    ///         key holder can refer their own key to any group, so treat
+    ///         this as a suggestion inbox, never as membership.
+    function getReferencesToGroup(bytes calldata groupPublicKey, uint256 offset, uint256 limit, bool desc)
+        external
+        view
+        returns (uint256 total, uint256[] memory referenceIds)
+    {
+        uint256 plusOne = _unitIdPlusOneByGroupKey[keccak256(groupPublicKey)];
+        if (plusOne == 0) {
+            return (0, new uint256[](0));
+        }
+        return _pageIds(_referenceIdsByUnit[plusOne - 1], offset, limit, desc);
+    }
+
+    // ── Reads: rpId enumeration (cosmetic) ─────────────────────────────────
 
     /// @notice Total number of distinct rpIds.
     function getTotalRpIds() external view returns (uint256) {
         return _rpIds.length;
     }
 
-    /// @notice Paginated list of all rpIds with entry counts and first-use times.
+    /// @notice Number of groups under an rpId.
+    function getTotalGroupsByRpId(string calldata rpId) external view returns (uint256) {
+        return _unitIdsByRpId[rpId].length;
+    }
+
+    /// @notice Paginated group ids under an rpId. Browse/stats convenience
+    ///         — synthetic signers choose their own rpId, so treat
+    ///         aggregate views as cosmetic.
+    function getGroupsByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
+        external
+        view
+        returns (uint256 total, uint256[] memory unitIds)
+    {
+        return _pageIds(_unitIdsByRpId[rpId], offset, limit, desc);
+    }
+
+    /// @notice Paginated list of all rpIds with group counts and first-use
+    ///         times.
     function getRpIds(uint256 offset, uint256 limit, bool desc)
         external
         view
@@ -541,43 +762,26 @@ contract WebAuthnP256PublicKeyRegistry {
             uint256 idx = desc ? total - 1 - offset - i : offset + i;
             string memory rp = _rpIds[idx];
             rpIds[i] = rp;
-            counts[i] = _entriesByRpId[rp].length;
+            counts[i] = _unitIdsByRpId[rp].length;
             createdAts[i] = _rpCreatedAt[rp];
         }
     }
 
-    function _view(uint256 entryId) internal view returns (EntryView memory) {
-        Entry storage entry = _entries[entryId];
-        Unit storage unit = _units[entry.unitId];
-        return EntryView({
-            entryId: entryId,
-            unitId: entry.unitId,
-            publicKey: entry.publicKey,
-            attestation: entry.attestation,
-            rpId: unit.rpId,
-            metadata: unit.metadata,
-            groupPublicKey: unit.groupPublicKey,
-            firstEntryId: unit.firstEntryId,
-            memberCount: unit.memberCount,
-            createdAt: unit.createdAt
-        });
-    }
-
-    function _page(uint256[] storage ids, uint256 offset, uint256 limit, bool desc)
+    function _pageIds(uint256[] storage ids, uint256 offset, uint256 limit, bool desc)
         internal
         view
-        returns (uint256 total, EntryView[] memory records)
+        returns (uint256 total, uint256[] memory page)
     {
         total = ids.length;
         if (offset >= total) {
-            return (total, new EntryView[](0));
+            return (total, new uint256[](0));
         }
         uint256 remaining = total - offset;
         uint256 count = remaining < limit ? remaining : limit;
-        records = new EntryView[](count);
+        page = new uint256[](count);
         for (uint256 i = 0; i < count; i++) {
             uint256 idx = desc ? total - 1 - offset - i : offset + i;
-            records[i] = _view(ids[idx]);
+            page[i] = ids[idx];
         }
     }
 }
