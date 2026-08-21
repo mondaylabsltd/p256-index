@@ -588,6 +588,23 @@ async fn execute_admission(
                 Err(_) => AdmissionResult::ChainReadFailed,
             }
         }
+        AdmissionOperation::CheckGroupExists { group_public_key } => {
+            let Ok(group) = parse_hex_bytes(group_public_key) else {
+                return AdmissionResult::ChainReadFailed;
+            };
+            match state.chain.unit_by_group_key(group).await {
+                Ok(unit) => AdmissionResult::ChainBool {
+                    value: unit.is_some(),
+                },
+                Err(_) => AdmissionResult::ChainReadFailed,
+            }
+        }
+        AdmissionOperation::FindTaskByKey { key_hash } => {
+            match state.store.find_by_public_key(key_hash).await {
+                Ok(task) => AdmissionResult::TaskFound { task },
+                Err(_) => AdmissionResult::StoreUnavailable,
+            }
+        }
         AdmissionOperation::QueueDepth => match state.store.queue_stats().await {
             Ok(stats) => AdmissionResult::Depth { depth: stats.depth },
             Err(_) => AdmissionResult::StoreUnavailable,
@@ -642,6 +659,10 @@ fn render_admission(outcome: AdmissionOutcome) -> Response {
         AdmissionOutcome::AlreadyRegistered { content_hash } => json_response(
             StatusCode::OK,
             json!({ "status": "done", "contentHash": content_hash }),
+        ),
+        AdmissionOutcome::ReferGroupMissing => error_response(
+            StatusCode::NOT_FOUND,
+            "referenced group does not exist; if you just created it, retry shortly",
         ),
         AdmissionOutcome::Busy => error_response(
             StatusCode::SERVICE_UNAVAILABLE,

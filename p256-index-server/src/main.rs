@@ -51,9 +51,16 @@ async fn main() -> Result<()> {
 
     let worker = start_worker_if_enabled(&config, store.clone(), chain.clone());
     let maintenance = start_maintenance_if_enabled(&config, store, chain, telegram);
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal())
-        .await;
+    // ConnectInfo is load-bearing: every rate-limited handler extracts the
+    // peer address, and without connect-info wiring axum answers each such
+    // request with an empty 500. The HTTP tests inject the extension by
+    // hand, so only a live client exercises this line.
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown_signal())
+    .await;
     if let Some(worker) = worker {
         worker.shutdown().await;
     }

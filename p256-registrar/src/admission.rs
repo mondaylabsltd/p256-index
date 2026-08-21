@@ -116,6 +116,17 @@ pub enum AdmissionOperation {
         group_public_key: String,
         member_public_key: String,
     },
+    /// Does the target group exist on-chain? getUnitByGroupKey(groupKey) —
+    /// Refer only, fail-open. Answered by [`AdmissionResult::ChainBool`].
+    CheckGroupExists {
+        group_public_key: String,
+    },
+    /// The in-flight/terminal task holding this public key's placeholder, if
+    /// any — used to tell a refer racing its own register (allowed) from a
+    /// refer to a group that never existed (rejected).
+    FindTaskByKey {
+        key_hash: String,
+    },
     QueueDepth,
     AllowGlobalCreate,
     /// Phase one: the store's atomic admission keyed by the content hash.
@@ -182,6 +193,10 @@ pub enum AdmissionOutcome {
     Queued { id: String, status: TaskStatus },
     /// 200: identical content is already on-chain.
     AlreadyRegistered { content_hash: String },
+    /// 404: a refer names a group that is not on-chain and has no register
+    /// in flight to create it — refusing it at the door keeps a would-be
+    /// GroupNotFound poison pill out of the FIFO queue.
+    ReferGroupMissing,
     /// 503 busy (depth or global rate gate).
     Busy,
     /// 503 retryable, naming the failed dependency ("redis" / "queue").
@@ -347,6 +362,15 @@ async fn drive_admission(
         _ => return Err(redis_down()),
     }
 
+    // A refer must target a group that already exists — or one whose
+    // creating register is still in flight (the intended race). Refusing a
+    // refer to a group that never existed keeps a permanent GroupNotFound
+    // poison pill out of the FIFO queue, where it would wedge every write
+    // behind it.
+    if task.kind == TaskKind::Refer {
+        refer_group_gate(ctx, &task).await?;
+    }
+
     // Write gates.
     match request(ctx, AdmissionOperation::QueueDepth).await {
         AdmissionResult::Depth { depth } if depth >= MAX_ACTIVE_QUEUE_DEPTH => {
@@ -378,6 +402,48 @@ async fn drive_admission(
             }
         }
         AdmissionResult::Admitted(AdmitOutcome::New) => enqueue(ctx, task).await,
+        _ => Err(redis_down()),
+    }
+}
+
+/// The refer group-existence gate. The chain read is fail-open (an RPC
+/// outage never blocks admission; the worker's GroupNotFound→transient
+/// retry remains the backstop for the race). A Redis failure on the
+/// task-lookup is a 503 like every other store failure. A definite "group
+/// absent AND no register in flight for it" is the only rejection.
+async fn refer_group_gate(ctx: &Ctx, task: &RegisterTask) -> Flow<()> {
+    match request(
+        ctx,
+        AdmissionOperation::CheckGroupExists {
+            group_public_key: task.group_public_key.clone(),
+        },
+    )
+    .await
+    {
+        AdmissionResult::ChainBool { value: true } | AdmissionResult::ChainReadFailed => Ok(()),
+        AdmissionResult::ChainBool { value: false } => {
+            match request(
+                ctx,
+                AdmissionOperation::FindTaskByKey {
+                    key_hash: task.group_public_key.clone(),
+                },
+            )
+            .await
+            {
+                // Allowed only when a register that creates this exact group
+                // is still working through the pipeline.
+                AdmissionResult::TaskFound {
+                    task: Some(pending),
+                } if pending.kind == TaskKind::Register
+                    && pending.group_public_key == task.group_public_key
+                    && !pending.status.is_terminal() =>
+                {
+                    Ok(())
+                }
+                AdmissionResult::TaskFound { .. } => Err(AdmissionOutcome::ReferGroupMissing),
+                _ => Err(redis_down()),
+            }
+        }
         _ => Err(redis_down()),
     }
 }
@@ -1068,6 +1134,12 @@ mod tests {
             AdmissionResult::ChainBool { value: false },
         );
         driver.step(
+            AdmissionOperation::CheckGroupExists {
+                group_public_key: task.group_public_key.clone(),
+            },
+            AdmissionResult::ChainBool { value: true },
+        );
+        driver.step(
             AdmissionOperation::QueueDepth,
             AdmissionResult::Depth { depth: 0 },
         );
@@ -1134,6 +1206,159 @@ mod tests {
             AdmissionResult::ChainBool { value: true },
         );
         driver.assert_settled(AdmissionOutcome::AlreadyRegistered { content_hash });
+    }
+
+    /// Submit a refer and walk AllowIp + FindTaskByContent(none) +
+    /// CheckReferenced(false), leaving CheckGroupExists in flight.
+    fn refer_up_to_group_gate() -> (Driver, RegisterTask) {
+        let core: Core<AdmissionApp> = Core::new();
+        let effects = core.process_event(AdmissionEvent::Submit {
+            request: AdmissionRequest::Refer(valid_refer_request()),
+            new_task_id: "task-new".into(),
+            now_ms: 1_000,
+            chain_id: CHAIN,
+            registry: REGISTRY.into(),
+        });
+        let mut driver = Driver {
+            core,
+            queue: VecDeque::new(),
+        };
+        driver.absorb(effects);
+        let (task, content_hash) = validated_refer();
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::FindTaskByContent { content_hash },
+            AdmissionResult::TaskFound { task: None },
+        );
+        driver.step(
+            AdmissionOperation::CheckReferenced {
+                group_public_key: task.group_public_key.clone(),
+                member_public_key: task.members[0].public_key.clone(),
+            },
+            AdmissionResult::ChainBool { value: false },
+        );
+        (driver, task)
+    }
+
+    fn finish_refer_admit(driver: &mut Driver, task: &RegisterTask) {
+        driver.step(
+            AdmissionOperation::QueueDepth,
+            AdmissionResult::Depth { depth: 0 },
+        );
+        driver.step(
+            AdmissionOperation::AllowGlobalCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::Admit { task: task.clone() },
+            AdmissionResult::Admitted(AdmitOutcome::New),
+        );
+        driver.step(
+            AdmissionOperation::Enqueue { task: task.clone() },
+            AdmissionResult::Enqueued,
+        );
+        let mut admitted = task.clone();
+        admitted.admitted = true;
+        driver.step(
+            AdmissionOperation::MarkAdmitted {
+                id: "task-new".into(),
+            },
+            AdmissionResult::TaskFound {
+                task: Some(admitted),
+            },
+        );
+        driver.assert_settled(AdmissionOutcome::Queued {
+            id: "task-new".into(),
+            status: TaskStatus::Pending,
+        });
+    }
+
+    #[test]
+    fn refer_to_a_missing_group_with_no_register_in_flight_is_refused() {
+        let (mut driver, task) = refer_up_to_group_gate();
+        driver.step(
+            AdmissionOperation::CheckGroupExists {
+                group_public_key: task.group_public_key.clone(),
+            },
+            AdmissionResult::ChainBool { value: false },
+        );
+        // No placeholder task holds the group key — a pure ghost.
+        driver.step(
+            AdmissionOperation::FindTaskByKey {
+                key_hash: task.group_public_key.clone(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+        driver.assert_settled(AdmissionOutcome::ReferGroupMissing);
+    }
+
+    #[test]
+    fn refer_racing_its_own_in_flight_register_is_admitted() {
+        let (mut driver, task) = refer_up_to_group_gate();
+        driver.step(
+            AdmissionOperation::CheckGroupExists {
+                group_public_key: task.group_public_key.clone(),
+            },
+            AdmissionResult::ChainBool { value: false },
+        );
+        // A register that creates this exact group is still in the pipeline.
+        let mut register = task.clone();
+        register.id = "register-in-flight".into();
+        register.kind = TaskKind::Register;
+        register.status = TaskStatus::Pending;
+        driver.step(
+            AdmissionOperation::FindTaskByKey {
+                key_hash: task.group_public_key.clone(),
+            },
+            AdmissionResult::TaskFound {
+                task: Some(register),
+            },
+        );
+        finish_refer_admit(&mut driver, &task);
+    }
+
+    #[test]
+    fn refer_to_a_missing_group_whose_register_already_finished_is_refused() {
+        let (mut driver, task) = refer_up_to_group_gate();
+        driver.step(
+            AdmissionOperation::CheckGroupExists {
+                group_public_key: task.group_public_key.clone(),
+            },
+            AdmissionResult::ChainBool { value: false },
+        );
+        // A terminal register is not "in flight": if the group is absent
+        // on-chain the register did not create it (e.g. it was poisoned).
+        let mut done_register = task.clone();
+        done_register.id = "register-terminal".into();
+        done_register.kind = TaskKind::Register;
+        done_register.status = TaskStatus::Failed;
+        driver.step(
+            AdmissionOperation::FindTaskByKey {
+                key_hash: task.group_public_key.clone(),
+            },
+            AdmissionResult::TaskFound {
+                task: Some(done_register),
+            },
+        );
+        driver.assert_settled(AdmissionOutcome::ReferGroupMissing);
+    }
+
+    #[test]
+    fn refer_group_check_is_fail_open_on_rpc_outage() {
+        let (mut driver, task) = refer_up_to_group_gate();
+        // The chain read failed: admission never blocks on an RPC wobble,
+        // so the refer proceeds (the worker's GroupNotFound→transient retry
+        // is the backstop).
+        driver.step(
+            AdmissionOperation::CheckGroupExists {
+                group_public_key: task.group_public_key.clone(),
+            },
+            AdmissionResult::ChainReadFailed,
+        );
+        finish_refer_admit(&mut driver, &task);
     }
 
     // ── Driver ─────────────────────────────────────────────────────────────
