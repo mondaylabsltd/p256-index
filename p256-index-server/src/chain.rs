@@ -22,11 +22,12 @@ use p256_registrar::{
     lookup::{Entry, Page, SiteItem, Unit},
     protocol::{
         CHAIN_ID, GROUP_CREATED_TOPIC, REFERENCE_CREATED_TOPIC, decode_bool, decode_entry,
-        decode_entry_by_key, decode_id_page, decode_rp_ids, decode_total, decode_unit,
-        decode_unit_by_group_key, get_entry_by_key_calldata, get_entry_calldata,
-        get_unit_by_group_key_calldata, get_unit_calldata, groups_by_rp_id_calldata,
-        groups_of_key_calldata, is_content_registered_calldata, is_referenced_calldata, is_revert,
-        references_of_key_calldata, rp_ids_calldata, total_entries_calldata,
+        decode_entry_by_key, decode_group_members, decode_id_page, decode_rp_ids, decode_total,
+        decode_unit, decode_unit_by_group_key, get_entry_by_key_calldata, get_entry_calldata,
+        get_group_members_calldata, get_unit_by_group_key_calldata, get_unit_calldata,
+        groups_by_rp_id_calldata, groups_of_key_calldata, is_content_registered_calldata,
+        is_referenced_calldata, is_revert, references_of_key_calldata,
+        references_to_group_calldata, rp_ids_calldata, total_entries_calldata,
         total_references_calldata, total_rp_ids_calldata, total_units_calldata, write_calldata,
     },
     roster::{Lane, Roster},
@@ -126,6 +127,18 @@ pub struct KeyProfile {
     pub reference_ids: Vec<u64>,
 }
 
+/// A group's frozen record plus one page of its founding members (joined
+/// with their global files) and of the reference ids pointing at it. The
+/// reference inbox is discovery-only, never membership.
+#[derive(Clone, Debug)]
+pub struct GroupDetail {
+    pub unit: Unit,
+    pub member_total: u64,
+    pub members: Vec<Entry>,
+    pub reference_total: u64,
+    pub reference_ids: Vec<u64>,
+}
+
 /// A definite receipt verdict. On success the receipt's UnitRegistered log
 /// yields the unit's first entry id (absent for non-register transactions).
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -172,6 +185,20 @@ pub trait ReadChain: Send + Sync {
         member_public_key: Vec<u8>,
     ) -> Result<bool, ChainError>;
     async fn unit_by_group_key(&self, public_key: Vec<u8>) -> Result<Option<Unit>, ChainError>;
+    async fn group_detail_by_key(
+        &self,
+        public_key: Vec<u8>,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Option<GroupDetail>, ChainError>;
+    async fn group_detail_by_id(
+        &self,
+        unit_id: u64,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Option<GroupDetail>, ChainError>;
 }
 
 impl Chain {
@@ -365,6 +392,75 @@ impl Chain {
             )
             .await?;
         decode_unit_by_group_key(&bytes).map_err(|_| ChainError::InvalidResponse)
+    }
+
+    /// Everything a group's page wants in one read: the frozen record, one
+    /// page of founding members joined with their files, and one page of
+    /// the reference ids pointing at the group.
+    pub async fn group_detail_by_key(
+        &self,
+        public_key: Vec<u8>,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Option<GroupDetail>, ChainError> {
+        let Some(unit) = self.unit_by_group_key(public_key.clone()).await? else {
+            return Ok(None);
+        };
+        self.group_detail_for(unit, public_key, page, page_size, descending)
+            .await
+            .map(Some)
+    }
+
+    pub async fn group_detail_by_id(
+        &self,
+        unit_id: u64,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Option<GroupDetail>, ChainError> {
+        let Some(unit) = self.unit(unit_id).await? else {
+            return Ok(None);
+        };
+        let group_key =
+            hex::decode(&unit.group_public_key).map_err(|_| ChainError::InvalidResponse)?;
+        self.group_detail_for(unit, group_key, page, page_size, descending)
+            .await
+            .map(Some)
+    }
+
+    async fn group_detail_for(
+        &self,
+        unit: Unit,
+        group_key: Vec<u8>,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<GroupDetail, ChainError> {
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                get_group_members_calldata(unit.unit_id, offset, page_size, descending),
+            )
+            .await?;
+        let (member_total, members) =
+            decode_group_members(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        let bytes = self
+            .call_contract(
+                self.registry_address,
+                references_to_group_calldata(group_key, offset, page_size, descending),
+            )
+            .await?;
+        let (reference_total, reference_ids) =
+            decode_id_page(&bytes).map_err(|_| ChainError::InvalidResponse)?;
+        Ok(GroupDetail {
+            unit,
+            member_total,
+            members,
+            reference_total,
+            reference_ids,
+        })
     }
 
     pub async fn is_referenced(
@@ -790,6 +886,26 @@ impl ReadChain for Chain {
 
     async fn unit_by_group_key(&self, public_key: Vec<u8>) -> Result<Option<Unit>, ChainError> {
         Chain::unit_by_group_key(self, public_key).await
+    }
+
+    async fn group_detail_by_key(
+        &self,
+        public_key: Vec<u8>,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Option<GroupDetail>, ChainError> {
+        Chain::group_detail_by_key(self, public_key, page, page_size, descending).await
+    }
+
+    async fn group_detail_by_id(
+        &self,
+        unit_id: u64,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    ) -> Result<Option<GroupDetail>, ChainError> {
+        Chain::group_detail_by_id(self, unit_id, page, page_size, descending).await
     }
 }
 

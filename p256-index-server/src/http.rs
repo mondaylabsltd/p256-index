@@ -40,7 +40,7 @@ use p256_registrar::{
 };
 
 use crate::{
-    chain::ReadChain,
+    chain::{GroupDetail, ReadChain},
     config::Config,
     queue::RegisterTaskQueue,
     store::{Admission, CacheRead, RedisStore, derive_ip_salt, hash_ip},
@@ -834,6 +834,47 @@ async fn execute_fetch(state: &AppState, fetch: &ChainFetch) -> LookupResult {
             Ok(None) => LookupResult::ChainNotFound,
             Err(_) => LookupResult::ChainFailed,
         },
+        ChainFetch::GroupById {
+            unit_id,
+            offset,
+            limit,
+            descending,
+        } => {
+            let page = offset / limit + 1;
+            match state
+                .chain
+                .group_detail_by_id(*unit_id, page, *limit, *descending)
+                .await
+            {
+                Ok(Some(detail)) => LookupResult::Chain {
+                    value: group_detail_json(detail, page, *limit),
+                },
+                Ok(None) => LookupResult::ChainNotFound,
+                Err(_) => LookupResult::ChainFailed,
+            }
+        }
+        ChainFetch::GroupByKey {
+            group_public_key,
+            offset,
+            limit,
+            descending,
+        } => {
+            let Ok(key) = hex::decode(group_public_key) else {
+                return LookupResult::ChainFailed;
+            };
+            let page = offset / limit + 1;
+            match state
+                .chain
+                .group_detail_by_key(key, page, *limit, *descending)
+                .await
+            {
+                Ok(Some(detail)) => LookupResult::Chain {
+                    value: group_detail_json(detail, page, *limit),
+                },
+                Ok(None) => LookupResult::ChainNotFound,
+                Err(_) => LookupResult::ChainFailed,
+            }
+        }
         ChainFetch::Totals => match state.chain.totals().await {
             Ok(totals) => LookupResult::Chain {
                 value: json!({
@@ -879,6 +920,22 @@ async fn execute_fetch(state: &AppState, fetch: &ChainFetch) -> LookupResult {
     }
 }
 
+/// The group-detail response body, shared by the unitId and groupPublicKey
+/// views: the frozen record, one page of founding members, and the
+/// discovery-only reference inbox.
+fn group_detail_json(detail: GroupDetail, page: u64, page_size: u64) -> Value {
+    json!({
+        "unit": detail.unit,
+        "members": { "total": detail.member_total, "items": detail.members },
+        "references": {
+            "total": detail.reference_total,
+            "referenceIds": detail.reference_ids,
+        },
+        "page": page,
+        "pageSize": page_size,
+    })
+}
+
 fn render_lookup(outcome: LookupOutcome) -> Response {
     match outcome {
         LookupOutcome::CachedOk { value } => cached_response(value),
@@ -908,6 +965,18 @@ fn cache_key_string(key: &LookupCacheKey) -> String {
             descending,
         } => format!("query:key:{key_hash}:{page}:{page_size}:{descending}"),
         LookupCacheKey::Entry { entry_id } => format!("query:entry:{entry_id}"),
+        LookupCacheKey::Unit {
+            unit_id,
+            page,
+            page_size,
+            descending,
+        } => format!("query:unit:{unit_id}:{page}:{page_size}:{descending}"),
+        LookupCacheKey::Group {
+            group_key,
+            page,
+            page_size,
+            descending,
+        } => format!("query:group:{group_key}:{page}:{page_size}:{descending}"),
         LookupCacheKey::StatsTotal => "stats:total".into(),
         LookupCacheKey::Sites {
             page,
@@ -1046,6 +1115,26 @@ mod tests {
         }
         async fn unit_by_group_key(&self, _: Vec<u8>) -> Result<Option<Unit>, ChainError> {
             Err(ChainError::Unavailable)
+        }
+
+        async fn group_detail_by_key(
+            &self,
+            _: Vec<u8>,
+            _: u64,
+            _: u64,
+            _: bool,
+        ) -> Result<Option<crate::chain::GroupDetail>, ChainError> {
+            Ok(None)
+        }
+
+        async fn group_detail_by_id(
+            &self,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: bool,
+        ) -> Result<Option<crate::chain::GroupDetail>, ChainError> {
+            Ok(None)
         }
 
         async fn rp_ids(&self, _: u64, _: u64, _: bool) -> Result<Page<SiteItem>, ChainError> {
@@ -1227,6 +1316,40 @@ mod tests {
         (body, member_public, group_public)
     }
 
+    #[test]
+    fn group_detail_body_names_every_field() {
+        let detail = crate::chain::GroupDetail {
+            unit: Unit {
+                unit_id: 3,
+                rp_id: "example.com".into(),
+                metadata: "aa".into(),
+                group_public_key: "04ab".into(),
+                content_hash: "0x11".into(),
+                member_count: 2,
+                created_at: 1_000,
+            },
+            member_total: 2,
+            members: vec![Entry {
+                entry_id: 7,
+                public_key: "04cd".into(),
+                attestation: String::new(),
+                created_at: 1_000,
+            }],
+            reference_total: 1,
+            reference_ids: vec![4],
+        };
+        let body = group_detail_json(detail, 1, 20);
+        assert_eq!(body["unit"]["unitId"], 3);
+        assert_eq!(body["unit"]["groupPublicKey"], "04ab");
+        assert_eq!(body["unit"]["memberCount"], 2);
+        assert_eq!(body["members"]["total"], 2);
+        assert_eq!(body["members"]["items"][0]["entryId"], 7);
+        assert_eq!(body["references"]["total"], 1);
+        assert_eq!(body["references"]["referenceIds"][0], 4);
+        assert_eq!(body["page"], 1);
+        assert_eq!(body["pageSize"], 20);
+    }
+
     /// The full HTTP contract over real Redis (Iggy is faked; the chain is
     /// offline). Gated because CI has no infrastructure.
     #[tokio::test]
@@ -1380,17 +1503,50 @@ mod tests {
         assert_eq!(pending["total"], 0);
         assert_eq!(pending["_queue"]["id"], id);
 
+        // Pre-chain visibility for the GROUP key too: the register
+        // placeholder covers it, so the group-detail view answers with the
+        // same queue marker before the unit lands on-chain.
+        let pending_group = request(
+            &app,
+            "GET",
+            &format!("/api/query?groupPublicKey={group_public_key}"),
+            "",
+        )
+        .await;
+        assert_eq!(pending_group.status(), StatusCode::OK);
+        let pending_group = response_json(pending_group).await;
+        assert_eq!(pending_group["_queue"]["id"], id);
+
+        // A well-formed group key nothing was ever submitted for is a 404.
+        let absent = request(
+            &app,
+            "GET",
+            &format!("/api/query?groupPublicKey=04{}", "ab".repeat(64)),
+            "",
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+        // Unit ids are resolved on-chain only; this chain has none.
+        let no_unit = request(&app, "GET", "/api/query?unitId=987654321", "").await;
+        assert_eq!(no_unit.status(), StatusCode::NOT_FOUND);
+
         // Param validation.
         let bad = request(&app, "GET", "/api/query?publicKey=02ab", "").await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let bad_unit = request(&app, "GET", "/api/query?unitId=not-a-number", "").await;
+        assert_eq!(bad_unit.status(), StatusCode::BAD_REQUEST);
+        let bad_group = request(&app, "GET", "/api/query?groupPublicKey=02ab", "").await;
+        assert_eq!(bad_group.status(), StatusCode::BAD_REQUEST);
         let none = request(&app, "GET", "/api/query", "").await;
         assert_eq!(none.status(), StatusCode::BAD_REQUEST);
 
-        // Health names the registry and the queue depth.
+        // Health names the registry and the queue depth: this run created
+        // two units, so two active tasks joined whatever was there before.
         let health = request(&app, "GET", "/api/health", "").await;
         assert_eq!(health.status(), StatusCode::OK);
         let health = response_json(health).await;
         assert_eq!(health["registry"], REGISTRY);
-        assert_eq!(health["queue"]["depth"], initial_queue_depth + 1);
+        assert_eq!(health["queue"]["depth"], initial_queue_depth + 2);
     }
 }

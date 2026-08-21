@@ -108,6 +108,8 @@ first client, not its owner.
 | POST | /api/challenge | Member / reference / group modes: the binding challenge for each signing role |
 | GET | /api/query?publicKey= | The key's file + its group/reference ids (`_queue` marker pre-chain) |
 | GET | /api/query?entryId= | One passkey file by its immutable id |
+| GET | /api/query?groupPublicKey= | Group detail: frozen record + member files + reference inbox (`_queue` marker pre-chain) |
+| GET | /api/query?unitId= | The same group detail by its immutable id |
 | GET | /api/stats/total | {totalEntries, totalUnits, totalReferences, totalRpIds} |
 | GET | /api/stats/sites | Paginated rpId list |
 | GET | /api/stats/keys?rpId= | Paginated groups under an rpId |

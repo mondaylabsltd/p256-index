@@ -12,7 +12,9 @@
 //! - a key with no on-chain entries but an in-flight task answers with a
 //!   `_queue` marker instead of an empty page, so "submitted to p256-index"
 //!   is always visible before it lands on-chain ("没上链前先查 p256-index");
-//! - entry-by-id misses are negative-cached briefly to absorb hot 404s.
+//!   group-by-key gets the same guarantee via the group-key placeholder;
+//! - entry-by-id and unit-by-id misses are negative-cached briefly to
+//!   absorb hot 404s (immutable-id lookups only — never key lookups).
 //!
 //! The shell owns key naming, TTL values, Redis and RPC execution.
 
@@ -119,6 +121,8 @@ pub fn queue_pending_body(task: &RegisterTask, public_key: &str) -> Value {
 pub struct LookupParams {
     pub public_key: Option<String>,
     pub entry_id: Option<String>,
+    pub unit_id: Option<String>,
+    pub group_public_key: Option<String>,
     pub page: Option<u64>,
     pub page_size: Option<u64>,
     pub order: Option<String>,
@@ -128,7 +132,8 @@ pub struct LookupParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LookupEndpoint {
-    /// `/api/query` — by publicKey (paged) or by entryId.
+    /// `/api/query` — by publicKey (paged), by entryId, by unitId, or by
+    /// groupPublicKey (both group-detail views, paged).
     Query { params: LookupParams },
     /// `/api/stats/total`
     StatsTotal,
@@ -153,6 +158,18 @@ pub enum LookupCacheKey {
     Entry {
         entry_id: u64,
     },
+    Unit {
+        unit_id: u64,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    },
+    Group {
+        group_key: String,
+        page: u64,
+        page_size: u64,
+        descending: bool,
+    },
     StatsTotal,
     Sites {
         page: u64,
@@ -171,7 +188,10 @@ impl LookupCacheKey {
     /// Which stale-grace window applies when RPC is down.
     pub fn ttl_class(&self) -> TtlClass {
         match self {
-            Self::EntriesByKey { .. } | Self::Entry { .. } => TtlClass::Record,
+            Self::EntriesByKey { .. }
+            | Self::Entry { .. }
+            | Self::Unit { .. }
+            | Self::Group { .. } => TtlClass::Record,
             Self::StatsTotal | Self::Sites { .. } | Self::Keys { .. } => TtlClass::Stats,
         }
     }
@@ -196,6 +216,18 @@ pub enum ChainFetch {
     },
     Entry {
         entry_id: u64,
+    },
+    GroupById {
+        unit_id: u64,
+        offset: u64,
+        limit: u64,
+        descending: bool,
+    },
+    GroupByKey {
+        group_public_key: String,
+        offset: u64,
+        limit: u64,
+        descending: bool,
     },
     Totals,
     Sites {
@@ -455,9 +487,30 @@ async fn query_flow(ctx: &Ctx, params: LookupParams) -> Flow<LookupOutcome> {
         };
         return entry_flow(ctx, entry_id).await;
     }
+    if let Some(unit_id) = params.unit_id.as_deref() {
+        let Ok(unit_id) = unit_id.parse::<u64>() else {
+            return Ok(LookupOutcome::Invalid {
+                message: "unitId must be an unsigned integer".into(),
+            });
+        };
+        let (page, page_size, descending) = pagination(&params);
+        return group_by_id_flow(ctx, unit_id, page, page_size, descending).await;
+    }
+    if let Some(group_key) = params.group_public_key.as_deref() {
+        let group_key = match normalize_public_key_param(group_key) {
+            Ok(value) => value,
+            Err(message) => {
+                return Ok(LookupOutcome::Invalid {
+                    message: message.replacen("publicKey", "groupPublicKey", 1),
+                });
+            }
+        };
+        let (page, page_size, descending) = pagination(&params);
+        return group_by_key_flow(ctx, group_key, page, page_size, descending).await;
+    }
     let Some(public_key) = params.public_key.as_deref() else {
         return Ok(LookupOutcome::Invalid {
-            message: "publicKey or entryId is required".into(),
+            message: "publicKey, entryId, unitId or groupPublicKey is required".into(),
         });
     };
     let public_key = match normalize_public_key_param(public_key) {
@@ -616,6 +669,168 @@ async fn entry_flow(ctx: &Ctx, entry_id: u64) -> Flow<LookupOutcome> {
             )
             .await;
             Ok(LookupOutcome::NotFound)
+        }
+        LookupResult::ChainFailed => match stale {
+            Some((value, age_ms)) => Ok(LookupOutcome::StaleOk { value, age_ms }),
+            None => Err(rpc_down()),
+        },
+        _ => Err(rpc_down()),
+    }
+}
+
+/// Group detail by immutable unit id. Ids are append-only, so a miss is
+/// negative-cached briefly like entry-by-id.
+async fn group_by_id_flow(
+    ctx: &Ctx,
+    unit_id: u64,
+    page: u64,
+    page_size: u64,
+    descending: bool,
+) -> Flow<LookupOutcome> {
+    let cache_key = LookupCacheKey::Unit {
+        unit_id,
+        page,
+        page_size,
+        descending,
+    };
+    let mut stale: Option<(Value, u64)> = None;
+    match request(
+        ctx,
+        LookupOperation::ReadCache {
+            key: cache_key.clone(),
+        },
+    )
+    .await
+    {
+        LookupResult::CacheFresh { value } => return Ok(LookupOutcome::CachedOk { value }),
+        LookupResult::CacheNegative => return Ok(LookupOutcome::NotFound),
+        LookupResult::CacheStale { value, age_ms } => stale = Some((value, age_ms)),
+        LookupResult::CacheMiss => {}
+        LookupResult::StoreUnavailable => return Err(redis_down()),
+        _ => return Err(redis_down()),
+    }
+    allow_read(ctx).await?;
+    match request(
+        ctx,
+        LookupOperation::FetchChain {
+            fetch: ChainFetch::GroupById {
+                unit_id,
+                offset: (page - 1) * page_size,
+                limit: page_size,
+                descending,
+            },
+        },
+    )
+    .await
+    {
+        LookupResult::Chain { value } => {
+            let _ = request(
+                ctx,
+                LookupOperation::WriteCache {
+                    key: cache_key,
+                    value: value.clone(),
+                    negative: false,
+                },
+            )
+            .await;
+            Ok(LookupOutcome::Ok { value })
+        }
+        LookupResult::ChainNotFound => {
+            let _ = request(
+                ctx,
+                LookupOperation::WriteCache {
+                    key: cache_key,
+                    value: Value::Null,
+                    negative: true,
+                },
+            )
+            .await;
+            Ok(LookupOutcome::NotFound)
+        }
+        LookupResult::ChainFailed => match stale {
+            Some((value, age_ms)) => Ok(LookupOutcome::StaleOk { value, age_ms }),
+            None => Err(rpc_down()),
+        },
+        _ => Err(rpc_down()),
+    }
+}
+
+/// Group detail by group public key — the group's stable identity. A group
+/// key with no on-chain unit but an in-flight register task answers with
+/// the `_queue` marker (register placeholders cover the group key); the
+/// miss is NOT negative-cached, because "queued → registered" is exactly
+/// the transition a brief 404 window would hide.
+async fn group_by_key_flow(
+    ctx: &Ctx,
+    group_key: String,
+    page: u64,
+    page_size: u64,
+    descending: bool,
+) -> Flow<LookupOutcome> {
+    let cache_key = LookupCacheKey::Group {
+        group_key: group_key.clone(),
+        page,
+        page_size,
+        descending,
+    };
+    let mut stale: Option<(Value, u64)> = None;
+    match request(
+        ctx,
+        LookupOperation::ReadCache {
+            key: cache_key.clone(),
+        },
+    )
+    .await
+    {
+        LookupResult::CacheFresh { value } => return Ok(LookupOutcome::CachedOk { value }),
+        LookupResult::CacheStale { value, age_ms } => stale = Some((value, age_ms)),
+        LookupResult::CacheNegative | LookupResult::CacheMiss => {}
+        LookupResult::StoreUnavailable => return Err(redis_down()),
+        _ => return Err(redis_down()),
+    }
+    allow_read(ctx).await?;
+    match request(
+        ctx,
+        LookupOperation::FetchChain {
+            fetch: ChainFetch::GroupByKey {
+                group_public_key: group_key.clone(),
+                offset: (page - 1) * page_size,
+                limit: page_size,
+                descending,
+            },
+        },
+    )
+    .await
+    {
+        LookupResult::Chain { value } => {
+            let _ = request(
+                ctx,
+                LookupOperation::WriteCache {
+                    key: cache_key,
+                    value: value.clone(),
+                    negative: false,
+                },
+            )
+            .await;
+            Ok(LookupOutcome::Ok { value })
+        }
+        LookupResult::ChainNotFound => {
+            match request(
+                ctx,
+                LookupOperation::FindTaskByKey {
+                    key_hash: group_key.clone(),
+                },
+            )
+            .await
+            {
+                LookupResult::TaskFound { task: Some(task) } if is_active_placeholder(&task) => {
+                    Ok(LookupOutcome::QueuePending {
+                        value: queue_pending_body(&task, &group_key),
+                    })
+                }
+                LookupResult::TaskFound { .. } => Ok(LookupOutcome::NotFound),
+                _ => Err(redis_down()),
+            }
         }
         LookupResult::ChainFailed => match stale {
             Some((value, age_ms)) => Ok(LookupOutcome::StaleOk { value, age_ms }),
@@ -1041,13 +1256,203 @@ mod tests {
         driver.assert_settled(LookupOutcome::NotFound);
     }
 
+    const GROUP_KEY: &str = "049e666db13bc6d0a76ec6801fbe24864030f15eca3b2d07ebcaf824bb2dc4f0aea8221dc27980b7c133a00d910c39723eb1523e88ad050a7303bba8bde07367fa";
+
+    fn by_group_key() -> LookupEndpoint {
+        LookupEndpoint::Query {
+            params: LookupParams {
+                group_public_key: Some(GROUP_KEY.into()),
+                ..LookupParams::default()
+            },
+        }
+    }
+
+    fn group_cache() -> LookupCacheKey {
+        LookupCacheKey::Group {
+            group_key: GROUP_KEY.into(),
+            page: 1,
+            page_size: 20,
+            descending: true,
+        }
+    }
+
+    fn group_fetch() -> LookupOperation {
+        LookupOperation::FetchChain {
+            fetch: ChainFetch::GroupByKey {
+                group_public_key: GROUP_KEY.into(),
+                offset: 0,
+                limit: 20,
+                descending: true,
+            },
+        }
+    }
+
+    #[test]
+    fn group_by_key_miss_fetches_backfills_and_serves() {
+        let mut driver = Driver::start(by_group_key());
+        driver.step(
+            LookupOperation::ReadCache { key: group_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        let detail = json!({"unit": {"unitId": 3}, "members": {"total": 1}});
+        driver.step(
+            group_fetch(),
+            LookupResult::Chain {
+                value: detail.clone(),
+            },
+        );
+        driver.step(
+            LookupOperation::WriteCache {
+                key: group_cache(),
+                value: detail.clone(),
+                negative: false,
+            },
+            LookupResult::Persisted,
+        );
+        driver.assert_settled(LookupOutcome::Ok { value: detail });
+    }
+
+    #[test]
+    fn unknown_group_key_with_active_register_task_answers_queue_pending() {
+        let mut driver = Driver::start(by_group_key());
+        driver.step(
+            LookupOperation::ReadCache { key: group_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        driver.step(group_fetch(), LookupResult::ChainNotFound);
+        driver.step(
+            LookupOperation::FindTaskByKey {
+                key_hash: GROUP_KEY.into(),
+            },
+            LookupResult::TaskFound {
+                task: Some(task(TaskStatus::Pending)),
+            },
+        );
+        driver.assert_settled(LookupOutcome::QueuePending {
+            value: queue_pending_body(&task(TaskStatus::Pending), GROUP_KEY),
+        });
+    }
+
+    #[test]
+    fn unknown_group_key_without_task_is_not_found_and_never_negative_cached() {
+        let mut driver = Driver::start(by_group_key());
+        driver.step(
+            LookupOperation::ReadCache { key: group_cache() },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        driver.step(group_fetch(), LookupResult::ChainNotFound);
+        driver.step(
+            LookupOperation::FindTaskByKey {
+                key_hash: GROUP_KEY.into(),
+            },
+            LookupResult::TaskFound { task: None },
+        );
+        // Settles straight to NotFound: no WriteCache{negative} operation
+        // may be in flight (the driver asserts an empty queue).
+        driver.assert_settled(LookupOutcome::NotFound);
+    }
+
+    #[test]
+    fn unit_by_id_walks_negative_cache_and_not_found() {
+        let endpoint = LookupEndpoint::Query {
+            params: LookupParams {
+                unit_id: Some("5".into()),
+                ..LookupParams::default()
+            },
+        };
+        let unit_cache = LookupCacheKey::Unit {
+            unit_id: 5,
+            page: 1,
+            page_size: 20,
+            descending: true,
+        };
+        // Negative cache answers 404 without RPC.
+        let mut driver = Driver::start(endpoint.clone());
+        driver.step(
+            LookupOperation::ReadCache {
+                key: unit_cache.clone(),
+            },
+            LookupResult::CacheNegative,
+        );
+        driver.assert_settled(LookupOutcome::NotFound);
+
+        // A chain miss caches the negative marker.
+        let mut driver = Driver::start(endpoint);
+        driver.step(
+            LookupOperation::ReadCache {
+                key: unit_cache.clone(),
+            },
+            LookupResult::CacheMiss,
+        );
+        driver.step(
+            LookupOperation::AllowRead,
+            LookupResult::Allowed { allowed: true },
+        );
+        driver.step(
+            LookupOperation::FetchChain {
+                fetch: ChainFetch::GroupById {
+                    unit_id: 5,
+                    offset: 0,
+                    limit: 20,
+                    descending: true,
+                },
+            },
+            LookupResult::ChainNotFound,
+        );
+        driver.step(
+            LookupOperation::WriteCache {
+                key: unit_cache,
+                value: Value::Null,
+                negative: true,
+            },
+            LookupResult::Persisted,
+        );
+        driver.assert_settled(LookupOutcome::NotFound);
+    }
+
+    #[test]
+    fn group_params_validate_before_any_operation() {
+        let driver = Driver::start(LookupEndpoint::Query {
+            params: LookupParams {
+                unit_id: Some("not-a-number".into()),
+                ..LookupParams::default()
+            },
+        });
+        driver.assert_settled(LookupOutcome::Invalid {
+            message: "unitId must be an unsigned integer".into(),
+        });
+
+        let driver = Driver::start(LookupEndpoint::Query {
+            params: LookupParams {
+                group_public_key: Some("02abc".into()),
+                ..LookupParams::default()
+            },
+        });
+        driver.assert_settled(LookupOutcome::Invalid {
+            message: "groupPublicKey must be an uncompressed P-256 point (04 + 128 hex chars)"
+                .into(),
+        });
+    }
+
     #[test]
     fn validation_rejects_bad_params() {
         let driver = Driver::start(LookupEndpoint::Query {
             params: LookupParams::default(),
         });
         driver.assert_settled(LookupOutcome::Invalid {
-            message: "publicKey or entryId is required".into(),
+            message: "publicKey, entryId, unitId or groupPublicKey is required".into(),
         });
 
         let driver = Driver::start(LookupEndpoint::Query {

@@ -115,6 +115,26 @@ impl ReadChain for FakeChain {
         Err(ChainError::Unavailable)
     }
 
+    async fn group_detail_by_key(
+        &self,
+        _: Vec<u8>,
+        _: u64,
+        _: u64,
+        _: bool,
+    ) -> Result<Option<p256_index_server::chain::GroupDetail>, ChainError> {
+        Ok(None)
+    }
+
+    async fn group_detail_by_id(
+        &self,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: bool,
+    ) -> Result<Option<p256_index_server::chain::GroupDetail>, ChainError> {
+        Ok(None)
+    }
+
     async fn rp_ids(&self, _: u64, _: u64, _: bool) -> Result<Page<SiteItem>, ChainError> {
         Err(ChainError::Unavailable)
     }

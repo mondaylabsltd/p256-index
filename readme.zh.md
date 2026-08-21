@@ -80,6 +80,8 @@
 | POST | /api/challenge | 成员/引用/组三模式,按角色算绑定挑战 |
 | GET | /api/query?publicKey= | 该钥匙档案 + 组/引用 id(上链前带 `_queue` 标记) |
 | GET | /api/query?entryId= | 按恒定 id 取单条 |
+| GET | /api/query?groupPublicKey= | 组详情:冻结记录 + 成员档案 + 引用收件箱(上链前带 `_queue` 标记) |
+| GET | /api/query?unitId= | 按恒定 id 取同一份组详情 |
 | GET | /api/stats/total | {totalEntries, totalUnits, totalReferences, totalRpIds} |
 | GET | /api/stats/sites | 分页 rpId 列表 |
 | GET | /api/stats/keys?rpId= | 某 rpId 下的分页组列表 |

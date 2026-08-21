@@ -103,6 +103,9 @@ sol! {
         function getTotalReferencesOfKey(bytes calldata publicKey) external view returns (uint256);
         function getReferencesOfKey(bytes calldata publicKey, uint256 offset, uint256 limit, bool desc)
             external view returns (uint256 total, uint256[] memory referenceIds);
+        function getTotalReferencesToGroup(bytes calldata groupPublicKey) external view returns (uint256);
+        function getReferencesToGroup(bytes calldata groupPublicKey, uint256 offset, uint256 limit, bool desc)
+            external view returns (uint256 total, uint256[] memory referenceIds);
         function getTotalRpIds() external view returns (uint256);
         function getTotalGroupsByRpId(string calldata rpId) external view returns (uint256);
         function getGroupsByRpId(string calldata rpId, uint256 offset, uint256 limit, bool desc)
@@ -456,6 +459,21 @@ pub fn references_of_key_calldata(
     .abi_encode()
 }
 
+pub fn references_to_group_calldata(
+    group_public_key: Vec<u8>,
+    offset: u64,
+    limit: u64,
+    desc: bool,
+) -> Vec<u8> {
+    WebAuthnP256PublicKeyRegistry::getReferencesToGroupCall {
+        groupPublicKey: group_public_key.into(),
+        offset: U256::from(offset),
+        limit: U256::from(limit),
+        desc,
+    }
+    .abi_encode()
+}
+
 pub fn get_unit_by_group_key_calldata(public_key: Vec<u8>) -> Vec<u8> {
     WebAuthnP256PublicKeyRegistry::getUnitByGroupKeyCall {
         publicKey: public_key.into(),
@@ -598,7 +616,8 @@ pub fn decode_reference(reference_id: u64, bytes: &[u8]) -> Result<ReferenceReco
 }
 
 /// (total, ids) — shared by getGroupsOfKey / getReferencesOfKey /
-/// getGroupsByRpId, whose return shapes are identical.
+/// getReferencesToGroup / getGroupsByRpId, whose return shapes are
+/// identical.
 pub fn decode_id_page(bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
     let value = WebAuthnP256PublicKeyRegistry::getGroupsOfKeyCall::abi_decode_returns(bytes)
         .map_err(|_| anyhow!("invalid id-page response"))?;
@@ -829,6 +848,21 @@ mod tests {
                 challenge_for(100, registry, "example.com", &pk, content)
             ),
             "0xd17270edef23ad83ebbf91a0d4f50caf64ef9b64bb85bec51192e36f311082ce"
+        );
+    }
+
+    /// The group-reference read selectors, pinned against `forge inspect
+    /// … methodIdentifiers` so the sol! mirror can never drift from the
+    /// deployed ABI.
+    #[test]
+    fn group_reference_read_selectors_match_forge_inspect() {
+        assert_eq!(
+            hex::encode(WebAuthnP256PublicKeyRegistry::getReferencesToGroupCall::SELECTOR),
+            "a75193db"
+        );
+        assert_eq!(
+            hex::encode(WebAuthnP256PublicKeyRegistry::getTotalReferencesToGroupCall::SELECTOR),
+            "e058465d"
         );
     }
 
