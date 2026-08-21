@@ -559,7 +559,8 @@ fn entry_from_sol(entry_id: u64, value: EntrySol) -> Entry {
         public_key: hex::encode(value.publicKey),
         attestation: hex::encode(value.attestation),
         credential_id: hex::encode(value.credentialId),
-        authenticator_attachment: String::from_utf8_lossy(&value.authenticatorAttachment).into_owned(),
+        authenticator_attachment: String::from_utf8_lossy(&value.authenticatorAttachment)
+            .into_owned(),
         transports: String::from_utf8_lossy(&value.transports).into_owned(),
         created_at: u64::try_from(value.createdAt)
             .unwrap_or(u64::MAX)
