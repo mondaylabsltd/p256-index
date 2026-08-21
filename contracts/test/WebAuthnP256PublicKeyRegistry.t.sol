@@ -169,8 +169,7 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
 
     function test_getUnitByGroupKey_andContentHash() public {
         _register(PRIV1, PUB1, "rp1", hex"aa");
-        (bool exists, uint256 unitId, WebAuthnP256PublicKeyRegistry.Unit memory unit) =
-            registry.getUnitByGroupKey(GPUB);
+        (bool exists, uint256 unitId, WebAuthnP256PublicKeyRegistry.Unit memory unit) = registry.getUnitByGroupKey(GPUB);
         assertTrue(exists);
         assertEq(unitId, 0);
         assertEq(unit.metadata, hex"aa");
@@ -251,6 +250,28 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         assertEq(registry.getTotalGroupMembers(0), 3);
     }
 
+    function test_frontRun_exactCopyRegistersOnceAndOriginalReverts() public {
+        WebAuthnP256PublicKeyRegistry.Member[] memory members = _trio("rp1");
+        WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", hex"1234", members);
+        bytes32 expectedContentHash = registry.contentHashFor("rp1", hex"1234", GPUB, members);
+
+        // There is deliberately no caller binding: an exact calldata copy
+        // can land first, but it can only commit the originally signed data.
+        vm.prank(address(0xA11CE));
+        registry.register("rp1", hex"1234", GPUB, gp, members);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.GroupKeyAlreadyUsed.selector, keccak256(GPUB))
+        );
+        vm.prank(address(0xB0B));
+        registry.register("rp1", hex"1234", GPUB, gp, members);
+
+        assertEq(registry.getTotalUnits(), 1);
+        assertEq(registry.getTotalEntries(), 3);
+        assertEq(registry.getUnit(0).contentHash, expectedContentHash);
+        assertEq(registry.getTotalGroupMembers(0), 3);
+    }
+
     function test_memberProof_cannotBeRePairedWithAnotherGroup() public {
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
         members[0] = _member(PRIV1, PUB1, "", "rp1", GPUB); // bound to GPUB
@@ -312,6 +333,35 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", "", members);
         vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
         registry.register("rp1", "", GPUB, gp, members);
+    }
+
+    function test_p256VerifierFailureModes_revertAtomically() public {
+        WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        members[0] = _member(PRIV1, PUB1, "", "rp1", GPUB);
+        WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", hex"aa", members);
+
+        // A failed staticcall must be treated as an invalid proof.
+        vm.etch(address(0x100), hex"60006000fd");
+        vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
+        registry.register("rp1", hex"aa", GPUB, gp, members);
+        assertEq(registry.getTotalUnits(), 0);
+        assertEq(registry.getTotalEntries(), 0);
+
+        // EIP-7951 invalid inputs/signatures return empty bytes, and an
+        // unsupported chain behaves the same way for this staticcall.
+        vm.etch(address(0x100), "");
+        vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
+        registry.register("rp1", hex"aa", GPUB, gp, members);
+        assertEq(registry.getTotalUnits(), 0);
+        assertEq(registry.getTotalEntries(), 0);
+
+        // Neither failed attempt consumed the group key or left partial
+        // indexes, so restoring the verifier makes the same payload valid.
+        P256Verifier verifier = new P256Verifier();
+        vm.etch(address(0x100), address(verifier).code);
+        registry.register("rp1", hex"aa", GPUB, gp, members);
+        assertEq(registry.getTotalUnits(), 1);
+        assertEq(registry.getTotalEntries(), 1);
     }
 
     // ── register: batch and shape validation ───────────────────────────────
@@ -394,6 +444,12 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
     function test_metadataAtCapRegisters() public {
         _register(PRIV1, PUB1, "rp1", new bytes(2048));
         assertEq(registry.getUnit(0).metadata.length, 2048);
+    }
+
+    function test_rpIdAtCapRegisters() public {
+        string memory rpIdAtCap = string(new bytes(253));
+        _register(PRIV1, PUB1, rpIdAtCap, "");
+        assertEq(bytes(registry.getUnit(0).rpId).length, 253);
     }
 
     function test_attestationShape() public {
@@ -497,6 +553,33 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         WebAuthnP256PublicKeyRegistry.Member memory again = _referrer(PRIV2, PUB2, "", "rp1", GPUB, hex"01");
         vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.AlreadyReferenced.selector, 0));
         registry.refer(GPUB, hex"01", again);
+    }
+
+    function test_refer_exactCopyStoresOnceAndOriginalReverts() public {
+        _register(PRIV1, PUB1, "rp1", hex"aa");
+        WebAuthnP256PublicKeyRegistry.Member memory referrer = _referrer(PRIV2, PUB2, "", "rp1", GPUB, hex"cafe");
+
+        vm.prank(address(0xA11CE));
+        registry.refer(GPUB, hex"cafe", referrer);
+
+        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.AlreadyReferenced.selector, 0));
+        vm.prank(address(0xB0B));
+        registry.refer(GPUB, hex"cafe", referrer);
+
+        assertEq(registry.getTotalReferences(), 1);
+        assertEq(registry.getReference(0).metadata, hex"cafe");
+        assertTrue(registry.isReferenced(GPUB, PUB2));
+    }
+
+    function test_refer_groupKeyCannotReferenceItself() public {
+        _register(PRIV1, PUB1, "rp1", hex"aa");
+        WebAuthnP256PublicKeyRegistry.Member memory self = _referrer(GPRIV, GPUB, "", "rp1", GPUB, "");
+
+        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.DuplicateMemberKey.selector, 0));
+        registry.refer(GPUB, "", self);
+
+        assertEq(registry.getTotalEntries(), 1);
+        assertEq(registry.getTotalReferences(), 0);
     }
 
     function test_refer_bindsGroupAttestationAndMetadata() public {
@@ -623,6 +706,97 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         assertEq(entryIds.length, 0);
     }
 
+    function test_referenceIndexes_paginateBothDirections() public {
+        _register(PRIV1, PUB1, "rp1", hex"01");
+
+        WebAuthnP256PublicKeyRegistry.Member[] memory secondMembers = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        secondMembers[0] = _member(PRIV2, PUB2, "", "rp1", GPUB2);
+        registry.register(
+            "rp1", hex"02", GPUB2, _groupProof(GPRIV2, GPUB2, "rp1", hex"02", secondMembers), secondMembers
+        );
+
+        registry.refer(GPUB, hex"01", _referrer(PRIV3, PUB3, "", "rp1", GPUB, hex"01")); // id 0
+        registry.refer(GPUB, hex"02", _referrer(PRIV4, PUB4, "", "rp1", GPUB, hex"02")); // id 1
+        registry.refer(GPUB, hex"03", _referrer(PRIV5, PUB5, "", "rp1", GPUB, hex"03")); // id 2
+        registry.refer(GPUB2, hex"04", _referrer(PRIV3, PUB3, "", "rp1", GPUB2, hex"04")); // id 3
+
+        (uint256 total, uint256[] memory ids) = registry.getReferencesToGroup(GPUB, 1, 1, false);
+        assertEq(total, 3);
+        assertEq(ids.length, 1);
+        assertEq(ids[0], 1);
+
+        (total, ids) = registry.getReferencesToGroup(GPUB, 0, 2, true);
+        assertEq(total, 3);
+        assertEq(ids.length, 2);
+        assertEq(ids[0], 2);
+        assertEq(ids[1], 1);
+
+        (total, ids) = registry.getReferencesToGroup(GPUB, 9, 10, false);
+        assertEq(total, 3);
+        assertEq(ids.length, 0);
+
+        (total, ids) = registry.getReferencesToGroup(GPUB, 0, 0, false);
+        assertEq(total, 3);
+        assertEq(ids.length, 0);
+
+        (total, ids) = registry.getReferencesToGroup(PUB6, 0, 10, false);
+        assertEq(total, 0);
+        assertEq(ids.length, 0);
+
+        (total, ids) = registry.getReferencesOfKey(PUB3, 0, 10, false);
+        assertEq(total, 2);
+        assertEq(ids[0], 0);
+        assertEq(ids[1], 3);
+
+        (total, ids) = registry.getReferencesOfKey(PUB3, 0, 10, true);
+        assertEq(total, 2);
+        assertEq(ids[0], 3);
+        assertEq(ids[1], 0);
+
+        (total, ids) = registry.getReferencesOfKey(PUB3, 9, 10, false);
+        assertEq(total, 2);
+        assertEq(ids.length, 0);
+        assertEq(registry.getTotalReferencesToGroup(GPUB), 3);
+        assertEq(registry.getTotalReferencesToGroup(GPUB2), 1);
+    }
+
+    function test_missingReadKeysReturnEmptyValues() public {
+        _register(PRIV1, PUB1, "rp1", hex"aa");
+
+        (bool entryExists, uint256 entryId, WebAuthnP256PublicKeyRegistry.Entry memory entry) =
+            registry.getEntryByKey(PUB6);
+        assertFalse(entryExists);
+        assertEq(entryId, 0);
+        assertEq(entry.publicKey.length, 0);
+
+        bytes32 missingContentHash = keccak256("missing content");
+        (bool contentExists, uint256 unitId) = registry.getUnitIdByContentHash(missingContentHash);
+        assertFalse(contentExists);
+        assertEq(unitId, 0);
+        assertFalse(registry.isContentRegistered(missingContentHash));
+
+        assertEq(registry.getTotalGroupsOfKey(PUB6), 0);
+        (uint256 total, uint256[] memory ids) = registry.getGroupsOfKey(PUB6, 0, 10, false);
+        assertEq(total, 0);
+        assertEq(ids.length, 0);
+
+        assertFalse(registry.isMember(GPUB2, PUB1));
+        assertFalse(registry.isMember(GPUB, PUB6));
+        assertFalse(registry.isReferenced(GPUB2, PUB1));
+        assertFalse(registry.isReferenced(GPUB, PUB6));
+
+        assertEq(registry.getTotalReferencesOfKey(PUB6), 0);
+        (total, ids) = registry.getReferencesOfKey(PUB6, 0, 10, false);
+        assertEq(total, 0);
+        assertEq(ids.length, 0);
+        assertEq(registry.getTotalReferencesToGroup(GPUB2), 0);
+        assertEq(registry.getTotalGroupsByRpId("missing.example"), 0);
+
+        (total, ids) = registry.getGroupsByRpId("missing.example", 0, 10, false);
+        assertEq(total, 0);
+        assertEq(ids.length, 0);
+    }
+
     function test_rpIdEnumeration_countsGroups() public {
         _register(PRIV1, PUB1, "rp1", hex"01");
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
@@ -640,8 +814,25 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         assertEq(groupTotal, 1);
         assertEq(unitIds[0], 1);
 
+        (groupTotal, unitIds) = registry.getGroupsByRpId("rp2", 0, 10, true);
+        assertEq(groupTotal, 1);
+        assertEq(unitIds[0], 1);
+
+        (total, rpIds, counts,) = registry.getRpIds(0, 10, true);
+        assertEq(total, 2);
+        assertEq(rpIds[0], "rp2");
+        assertEq(counts[0], 1);
+
         // Past-the-end page: totals stay, slices are empty.
         (total, rpIds, counts,) = registry.getRpIds(5, 10, false);
+        assertEq(total, 2);
+        assertEq(rpIds.length, 0);
+
+        (groupTotal, unitIds) = registry.getGroupsByRpId("rp2", 5, 10, false);
+        assertEq(groupTotal, 1);
+        assertEq(unitIds.length, 0);
+
+        (total, rpIds, counts,) = registry.getRpIds(0, 0, false);
         assertEq(total, 2);
         assertEq(rpIds.length, 0);
     }
@@ -655,6 +846,8 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         registry.getReference(0);
         vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.UnitNotFound.selector, 0));
         registry.getGroupMembers(0, 0, 10, false);
+        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.UnitNotFound.selector, 0));
+        registry.getTotalGroupMembers(0);
     }
 
     function test_keyRolesAreSeparateNamespaces() public {
