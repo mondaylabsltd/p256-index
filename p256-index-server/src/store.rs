@@ -197,6 +197,40 @@ impl RedisStore {
         self.find_by_index(key_active_key(public_key)).await
     }
 
+    /// The task a group-key-agnostic retry digest coalesces onto, if its
+    /// marker is still live. A recorded id whose task has since vanished
+    /// reads as no match — the marker only ever points, never owns.
+    pub async fn find_by_retry_digest(
+        &self,
+        digest: &str,
+    ) -> Result<Option<RegisterTask>, StoreError> {
+        let mut command = redis::cmd("GET");
+        command.arg(retry_digest_key(digest));
+        let id: Option<String> = self.query(command).await?;
+        match id {
+            Some(id) => self.get_task(&id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// TTL'd marker: identical resubmissions of this digest coalesce onto
+    /// `task_id` until it expires.
+    pub async fn record_retry_digest(
+        &self,
+        digest: &str,
+        task_id: &str,
+        ttl_secs: u64,
+    ) -> Result<(), StoreError> {
+        let mut command = redis::cmd("SET");
+        command
+            .arg(retry_digest_key(digest))
+            .arg(task_id)
+            .arg("EX")
+            .arg(ttl_secs);
+        let _: String = self.query(command).await?;
+        Ok(())
+    }
+
     async fn find_by_index(&self, key: String) -> Result<Option<RegisterTask>, StoreError> {
         let mut command = redis::cmd("GET");
         command.arg(key);
@@ -645,6 +679,10 @@ fn content_active_key(content_hash: &str) -> String {
 
 fn key_active_key(public_key: &str) -> String {
     format!("p256-index:task-key:{}", public_key.to_ascii_lowercase())
+}
+
+fn retry_digest_key(digest: &str) -> String {
+    format!("p256-index:task-retry:{}", digest.to_ascii_lowercase())
 }
 
 fn member_key_placeholders(task: &RegisterTask) -> Vec<String> {

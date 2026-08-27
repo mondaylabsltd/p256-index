@@ -611,6 +611,26 @@ async fn execute_admission(
                 Err(_) => AdmissionResult::StoreUnavailable,
             }
         }
+        AdmissionOperation::FindTaskByRetryDigest { digest } => {
+            match state.store.find_by_retry_digest(digest).await {
+                Ok(task) => AdmissionResult::TaskFound { task },
+                Err(_) => AdmissionResult::StoreUnavailable,
+            }
+        }
+        AdmissionOperation::RecordRetryDigest { digest, task_id } => {
+            match state
+                .store
+                .record_retry_digest(
+                    digest,
+                    task_id,
+                    p256_registrar::admission::RETRY_COALESCE_TTL_SECS,
+                )
+                .await
+            {
+                Ok(()) => AdmissionResult::Persisted,
+                Err(_) => AdmissionResult::StoreUnavailable,
+            }
+        }
         AdmissionOperation::CheckContentRegistered { content_hash } => {
             let Ok(content_hash) = parse_b256(content_hash) else {
                 return AdmissionResult::ChainReadFailed;

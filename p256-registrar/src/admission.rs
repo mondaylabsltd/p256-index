@@ -23,7 +23,7 @@
 //! and registry address enter through the Submit event so the program stays
 //! deterministic.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, keccak256};
 use crux_core::{App, Command, command::CommandContext, macros::effect};
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,12 @@ use crate::verify::verify_proof;
 
 /// New registrations are rejected while the active queue is at least this deep.
 pub const MAX_ACTIVE_QUEUE_DEPTH: u64 = 10_000;
+
+/// How long a register's retry digest keeps coalescing look-alike
+/// resubmissions (see [`register_retry_digest`]). Long enough to absorb any
+/// client retry loop, short enough that a deliberate identical re-register
+/// weeks later still passes.
+pub const RETRY_COALESCE_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// Mirrors the contract's MAX_MEMBERS.
 pub const MAX_MEMBERS: usize = 7;
@@ -108,6 +114,19 @@ pub enum AdmissionOperation {
     /// The in-flight/terminal task holding this content hash, if any.
     FindTaskByContent {
         content_hash: String,
+    },
+    /// The task recorded under this group-key-agnostic retry digest, if any
+    /// (see [`register_retry_digest`]); the shell answers from a TTL'd
+    /// marker written by [`AdmissionOperation::RecordRetryDigest`].
+    FindTaskByRetryDigest {
+        digest: String,
+    },
+    /// Best-effort marker: this digest's identical resubmissions coalesce
+    /// onto `task_id` for [`RETRY_COALESCE_TTL_SECS`]. A lost marker only
+    /// weakens dedup; it must never fail an admission.
+    RecordRetryDigest {
+        digest: String,
+        task_id: String,
     },
     /// isContentRegistered(contentHash) on the registry (fail-open).
     CheckContentRegistered {
@@ -291,6 +310,33 @@ async fn request(ctx: &Ctx, operation: AdmissionOperation) -> AdmissionResult {
     ctx.request_from_shell(operation).await
 }
 
+/// A register's identity MINUS its single-use group key: rpId, metadata and
+/// the sorted member key set, each length-prefixed. The protocol makes the
+/// group key part of the content hash, so a client that retries by
+/// regenerating it mints a brand-new content hash and walks straight past
+/// content idempotency — four identical units in 25 seconds, observed in
+/// production. The server pays the gas, so it coalesces on this digest
+/// instead. Byte-exact on purpose: any intentional difference (Vela's
+/// metadata carries a creation timestamp) changes the digest and passes.
+pub fn register_retry_digest(task: &RegisterTask) -> String {
+    let mut member_keys: Vec<String> = task
+        .members
+        .iter()
+        .map(|member| member.public_key.to_lowercase())
+        .collect();
+    member_keys.sort();
+    let mut preimage = Vec::new();
+    for part in std::iter::once(task.rp_id.as_str())
+        .chain(std::iter::once(task.metadata.as_str()))
+        .chain(member_keys.iter().map(String::as_str))
+    {
+        let bytes = part.as_bytes();
+        preimage.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        preimage.extend_from_slice(bytes);
+    }
+    hex::encode(keccak256(preimage))
+}
+
 async fn drive_admission(
     ctx: &Ctx,
     submitted: AdmissionRequest,
@@ -344,6 +390,37 @@ async fn drive_admission(
         }
         AdmissionResult::TaskFound { task: None } => {}
         _ => return Err(redis_down()),
+    }
+
+    // Second idempotency net, register only: the same unit resubmitted with
+    // a REGENERATED group key (a client retry loop) has a fresh content
+    // hash but the same retry digest. Coalesce onto the live task — unless
+    // it failed, in which case a fresh attempt with a fresh key is exactly
+    // what should proceed.
+    let retry_digest = (task.kind == TaskKind::Register).then(|| register_retry_digest(&task));
+    if let Some(digest) = &retry_digest {
+        match request(
+            ctx,
+            AdmissionOperation::FindTaskByRetryDigest {
+                digest: digest.clone(),
+            },
+        )
+        .await
+        {
+            AdmissionResult::TaskFound {
+                task: Some(existing),
+            } if existing.status != TaskStatus::Failed => {
+                if existing.admitted || existing.status.is_terminal() {
+                    return Ok(AdmissionOutcome::Queued {
+                        id: existing.id,
+                        status: existing.status,
+                    });
+                }
+                return enqueue(ctx, existing).await;
+            }
+            AdmissionResult::TaskFound { .. } => {}
+            _ => return Err(redis_down()),
+        }
     }
 
     // Chain pre-check, fail-open: an RPC outage never blocks admission —
@@ -404,7 +481,21 @@ async fn drive_admission(
                 _ => Err(redis_down()),
             }
         }
-        AdmissionResult::Admitted(AdmitOutcome::New) => enqueue(ctx, task).await,
+        AdmissionResult::Admitted(AdmitOutcome::New) => {
+            if let Some(digest) = &retry_digest {
+                // Best-effort by design: any shell answer is accepted — a
+                // lost marker weakens dedup, never the admission itself.
+                let _ = request(
+                    ctx,
+                    AdmissionOperation::RecordRetryDigest {
+                        digest: digest.clone(),
+                        task_id: task.id.clone(),
+                    },
+                )
+                .await;
+            }
+            enqueue(ctx, task).await
+        }
         _ => Err(redis_down()),
     }
 }
@@ -1474,6 +1565,19 @@ mod tests {
         validated().1
     }
 
+    fn expected_retry_digest() -> String {
+        register_retry_digest(&expected_task())
+    }
+
+    fn walk_retry_digest_miss(driver: &mut Driver) {
+        driver.step(
+            AdmissionOperation::FindTaskByRetryDigest {
+                digest: expected_retry_digest(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+    }
+
     fn walk_clean_prechecks(driver: &mut Driver) {
         driver.step(
             AdmissionOperation::AllowIpCreate,
@@ -1485,6 +1589,7 @@ mod tests {
             },
             AdmissionResult::TaskFound { task: None },
         );
+        walk_retry_digest_miss(driver);
         driver.step(
             AdmissionOperation::CheckContentRegistered {
                 content_hash: expected_content_hash(),
@@ -1510,6 +1615,13 @@ mod tests {
                 task: expected_task(),
             },
             AdmissionResult::Admitted(AdmitOutcome::New),
+        );
+        driver.step(
+            AdmissionOperation::RecordRetryDigest {
+                digest: expected_retry_digest(),
+                task_id: "task-new".into(),
+            },
+            AdmissionResult::Persisted,
         );
         driver.step(
             AdmissionOperation::Enqueue {
@@ -1623,6 +1735,7 @@ mod tests {
             },
             AdmissionResult::TaskFound { task: None },
         );
+        walk_retry_digest_miss(&mut driver);
         driver.step(
             AdmissionOperation::CheckContentRegistered {
                 content_hash: expected_content_hash(),
@@ -1647,6 +1760,7 @@ mod tests {
             },
             AdmissionResult::TaskFound { task: None },
         );
+        walk_retry_digest_miss(&mut driver);
         driver.step(
             AdmissionOperation::CheckContentRegistered {
                 content_hash: expected_content_hash(),
@@ -1744,6 +1858,13 @@ mod tests {
             AdmissionResult::Admitted(AdmitOutcome::New),
         );
         driver.step(
+            AdmissionOperation::RecordRetryDigest {
+                digest: expected_retry_digest(),
+                task_id: "task-new".into(),
+            },
+            AdmissionResult::Persisted,
+        );
+        driver.step(
             AdmissionOperation::Enqueue {
                 task: expected_task(),
             },
@@ -1752,5 +1873,150 @@ mod tests {
         driver.assert_settled(AdmissionOutcome::DependencyUnavailable {
             dependency: "queue".into(),
         });
+    }
+
+    /// The production incident: a client retry loop regenerated its
+    /// single-use group key, so content idempotency missed — the retry
+    /// digest (group-key-agnostic) coalesces the resubmission onto the
+    /// live task instead of buying a second identical unit.
+    #[test]
+    fn fresh_group_key_retry_coalesces_onto_live_task() {
+        let mut driver = Driver::submit(valid_request());
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::FindTaskByContent {
+                content_hash: expected_content_hash(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+        let mut existing = expected_task();
+        existing.id = "earlier".into();
+        existing.admitted = true;
+        driver.step(
+            AdmissionOperation::FindTaskByRetryDigest {
+                digest: expected_retry_digest(),
+            },
+            AdmissionResult::TaskFound {
+                task: Some(existing),
+            },
+        );
+        driver.assert_settled(AdmissionOutcome::Queued {
+            id: "earlier".into(),
+            status: TaskStatus::Pending,
+        });
+    }
+
+    /// A digest hit on a FAILED task must not coalesce: a fresh attempt
+    /// with a fresh group key is exactly the retry that should proceed.
+    #[test]
+    fn retry_digest_hit_on_failed_task_does_not_coalesce() {
+        let mut driver = Driver::submit(valid_request());
+        driver.step(
+            AdmissionOperation::AllowIpCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::FindTaskByContent {
+                content_hash: expected_content_hash(),
+            },
+            AdmissionResult::TaskFound { task: None },
+        );
+        let mut failed = expected_task();
+        failed.id = "earlier".into();
+        failed.admitted = true;
+        failed.status = TaskStatus::Failed;
+        driver.step(
+            AdmissionOperation::FindTaskByRetryDigest {
+                digest: expected_retry_digest(),
+            },
+            AdmissionResult::TaskFound { task: Some(failed) },
+        );
+        // The walk continues past the digest into a normal admission.
+        driver.step(
+            AdmissionOperation::CheckContentRegistered {
+                content_hash: expected_content_hash(),
+            },
+            AdmissionResult::ChainBool { value: false },
+        );
+        driver.step(
+            AdmissionOperation::QueueDepth,
+            AdmissionResult::Depth { depth: 0 },
+        );
+        driver.step(
+            AdmissionOperation::AllowGlobalCreate,
+            AdmissionResult::Allowed { allowed: true },
+        );
+        driver.step(
+            AdmissionOperation::Admit {
+                task: expected_task(),
+            },
+            AdmissionResult::Admitted(AdmitOutcome::New),
+        );
+        driver.step(
+            AdmissionOperation::RecordRetryDigest {
+                digest: expected_retry_digest(),
+                task_id: "task-new".into(),
+            },
+            AdmissionResult::Persisted,
+        );
+        driver.step(
+            AdmissionOperation::Enqueue {
+                task: expected_task(),
+            },
+            AdmissionResult::Enqueued,
+        );
+        let mut admitted = expected_task();
+        admitted.admitted = true;
+        driver.step(
+            AdmissionOperation::MarkAdmitted {
+                id: "task-new".into(),
+            },
+            AdmissionResult::TaskFound {
+                task: Some(admitted),
+            },
+        );
+        driver.assert_settled(AdmissionOutcome::Queued {
+            id: "task-new".into(),
+            status: TaskStatus::Pending,
+        });
+    }
+
+    #[test]
+    fn retry_digest_ignores_group_key_and_member_order_but_not_metadata() {
+        let base = expected_task();
+
+        // A regenerated group key (and hence content hash) changes nothing.
+        let mut rekeyed = base.clone();
+        rekeyed.group_public_key = format!("{}00", rekeyed.group_public_key);
+        rekeyed.content_hash = "0xrekeyed".into();
+        assert_eq!(
+            register_retry_digest(&base),
+            register_retry_digest(&rekeyed)
+        );
+
+        // Member order is canonicalized away.
+        let mut two = base.clone();
+        let mut second = two.members[0].clone();
+        second.public_key = format!("{}ff", second.public_key);
+        two.members.push(second);
+        let mut reversed = two.clone();
+        reversed.members.reverse();
+        assert_eq!(
+            register_retry_digest(&two),
+            register_retry_digest(&reversed)
+        );
+        assert_ne!(register_retry_digest(&base), register_retry_digest(&two));
+
+        // Any metadata difference passes through (Vela metadata carries a
+        // creation timestamp, so intentional new wallets never collide).
+        let mut other_metadata = base.clone();
+        other_metadata.metadata = format!("{}00", other_metadata.metadata);
+        assert_ne!(
+            register_retry_digest(&base),
+            register_retry_digest(&other_metadata)
+        );
     }
 }
