@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["p256-registrar", "p256-index-server"]
+members = ["p256-registrar", "p256-index-server", "p256-replay"]

@@ -3723,6 +3723,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "p256-replay"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "papaya"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
