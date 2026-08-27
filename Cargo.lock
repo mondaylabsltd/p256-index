@@ -3680,7 +3680,7 @@ dependencies = [
 
 [[package]]
 name = "p256-index-server"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3710,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "p256-registrar"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "alloy",
  "anyhow",
