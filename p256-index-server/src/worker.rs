@@ -7,7 +7,11 @@
 //! operations against Redis and the chain. One Core instance drives one
 //! polled batch to a `BatchVerdict`.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
 
 use iggy::prelude::{
     Client, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient,
@@ -38,13 +42,55 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// price. Short enough that a brief spike costs little latency, long enough not
 /// to poll the RPC pool pointlessly.
 const GAS_WAIT: Duration = Duration::from_secs(15);
+/// How long the create worker may go without one completed Iggy poll before
+/// the process is considered wedged. Generous against every legitimate quiet
+/// spell in the loop (60s max supervisor backoff, 60s max batch-retry backoff,
+/// 15s gas waits — all of which return to a poll), so only a session that can
+/// neither poll nor fail its way back to one trips it.
+pub const WORKER_STALL_LIMIT: Duration = Duration::from_secs(10 * 60);
+/// How often the watchdog compares the pulse age against the stall limit.
+const WATCHDOG_TICK: Duration = Duration::from_secs(60);
+
+/// Liveness pulse for the create worker, stamped after every completed poll —
+/// empty polls included, because an idle session is a live session. The health
+/// endpoint reports it so monitors see a dead consumer behind a happily
+/// answering HTTP server; the watchdog acts on it.
+#[derive(Clone)]
+pub struct WorkerPulse {
+    last_beat: Arc<StdMutex<Instant>>,
+}
+
+impl WorkerPulse {
+    fn new() -> Self {
+        Self {
+            last_beat: Arc::new(StdMutex::new(Instant::now())),
+        }
+    }
+
+    fn beat(&self) {
+        *self.last_beat.lock().expect("pulse lock") = Instant::now();
+    }
+
+    pub fn age(&self) -> Duration {
+        self.last_beat.lock().expect("pulse lock").elapsed()
+    }
+
+    pub fn stalled(&self) -> bool {
+        self.age() >= WORKER_STALL_LIMIT
+    }
+}
 
 pub struct WorkerHandle {
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+    pulse: WorkerPulse,
 }
 
 impl WorkerHandle {
+    pub fn pulse(&self) -> WorkerPulse {
+        self.pulse.clone()
+    }
+
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(75), self.task).await;
@@ -60,6 +106,7 @@ pub struct CreateWorker {
     stream_name: String,
     topic_name: String,
     nonces: Arc<NonceManager>,
+    pulse: WorkerPulse,
 }
 
 struct NonceManager {
@@ -76,6 +123,7 @@ impl CreateWorker {
         topic_name: String,
     ) -> WorkerHandle {
         let shutdown = CancellationToken::new();
+        let pulse = WorkerPulse::new();
         let worker = Self {
             store,
             chain,
@@ -86,16 +134,77 @@ impl CreateWorker {
             nonces: Arc::new(NonceManager {
                 value: Mutex::new(None),
             }),
+            pulse: pulse.clone(),
         };
-        let task = tokio::spawn({
+        // Watchdog: the supervisor below only helps when `run` *returns*. A
+        // poll wedged on a half-dead TCP session never returns and never
+        // errors, so an independent task watches the pulse and exits the
+        // process — the container restart policy then supplies what no
+        // in-process retry can: a fresh connection state.
+        tokio::spawn({
+            let pulse = pulse.clone();
             let shutdown = shutdown.clone();
             async move {
-                if let Err(error) = worker.run(shutdown).await {
-                    tracing::error!(%error, "Iggy create worker stopped");
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(WATCHDOG_TICK) => {}
+                    }
+                    if pulse.stalled() {
+                        tracing::error!(
+                            stalled_for_s = pulse.age().as_secs(),
+                            "create worker completed no Iggy poll within the stall limit; exiting for a clean restart"
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
         });
-        WorkerHandle { shutdown, task }
+        let task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                // Supervise: `run` returning an error means the consumer loop
+                // lost its Iggy session (one failed poll used to kill the task
+                // for good while the HTTP server kept answering "ok" — the
+                // queue then grew unserved until a human restarted the
+                // container). Rebuild the client and rejoin the group until
+                // told to shut down.
+                let mut restarts = 0u32;
+                loop {
+                    let started = tokio::time::Instant::now();
+                    match worker.clone().run(shutdown.clone()).await {
+                        Ok(()) => break, // clean shutdown
+                        Err(error) => {
+                            if shutdown.is_cancelled() {
+                                break;
+                            }
+                            // A session that held for a while earns a fresh
+                            // backoff ladder; only rapid-fire failures escalate.
+                            if started.elapsed() > Duration::from_secs(300) {
+                                restarts = 0;
+                            }
+                            let backoff = p256_registrar::sentinel::backoff_delay(restarts)
+                                .min(Duration::from_secs(60));
+                            restarts = restarts.saturating_add(1);
+                            tracing::error!(
+                                %error,
+                                retry_in_s = backoff.as_secs(),
+                                "Iggy create worker stopped; restarting"
+                            );
+                            tokio::select! {
+                                _ = shutdown.cancelled() => break,
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        WorkerHandle {
+            shutdown,
+            task,
+            pulse,
+        }
     }
 
     async fn run(self, shutdown: CancellationToken) -> Result<(), WorkerError> {
@@ -142,6 +251,7 @@ impl CreateWorker {
                 result = client.poll_messages(&stream, &topic, None, &consumer, &polling, POLL_BATCH_SIZE, false) =>
                     result.map_err(|_| WorkerError::new("could not poll Iggy create tasks"))?,
             };
+            self.pulse.beat();
             if polled.messages.is_empty() {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -651,6 +761,7 @@ mod e2e_chain_tests {
             nonces: Arc::new(NonceManager {
                 value: Mutex::new(None),
             }),
+            pulse: super::WorkerPulse::new(),
         };
         worker
             .process_batch(vec![task.clone()])
