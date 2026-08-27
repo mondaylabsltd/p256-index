@@ -189,7 +189,7 @@ async fn health(State(state): State<AppState>) -> Response {
             };
             let mut body = json!({
                 "service": "webauthn-p256-publickey-registry",
-                "version": "2.0.0",
+                "version": env!("CARGO_PKG_VERSION"),
                 "chainId": state.chain_id,
                 "registry": state.chain.registry_address(),
                 "domainRegistry": state.chain.domain_registry_address(),
@@ -226,7 +226,7 @@ async fn health(State(state): State<AppState>) -> Response {
                 code,
                 json!({
                     "service": "webauthn-p256-publickey-registry",
-                    "version": "2.0.0",
+                    "version": env!("CARGO_PKG_VERSION"),
                     "chainId": state.chain_id,
                     "registry": state.chain.registry_address(),
                     "domainRegistry": state.chain.domain_registry_address(),
