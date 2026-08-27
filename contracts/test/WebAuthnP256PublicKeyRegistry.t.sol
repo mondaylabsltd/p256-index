@@ -46,7 +46,9 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         // Stand in for the EIP-7951 / RIP-7212 precompile (live on Gnosis,
         // absent in the local EVM) with the audited Solidity fallback.
         vm.etch(address(0x100), address(new P256Verifier()).code);
-        registry = new WebAuthnP256PublicKeyRegistry();
+        // Standalone deployment: the sentinel pair freezes the suite's own
+        // (chain id, address) as the signature domain.
+        registry = new WebAuthnP256PublicKeyRegistry(0, address(0));
     }
 
     // ── Proof construction (real signatures) ───────────────────────────────
@@ -738,15 +740,25 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
             bytes32(0xd17270edef23ad83ebbf91a0d4f50caf64ef9b64bb85bec51192e36f311082ce)
         );
         // And the deployed function is exactly that formula over its own
-        // identity.
+        // FROZEN identity (the sentinel constructor froze the suite's own
+        // chain id and address).
+        assertEq(registry.DOMAIN_CHAIN_ID(), block.chainid);
+        assertEq(registry.DOMAIN_REGISTRY(), address(registry));
         assertEq(
             registry.challengeFor("example.com", PUB1, contentHash),
-            keccak256(abi.encode(block.chainid, address(registry), "example.com", PUB1, contentHash))
+            keccak256(
+                abi.encode(
+                    registry.DOMAIN_CHAIN_ID(), registry.DOMAIN_REGISTRY(), "example.com", PUB1, contentHash
+                )
+            )
         );
     }
 
-    function test_challengeBindsRegistryInstance() public {
-        WebAuthnP256PublicKeyRegistry other = new WebAuthnP256PublicKeyRegistry();
+    /// Independent standalone deployments still repel each other's
+    /// signatures: each froze its own domain, so domain separation between
+    /// registry FAMILIES is intact.
+    function test_challengeBindsFrozenDomain_independentDeploymentRejects() public {
+        WebAuthnP256PublicKeyRegistry other = new WebAuthnP256PublicKeyRegistry(0, address(0));
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
         members[0] = _member(PRIV1, PUB1, "", "rp1", GPUB); // signed for `registry`
         WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", "", members);
@@ -758,14 +770,83 @@ contract WebAuthnP256PublicKeyRegistryTest is Test {
         assertEq(registry.getTotalUnits(), 1);
     }
 
-    function test_challengeBindsChainId() public {
+    /// The migration property: a deployment constructed with the ORIGINAL
+    /// registry's domain accepts the original's calldata verbatim — on any
+    /// chain id — with no re-signing. This is the disaster-recovery path.
+    function test_frozenDomain_migrationDeploymentReplaysVerbatim() public {
+        WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        members[0] = _member(PRIV1, PUB1, ATTESTATION, "rp1", GPUB); // signed for `registry`
+        WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", hex"aa", members);
+        registry.register("rp1", hex"aa", GPUB, gp, members);
+
+        // "Gnosis died": the same calldata lands on a mirror on another
+        // chain, deployed with the original's frozen domain.
+        vm.chainId(31338);
+        WebAuthnP256PublicKeyRegistry mirror =
+            new WebAuthnP256PublicKeyRegistry(registry.DOMAIN_CHAIN_ID(), registry.DOMAIN_REGISTRY());
+        mirror.register("rp1", hex"aa", GPUB, gp, members);
+
+        assertEq(mirror.getTotalUnits(), 1);
+        assertEq(mirror.getTotalEntries(), 1);
+        assertEq(
+            mirror.contentHashFor("rp1", hex"aa", GPUB, members),
+            registry.contentHashFor("rp1", hex"aa", GPUB, members)
+        );
+    }
+
+    /// Every accepted write stores its verbatim calldata; those bytes
+    /// replay as-is into a same-domain mirror, and the mirror stores them
+    /// again — each record carries its own escape pod, recursively.
+    function test_payloads_storedVerbatimAndReplayable() public {
+        WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
+        members[0] = _member(PRIV1, PUB1, ATTESTATION, "rp1", GPUB);
+        WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", hex"aa", members);
+        bytes memory registerCall = abi.encodeCall(registry.register, ("rp1", hex"aa", GPUB, gp, members));
+        (bool ok,) = address(registry).call(registerCall);
+        assertTrue(ok);
+        assertEq(registry.registerPayloadOf(0), registerCall);
+
+        bytes32 refBinding = registry.referenceBindingFor(GPUB, "", hex"bb");
+        WebAuthnP256PublicKeyRegistry.Member memory referrer = WebAuthnP256PublicKeyRegistry.Member(
+            PUB2, "", "", "", "", _proofOver(PRIV2, registry.challengeFor("rp1", PUB2, refBinding), "rp1", 0x05)
+        );
+        bytes memory referCall = abi.encodeCall(registry.refer, (GPUB, hex"bb", referrer));
+        (ok,) = address(registry).call(referCall);
+        assertTrue(ok);
+        assertEq(registry.referPayloadOf(0), referCall);
+
+        // The stored bytes replay into a same-domain mirror on another
+        // chain id, which then carries the same payloads itself.
+        vm.chainId(31338);
+        WebAuthnP256PublicKeyRegistry mirror =
+            new WebAuthnP256PublicKeyRegistry(registry.DOMAIN_CHAIN_ID(), registry.DOMAIN_REGISTRY());
+        (ok,) = address(mirror).call(registry.registerPayloadOf(0));
+        assertTrue(ok);
+        (ok,) = address(mirror).call(registry.referPayloadOf(0));
+        assertTrue(ok);
+        assertEq(mirror.getTotalUnits(), 1);
+        assertEq(mirror.getTotalReferences(), 1);
+        assertEq(mirror.registerPayloadOf(0), registerCall);
+        assertEq(mirror.referPayloadOf(0), referCall);
+    }
+
+    function test_payloads_notFoundReverts() public {
+        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.UnitNotFound.selector, 0));
+        registry.registerPayloadOf(0);
+        vm.expectRevert(abi.encodeWithSelector(WebAuthnP256PublicKeyRegistry.ReferenceNotFound.selector, 0));
+        registry.referPayloadOf(0);
+    }
+
+    /// The domain is frozen at construction: changing the live chain id
+    /// under an existing deployment does not orphan its signatures.
+    function test_frozenDomain_survivesLiveChainIdChange() public {
         WebAuthnP256PublicKeyRegistry.Member[] memory members = new WebAuthnP256PublicKeyRegistry.Member[](1);
         members[0] = _member(PRIV1, PUB1, "", "rp1", GPUB);
         WebAuthnP256PublicKeyRegistry.Proof memory gp = _groupProof(GPRIV, GPUB, "rp1", "", members);
 
-        vm.chainId(31338); // a fork with a different chain id rejects them
-        vm.expectRevert(WebAuthnP256PublicKeyRegistry.InvalidProof.selector);
+        vm.chainId(31338);
         registry.register("rp1", "", GPUB, gp, members);
+        assertEq(registry.getTotalUnits(), 1);
     }
 
     // ── Reads, pagination, enumeration ─────────────────────────────────────

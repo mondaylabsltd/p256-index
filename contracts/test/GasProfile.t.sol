@@ -51,7 +51,7 @@ contract GasProfileTest is Test {
 
     function setUp() public {
         vm.etch(address(0x100), address(new P256Verifier()).code);
-        registry = new WebAuthnP256PublicKeyRegistry();
+        registry = new WebAuthnP256PublicKeyRegistry(0, address(0));
     }
 
     function _proofOver(uint256 priv, bytes32 challenge)

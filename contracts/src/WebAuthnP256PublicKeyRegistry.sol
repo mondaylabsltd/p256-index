@@ -32,12 +32,19 @@ import {Base64Url} from "./Base64Url.sol";
 ///         storage-authorization challenge
 ///
 ///           keccak256(abi.encode(
-///               block.chainid, address(registry), rpId,
+///               DOMAIN_CHAIN_ID, DOMAIN_REGISTRY, rpId,
 ///               signer.publicKey, binding))
 ///
 ///         verified on-chain via the EIP-7951 / RIP-7212 P256VERIFIER
-///         precompile at 0x100, where `binding` depends on the signer's
-///         role:
+///         precompile at 0x100. The signature DOMAIN is frozen at
+///         construction, not read from the environment: a standalone
+///         deployment freezes its own (block.chainid, address(this)), and
+///         a MIGRATION deployment on any other chain is constructed with
+///         the ORIGINAL deployment's domain — so every historical
+///         register/refer calldata replays there verbatim, with no user
+///         ever re-signing. The domain is a registry-family namespace, not
+///         a chain identity; the chain underneath is a replaceable storage
+///         backend. `binding` depends on the signer's role:
 ///
 ///         - the GROUP KEY (a client-held software key, generated for the
 ///           one register call and discarded after — group keys are
@@ -55,7 +62,15 @@ import {Base64Url} from "./Base64Url.sol";
 ///         signature, and replaying a mined call can only recreate state
 ///         that already exists (group keys are single-use, memberships and
 ///         references are unique per pair). Nobody can create an entry, a
-///         membership or a reference for a key they do not hold.
+///         membership or a reference for a key they do not hold. Replaying
+///         a call into a same-domain deployment on another chain recreates
+///         the same public record there — that is publication, not attack,
+///         and it is the registry's disaster-migration mechanism. Every
+///         accepted write's verbatim calldata is stored on-chain
+///         (registerPayloadOf / referPayloadOf), so the replayable bytes
+///         are themselves readable by public key with plain eth_calls —
+///         each record carries its own escape pod, recursively across
+///         mirrors.
 ///
 ///         Nothing else is exclusive or interpreted:
 ///         - a passkey ENTRY is global and reusable: the same key may be a
@@ -92,7 +107,25 @@ import {Base64Url} from "./Base64Url.sol";
 ///         Deployment requires a chain with the P256VERIFY precompile
 ///         (EIP-7951 / RIP-7212) at address 0x100.
 contract WebAuthnP256PublicKeyRegistry {
-    uint8 public constant VERSION = 11;
+    uint8 public constant VERSION = 13;
+
+    /// The frozen signature domain (see the challenge formula above). Set
+    /// once at construction; `challengeFor` never reads the live chain
+    /// context, so signed calldata is portable across every deployment
+    /// constructed with the same pair.
+    uint256 public immutable DOMAIN_CHAIN_ID;
+    address public immutable DOMAIN_REGISTRY;
+
+    /// @param domainChainId  The chain id baked into every challenge; 0
+    ///        freezes the deployment chain's own id (standalone deployment).
+    /// @param domainRegistry The registry address baked into every
+    ///        challenge; address(0) freezes this deployment's own address.
+    ///        A migration deployment passes the ORIGINAL registry's pair so
+    ///        historical calldata replays verbatim.
+    constructor(uint256 domainChainId, address domainRegistry) {
+        DOMAIN_CHAIN_ID = domainChainId == 0 ? block.chainid : domainChainId;
+        DOMAIN_REGISTRY = domainRegistry == address(0) ? address(this) : domainRegistry;
+    }
 
     uint256 public constant MAX_RPID_LENGTH = 253;
     uint256 public constant UNCOMPRESSED_P256_KEY_LENGTH = 65; // 04 || x(32) || y(32)
@@ -219,6 +252,17 @@ contract WebAuthnP256PublicKeyRegistry {
     mapping(string => uint256) private _rpCreatedAt;
     mapping(string => uint256[]) private _unitIdsByRpId;
 
+    /// The verbatim calldata of every accepted write (`msg.data`, stored
+    /// only after all signatures verified). This makes each record its own
+    /// escape pod: `registerPayloadOf`/`referPayloadOf` return bytes that
+    /// replay as-is into any same-domain deployment on any chain — pure
+    /// eth_call reads, no event scans, no transaction archaeology, and
+    /// correct even when the original caller was a contract wallet (whose
+    /// outer transaction input is not the registry's calldata). Roughly
+    /// doubles a write's gas; portability is this registry's mission.
+    mapping(uint256 => bytes) private _registerPayload;
+    mapping(uint256 => bytes) private _referPayload;
+
     event EntryCreated(
         uint256 indexed entryId, bytes32 indexed keyHash, bytes publicKey, bytes attestation, bytes credentialId
     );
@@ -313,16 +357,17 @@ contract WebAuthnP256PublicKeyRegistry {
     // ── Challenges and digests ─────────────────────────────────────────────
 
     /// @notice The storage-authorization challenge one key signs: it binds
-    ///         this chain, this registry, the rpId, the signer's own key
-    ///         and a role-dependent `binding` — the group's contentHash for
-    ///         the group key, memberBindingFor for a member passkey,
+    ///         the FROZEN domain (not the live chain context — see the
+    ///         constructor), the rpId, the signer's own key and a
+    ///         role-dependent `binding` — the group's contentHash for the
+    ///         group key, memberBindingFor for a member passkey,
     ///         referenceBindingFor for a referring passkey.
     function challengeFor(string memory rpId, bytes memory publicKey, bytes32 binding)
         public
         view
         returns (bytes32)
     {
-        return keccak256(abi.encode(block.chainid, address(this), rpId, publicKey, binding));
+        return keccak256(abi.encode(DOMAIN_CHAIN_ID, DOMAIN_REGISTRY, rpId, publicKey, binding));
     }
 
     /// @notice The binding a MEMBER passkey signs into its challenge: the
@@ -461,6 +506,10 @@ contract WebAuthnP256PublicKeyRegistry {
         for (uint256 i = 0; i < members.length; i++) {
             _admitMember(unitId, rpId, groupPublicKey, keyHashes[i], members[i]);
         }
+
+        // Only fully-verified calldata is worth carrying (reverts above
+        // discard the write anyway); stored verbatim, replayable as-is.
+        _registerPayload[unitId] = msg.data;
 
         emit GroupCreated(unitId, keccak256(bytes(rpId)), groupKeyHash, groupPublicKey, members.length);
     }
@@ -603,8 +652,28 @@ contract WebAuthnP256PublicKeyRegistry {
         _referenceIdPlusOneByLink[unitId][entryId] = referenceId + 1;
         _referenceIdsByEntry[entryId].push(referenceId);
         _referenceIdsByUnit[unitId].push(referenceId);
+        _referPayload[referenceId] = msg.data;
 
         emit ReferenceCreated(referenceId, entryId, unitId, keyHash, groupKeyHash);
+    }
+
+    // ── Reads: replay payloads ─────────────────────────────────────────────
+
+    /// @notice The verbatim, signature-verified calldata that created this
+    ///         group — send it unchanged to any same-domain deployment on
+    ///         any chain (a mainnet mirror, a disaster-recovery chain) to
+    ///         recreate the record there. Locate the unitId by public key
+    ///         via getUnitByGroupKey / getGroupsOfKey.
+    function registerPayloadOf(uint256 unitId) external view returns (bytes memory) {
+        if (unitId >= _units.length) revert UnitNotFound(unitId);
+        return _registerPayload[unitId];
+    }
+
+    /// @notice The verbatim calldata that created this reference; replays
+    ///         into any same-domain deployment holding the target group.
+    function referPayloadOf(uint256 referenceId) external view returns (bytes memory) {
+        if (referenceId >= _references.length) revert ReferenceNotFound(referenceId);
+        return _referPayload[referenceId];
     }
 
     // ── Reads: passkeys ────────────────────────────────────────────────────

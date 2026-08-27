@@ -14,9 +14,19 @@ import {WebAuthnP256PublicKeyRegistry} from "../src/WebAuthnP256PublicKeyRegistr
 contract DeployRegistryScript is Script {
     function run() public {
         bytes32 salt = vm.envOr("DEPLOY_SALT", bytes32(0));
+        // Standalone deployment by default (the registry freezes its own
+        // chain id and address as the signature domain). A MIGRATION
+        // deployment sets both to the original registry's pair so its
+        // historical calldata replays verbatim:
+        //   DOMAIN_CHAIN_ID=100 DOMAIN_REGISTRY=0x<original> forge script ...
+        uint256 domainChainId = vm.envOr("DOMAIN_CHAIN_ID", uint256(0));
+        address domainRegistry = vm.envOr("DOMAIN_REGISTRY", address(0));
         vm.startBroadcast();
-        WebAuthnP256PublicKeyRegistry registry = new WebAuthnP256PublicKeyRegistry{salt: salt}();
+        WebAuthnP256PublicKeyRegistry registry =
+            new WebAuthnP256PublicKeyRegistry{salt: salt}(domainChainId, domainRegistry);
         console.log("WebAuthnP256PublicKeyRegistry deployed at:", address(registry));
+        console.log("  domain chain id:", registry.DOMAIN_CHAIN_ID());
+        console.log("  domain registry:", registry.DOMAIN_REGISTRY());
         vm.stopBroadcast();
     }
 }
