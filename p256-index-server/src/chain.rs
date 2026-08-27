@@ -54,6 +54,10 @@ const WRITE_RPCS: &[&str] = &[
 pub struct Chain {
     rpc: RpcPool,
     registry_address: Address,
+    /// The frozen signature domain (VERSION >= 12): challenges bind this
+    /// address, transactions and reads go to `registry_address`. Identical
+    /// until a migration separates them.
+    domain_registry_address: Address,
     signer_key: Option<SecretKey>,
     /// Absolute ceiling on `max_fee_per_gas`; see [`Config::max_gas_price_wei`].
     max_gas_price_wei: U256,
@@ -155,6 +159,12 @@ pub trait ReadChain: Send + Sync {
     fn rpc_circuit_state(&self) -> &'static str;
     /// The configured registry address, EIP-55 checksummed.
     fn registry_address(&self) -> String;
+    /// The frozen signature-domain address every challenge binds; equal to
+    /// [`Self::registry_address`] except after a migration, when writes
+    /// target the new deployment but signatures keep the original domain.
+    fn domain_registry_address(&self) -> String {
+        self.registry_address()
+    }
     async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError>;
     async fn unit(&self, unit_id: u64) -> Result<Option<Unit>, ChainError>;
     async fn key_profile(
@@ -222,6 +232,8 @@ impl Chain {
             )?,
             registry_address: Address::from_str(&config.contract_address)
                 .map_err(|_| anyhow!("P256_INDEX_CONTRACT_ADDRESS is not a valid address"))?,
+            domain_registry_address: Address::from_str(&config.domain_registry)
+                .map_err(|_| anyhow!("P256_INDEX_DOMAIN_REGISTRY is not a valid address"))?,
             signer_key,
             max_gas_price_wei: U256::from(config.max_gas_price_wei),
         })
@@ -245,6 +257,10 @@ impl Chain {
 
     pub fn registry_address(&self) -> String {
         self.registry_address.to_checksum(None)
+    }
+
+    pub fn domain_registry_address(&self) -> String {
+        self.domain_registry_address.to_checksum(None)
     }
 
     // ── Reads ──────────────────────────────────────────────────────────────
@@ -831,6 +847,10 @@ impl ReadChain for Chain {
         Chain::registry_address(self)
     }
 
+    fn domain_registry_address(&self) -> String {
+        Chain::domain_registry_address(self)
+    }
+
     async fn entry(&self, entry_id: u64) -> Result<Option<Entry>, ChainError> {
         Chain::entry(self, entry_id).await
     }
@@ -1137,6 +1157,7 @@ mod tests {
             iggy_stream: "p256-index".into(),
             iggy_topic: "create".into(),
             contract_address: "0x1111111111111111111111111111111111111111".into(),
+            domain_registry: "0x1111111111111111111111111111111111111111".into(),
         }
     }
 

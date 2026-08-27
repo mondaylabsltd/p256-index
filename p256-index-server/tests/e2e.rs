@@ -66,6 +66,7 @@ fn test_config(redis_url: &str, iggy_url: &str) -> Config {
         iggy_stream: DEFAULT_STREAM_NAME.into(),
         iggy_topic: DEFAULT_TOPIC_NAME.into(),
         contract_address: REGISTRY.into(),
+        domain_registry: REGISTRY.into(),
     }
 }
 

@@ -44,6 +44,7 @@ use crate::{
     config::Config,
     queue::RegisterTaskQueue,
     store::{Admission, CacheRead, RedisStore, derive_ip_salt, hash_ip},
+    worker::WorkerPulse,
 };
 
 const MAX_BODY_SIZE: usize = 128 * 1024;
@@ -59,6 +60,9 @@ pub struct AppState {
     global_write_limit: u64,
     telegram_configured: bool,
     chain_id: u64,
+    /// Present only when the create worker runs in this process; `None` keeps
+    /// read-only deployments (no signer, QUEUE_WORKER=0) reporting healthy.
+    worker_pulse: Option<WorkerPulse>,
 }
 
 impl AppState {
@@ -77,7 +81,13 @@ impl AppState {
             telegram_configured: config.telegram_bot_token.is_some()
                 && config.telegram_chat_id.is_some(),
             chain_id: p256_registrar::protocol::CHAIN_ID,
+            worker_pulse: None,
         }
+    }
+
+    pub fn with_worker_pulse(mut self, pulse: Option<WorkerPulse>) -> Self {
+        self.worker_pulse = pulse;
+        self
     }
 }
 
@@ -152,20 +162,37 @@ async fn root() -> Response {
 }
 
 async fn health(State(state): State<AppState>) -> Response {
+    // A stalled create worker is the one condition that must fail the probe
+    // outright: the HTTP server keeps answering while nothing consumes the
+    // queue, so only a non-2xx here lets healthchecks and monitors see it.
+    let worker_stalled = state
+        .worker_pulse
+        .as_ref()
+        .is_some_and(WorkerPulse::stalled);
     match state.store.queue_stats().await {
         Ok(stats) => {
             // The thresholds are sentinel policy; this handler only renders.
-            let reasons = sentinel::health_reasons(&sentinel::QueueHealth {
+            let mut reasons = sentinel::health_reasons(&sentinel::QueueHealth {
                 depth: stats.depth,
                 dlq_count: stats.dlq_count,
                 oldest_active_age_ms: stats.oldest_active_age_ms,
             });
-            let status = if reasons.is_empty() { "ok" } else { "degraded" };
+            if worker_stalled {
+                reasons.push("queue-worker-stalled");
+            }
+            let status = if worker_stalled {
+                "unhealthy"
+            } else if reasons.is_empty() {
+                "ok"
+            } else {
+                "degraded"
+            };
             let mut body = json!({
                 "service": "webauthn-p256-publickey-registry",
                 "version": "2.0.0",
                 "chainId": state.chain_id,
                 "registry": state.chain.registry_address(),
+                "domainRegistry": state.chain.domain_registry_address(),
                 "rpcCircuit": state.chain.rpc_circuit_state(),
                 "telegramConfigured": state.telegram_configured,
                 "status": status,
@@ -178,22 +205,39 @@ async fn health(State(state): State<AppState>) -> Response {
             if !reasons.is_empty() {
                 body["reasons"] = json!(reasons);
             }
-            json_response(StatusCode::OK, body)
+            let code = if worker_stalled {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            json_response(code, body)
         }
-        Err(_) => json_response(
-            StatusCode::OK,
-            json!({
-                "service": "webauthn-p256-publickey-registry",
-                "version": "2.0.0",
-                "chainId": state.chain_id,
-                "registry": state.chain.registry_address(),
-                "rpcCircuit": state.chain.rpc_circuit_state(),
-                "telegramConfigured": state.telegram_configured,
-                "status": "degraded",
-                "reasons": ["stats-unavailable"],
-                "queue": { "error": "queue stats unavailable" },
-            }),
-        ),
+        Err(_) => {
+            let mut reasons = vec!["stats-unavailable"];
+            if worker_stalled {
+                reasons.push("queue-worker-stalled");
+            }
+            let code = if worker_stalled {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            json_response(
+                code,
+                json!({
+                    "service": "webauthn-p256-publickey-registry",
+                    "version": "2.0.0",
+                    "chainId": state.chain_id,
+                    "registry": state.chain.registry_address(),
+                    "domainRegistry": state.chain.domain_registry_address(),
+                    "rpcCircuit": state.chain.rpc_circuit_state(),
+                    "telegramConfigured": state.telegram_configured,
+                    "status": if worker_stalled { "unhealthy" } else { "degraded" },
+                    "reasons": reasons,
+                    "queue": { "error": "queue stats unavailable" },
+                }),
+            )
+        }
     }
 }
 
@@ -239,7 +283,7 @@ async fn challenge(State(state): State<AppState>, request: Request<Body>) -> Res
         }
     };
     let group_key_bytes = hex::decode(&group_public_key).expect("validated hex");
-    let Ok(registry) = state.chain.registry_address().parse() else {
+    let Ok(registry) = state.chain.domain_registry_address().parse() else {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "registry misconfigured");
     };
 
@@ -530,7 +574,7 @@ async fn drive_admission_request(
         new_task_id: uuid::Uuid::new_v4().to_string(),
         now_ms: now_ms(),
         chain_id: state.chain_id,
-        registry: state.chain.registry_address(),
+        registry: state.chain.domain_registry_address(),
     });
 
     loop {
@@ -1198,6 +1242,7 @@ mod tests {
             iggy_stream: "p256-index".into(),
             iggy_topic: "create".into(),
             contract_address: REGISTRY.into(),
+            domain_registry: REGISTRY.into(),
         }
     }
 

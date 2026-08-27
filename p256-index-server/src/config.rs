@@ -31,6 +31,14 @@ pub struct Config {
     /// The deployed registry address (P256_INDEX_CONTRACT_ADDRESS). Always
     /// required — the service is meaningless without a registry to read.
     pub contract_address: String,
+    /// The frozen signature-domain address (P256_INDEX_DOMAIN_REGISTRY),
+    /// defaulting to `contract_address`. From registry VERSION 12 the
+    /// challenge domain is baked in at deployment, so a migration
+    /// deployment is read and written at `contract_address` while every
+    /// challenge keeps binding the ORIGINAL registry's address — the two
+    /// only differ after a migration, and must match the deployed
+    /// contract's DOMAIN_REGISTRY.
+    pub domain_registry: String,
 }
 
 impl Config {
@@ -69,6 +77,9 @@ impl Config {
         if max_gas_price_wei == 0 {
             bail!("P256_INDEX_MAX_GAS_PRICE_WEI must be greater than zero");
         }
+        let contract_address = required("P256_INDEX_CONTRACT_ADDRESS")?;
+        let domain_registry =
+            optional("P256_INDEX_DOMAIN_REGISTRY").unwrap_or_else(|| contract_address.clone());
 
         Ok(Self {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], port)),
@@ -83,7 +94,8 @@ impl Config {
             telegram_chat_id: optional("TELEGRAM_CHAT_ID"),
             global_write_limit,
             max_gas_price_wei,
-            contract_address: required("P256_INDEX_CONTRACT_ADDRESS")?,
+            contract_address,
+            domain_registry,
             iggy_enqueue_timeout: Duration::from_secs(
                 optional("P256_INDEX_IGGY_ENQUEUE_TIMEOUT_SECS")
                     .map(|value| value.parse::<u64>())

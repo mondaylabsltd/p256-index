@@ -41,17 +41,20 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Started before the router so the health endpoint can watch the worker's
+    // liveness pulse.
+    let worker = start_worker_if_enabled(&config, store.clone(), chain.clone());
     let state = AppState::new(
         store.clone(),
         std::sync::Arc::new(queue.clone()),
         std::sync::Arc::new(chain.clone()),
         &config,
-    );
+    )
+    .with_worker_pulse(worker.as_ref().map(|handle| handle.pulse()));
     let app = router(state);
     let listener = TcpListener::bind(config.listen_addr).await?;
     tracing::info!(listen_addr = %config.listen_addr, "HTTP server listening");
 
-    let worker = start_worker_if_enabled(&config, store.clone(), chain.clone());
     let maintenance = start_maintenance_if_enabled(&config, store, chain, telegram);
     // ConnectInfo is load-bearing: every rate-limited handler extracts the
     // peer address, and without connect-info wiring axum answers each such

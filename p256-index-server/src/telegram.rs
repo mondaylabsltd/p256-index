@@ -102,6 +102,7 @@ mod tests {
             iggy_stream: "p256-index".into(),
             iggy_topic: "create".into(),
             contract_address: "0x1111111111111111111111111111111111111111".into(),
+            domain_registry: "0x1111111111111111111111111111111111111111".into(),
         }
     }
 
