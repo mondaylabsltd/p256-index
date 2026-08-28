@@ -182,6 +182,8 @@ impl Edge {
             "registry": self.chain.registry_address(),
             "domainRegistry": self.chain.domain_registry_address(),
             "rpcCircuit": self.chain.rpc_circuit_state(),
+            "telegramConfigured": self.config.telegram_bot_token.is_some()
+                && self.config.telegram_chat_id.is_some(),
         });
         match self.do_get::<StatsEnvelope>("/stats").await {
             Ok(stats) => {

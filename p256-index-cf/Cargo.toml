@@ -17,7 +17,9 @@
 # and deploy with `npx wrangler deploy` (uses worker-build).
 [package]
 name = "p256-index-cf"
-version = "0.1.0"
+# Tracks the service release train (the docker shell's version), not an
+# independent crate line: /api/health reports it.
+version = "2.1.1"
 edition = "2024"
 
 [lib]
