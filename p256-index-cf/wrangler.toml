@@ -26,8 +26,10 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-05-01"
 keep_vars = true
 
+# Self-bootstrapping: installs Rust first when the environment (e.g. a
+# Workers Builds CI image) lacks it, so no build steps live outside the repo.
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+command = "sh build.sh"
 
 # The docker shell's 60s maintenance tick (unstick sweep, operator alerts,
 # daily heartbeat — all internally gated/throttled, so every-minute is cheap).

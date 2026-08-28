@@ -66,6 +66,22 @@ Non-sensitive tuning (`GLOBAL_WRITE_LIMIT`, `P256_INDEX_MAX_GAS_PRICE_WEI`,
 `P256_INDEX_READ_RPCS`, `P256_INDEX_WRITE_RPCS`, `RELEASE`) can be set the
 same way, or as plain vars in the dashboard.
 
+### Deploy from Git (Workers Builds)
+
+`build.sh` bootstraps Rust itself when the CI image lacks it, so the
+connect-repository dialog needs almost nothing:
+
+- Production branch: `main`
+- **Enable Preview builds: OFF** — preview versions share production
+  bindings, so a PR preview would write into the production queue and
+  spend the production wallet's gas.
+- Build command: leave empty
+- Deploy command: `npx wrangler deploy` (the default)
+- **Advanced settings → Root directory: `/p256-index-cf`**
+
+Expect the first build to take ~10 minutes (rustup + compiling
+worker-build + the crate; CI does not cache cargo artifacts).
+
 Local development (`miniflare`: real SQLite-backed object + local cache):
 
 ```sh
