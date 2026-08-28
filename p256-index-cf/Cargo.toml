@@ -1,0 +1,57 @@
+# Cloudflare Workers shell for the p256 registry.
+#
+# Architecture rule (mirrors the docker shell's discipline):
+#   - all decision rules live in p256-registrar (unchanged, compiled to wasm);
+#   - all strongly-consistent state lives in ONE Durable Object (SubmitterDo:
+#     task queue + status + idempotency + broadcast ledger in SQLite, the
+#     submission loop driven by its alarm);
+#   - the response cache lives in the platform Cache API (per-datacenter,
+#     zero-provisioning — the read-through cache Redis holds in the docker
+#     shell);
+#   - all CPU work (proof verification, challenges) runs in the stateless
+#     Worker, which scales horizontally.
+#
+# This crate is excluded from the root workspace: it only builds for
+# wasm32-unknown-unknown. Check with
+#   cargo check --target wasm32-unknown-unknown
+# and deploy with `npx wrangler deploy` (uses worker-build).
+[package]
+name = "p256-index-cf"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+p256-registrar = { path = "../p256-registrar" }
+# RustCrypto's getrandom needs the JS backend on wasm32; this feature flag is
+# the only wasm accommodation the whole build requires.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# k256/alloy still pull the 0.2 series via rand_core 0.6; its JS backend has
+# its own feature name.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+worker = "0.8"
+crux_core = "0.19"
+alloy = { version = "2.2.0", default-features = false, features = [
+    "consensus",
+    "eips",
+    "network",
+    "signer-local",
+    "rlp",
+] }
+k256 = "0.13"
+anyhow = "1"
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "rng-getrandom"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

@@ -1,0 +1,43 @@
+# Cloudflare Workers deployment for the p256 registry.
+#
+# This file is deployment-neutral on purpose: no resource ids, no
+# per-deployment addresses. Cloning the repo and deploying never requires
+# editing a tracked file — all configuration is injected per deployment:
+#
+#   npx wrangler secret put P256_INDEX_CONTRACT_ADDRESS   # required
+#   npx wrangler secret put PRIVATE_KEY                   # optional: read-only without it
+#   npx wrangler secret put P256_INDEX_DOMAIN_REGISTRY    # only after a registry migration
+#   npx wrangler secret put ALCHEMY_API_KEY               # optional write-lane RPC
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN            # optional operator alerts
+#   npx wrangler secret put TELEGRAM_CHAT_ID
+#   npx wrangler deploy
+#
+# (The config loader reads every setting from vars OR secrets, so
+# non-sensitive values may also be set as plain vars in the dashboard;
+# keep_vars below stops deploys from wiping them.)
+#
+# Local development: copy .dev.vars.example to .dev.vars, then
+#   npx wrangler dev
+#
+# The response cache uses the platform Cache API — nothing to provision.
+
+name = "p256-index"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-01"
+keep_vars = true
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+# The docker shell's 60s maintenance tick (unstick sweep, operator alerts,
+# daily heartbeat — all internally gated/throttled, so every-minute is cheap).
+[triggers]
+crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "SUBMITTER"
+class_name = "SubmitterDo"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubmitterDo"]

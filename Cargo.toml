@@ -1,3 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["p256-registrar", "p256-index-server", "p256-replay"]
+# p256-index-cf builds only for wasm32 (Cloudflare Workers); keeping it out of
+# the workspace keeps native `cargo clippy/test --workspace` free of wasm deps.
+exclude = ["p256-index-cf"]

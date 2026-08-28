@@ -1,0 +1,5 @@
+# Local development variables for `npx wrangler dev` (copy to .dev.vars).
+# Secrets (PRIVATE_KEY, ALCHEMY_API_KEY) may also go in .dev.vars locally;
+# never commit .dev.vars.
+P256_INDEX_CONTRACT_ADDRESS=0x94fD1A891EB6c5F340622Baf2F3A0cb70A941EA9
+P256_INDEX_DOMAIN_REGISTRY=0x5266DfF591B9F9EecfEdb8E7EfEf6c687854edaf

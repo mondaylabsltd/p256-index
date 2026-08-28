@@ -1,5 +1,10 @@
 # Rust build output (workspace target lives at the repository root)
 /target
+# p256-index-cf is excluded from the workspace and builds into its own tree
+p256-index-cf/target
+p256-index-cf/build
+p256-index-cf/.dev.vars
+p256-index-cf/.wrangler
 
 # code coverage
 coverage
