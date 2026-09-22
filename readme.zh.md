@@ -158,3 +158,8 @@ P256_INDEX_E2E_CHAIN=1 cargo test --lib -- --ignored \
 
 同一 PRIVATE_KEY 同时只能有一个写入进程。配置 TELEGRAM_BOT_TOKEN 与
 TELEGRAM_CHAT_ID 启用告警投递;RELEASE 在心跳中带构建标签。
+
+## 许可证
+
+MIT,见 [LICENSE](LICENSE)。`contracts/src` 中的合约使用同一 SPDX 标识;`contracts/lib`
+下的子模块(forge-std、p256-verifier)保留各自的许可证。

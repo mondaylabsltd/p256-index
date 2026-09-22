@@ -21,6 +21,7 @@ name = "p256-index-cf"
 # independent crate line: /api/health reports it.
 version = "2.1.1"
 edition = "2024"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib"]

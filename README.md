@@ -218,3 +218,9 @@ P256_INDEX_E2E_CHAIN=1 cargo test --lib -- --ignored \
 Only one writer may use a given PRIVATE_KEY at a time. Set
 TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable alert delivery; RELEASE
 adds a build tag to the heartbeat.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The contracts in `contracts/src` carry the same
+SPDX identifier. The submodules under `contracts/lib` (forge-std, p256-verifier)
+keep their own licences.
