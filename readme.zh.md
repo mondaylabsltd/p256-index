@@ -96,17 +96,44 @@ attachment、transports)——形状校验,真实性属存储方声明;展示映
 ## 配置
 
 复制 .env.example 为 .env。Redis 与 Iggy 必需,连不上即快速失败;
-`P256_INDEX_CONTRACT_ADDRESS`(已部署的 registry)始终必需。
+`P256_INDEX_CONTRACT_ADDRESS`(已部署的 registry)始终必需——没有编译期
+默认值,不设置则服务启动即退出。
 
 ~~~dotenv
 P256_INDEX_IGGY_URL=iggy+tcp://user:password@iggy.example:5100?reconnection_retries=5&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=3s&nodelay=true
 P256_INDEX_REDIS_URL=redis://redis.example:6379/0
 P256_INDEX_CONTRACT_ADDRESS=0x…
+P256_INDEX_DOMAIN_REGISTRY=0x…
 PRIVATE_KEY=0x…
 ~~~
 
+`P256_INDEX_DOMAIN_REGISTRY` 是冻结的签名域,与合约地址不是一回事。
+自 registry VERSION 12 起,挑战域在部署时即固化:迁移后的部署在
+`P256_INDEX_CONTRACT_ADDRESS` 上读写,而每个挑战仍绑定**最初那个**
+registry 的地址,因此该值必须等于所部署合约的 `DOMAIN_REGISTRY`。
+它默认回落到 `P256_INDEX_CONTRACT_ADDRESS`,这只对从未迁移过的 registry
+正确。Vela 的 Gnosis 部署已过 V13 切换,故两者分别显式设置
+(`.env.example` 里就是这对线上值;`/api/health` 同时报告 `registry` 与
+`domainRegistry`,配错在花掉一次注册之前就能看见)。
+
 PRIVATE_KEY 仅在只读运行时可省略:HTTP 读 API 照常,Iggy 消费者禁用,新
 任务保持 pending。gas 由本服务支付;每 IP 5/分钟与全局创建预算是成本闸门。
+
+## Docker
+
+Compose 只起本服务,Redis 与 Iggy 仍为外部依赖。构建上下文是仓库根,
+因为本服务只是三成员 Cargo workspace 中的一个。
+
+~~~sh
+cp .env.example p256-index-server/.env   # 然后填好
+docker compose up --build -d
+curl --fail --silent http://127.0.0.1:11256/api/health
+~~~
+
+`docker-compose.yaml` 读的就是这个被 gitignore 的路径。compose 里把它标为
+可选,使全新 clone 也能 build 和 `docker compose config`;但缺少上面那些
+必填值时,服务启动即退出。Redis 或 Iggy 跑在 Docker 宿主机上时,URL 里用
+`host.docker.internal` 而不是 `127.0.0.1`。
 
 ## 合约
 

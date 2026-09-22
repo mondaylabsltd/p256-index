@@ -147,19 +147,51 @@ content already on-chain answers 200 "done".
 
 Copy .env.example to .env. Redis and Iggy are mandatory; the service fails
 fast if it cannot reach either one. `P256_INDEX_CONTRACT_ADDRESS` (the
-deployed registry) is always required.
+deployed registry) is always required — there is no compiled-in default, so
+the server exits at boot without it.
 
 ~~~dotenv
 P256_INDEX_IGGY_URL=iggy+tcp://user:password@iggy.example:5100?reconnection_retries=5&reconnection_interval=1s&reestablish_after=5s&heartbeat_interval=3s&nodelay=true
 P256_INDEX_REDIS_URL=redis://redis.example:6379/0
 P256_INDEX_CONTRACT_ADDRESS=0x…
+P256_INDEX_DOMAIN_REGISTRY=0x…
 PRIVATE_KEY=0x…
 ~~~
+
+`P256_INDEX_DOMAIN_REGISTRY` is the frozen signature domain, and it is not
+the same thing as the contract address. From registry VERSION 12 the
+challenge domain is baked in at deployment: a migration deployment is read
+and written at `P256_INDEX_CONTRACT_ADDRESS`, while every challenge keeps
+binding the **original** registry's address, so this value must equal the
+deployed contract's `DOMAIN_REGISTRY`. It defaults to
+`P256_INDEX_CONTRACT_ADDRESS`, which is correct only for a registry that has
+never been migrated. Vela's Gnosis deployment is past the V13 cutover, so
+both are set explicitly (`.env.example` carries the live pair, and
+`/api/health` reports `registry` and `domainRegistry` so a mismatch is
+visible before it costs a registration).
 
 PRIVATE_KEY is optional only for read-only operation: without it the HTTP
 API serves reads but the Iggy consumer is disabled and new tasks stay
 pending. The service pays gas for all registrations; the per-IP (5/min) and
 global create budgets are the cost gate.
+
+## Docker
+
+Compose starts only this service; Redis and Iggy stay external. The build
+context is the repository root, because the server is one member of a
+three-member Cargo workspace.
+
+~~~sh
+cp .env.example p256-index-server/.env   # then fill it in
+docker compose up --build -d
+curl --fail --silent http://127.0.0.1:11256/api/health
+~~~
+
+That `.env` path is what `docker-compose.yaml` reads, and it is gitignored.
+The compose file marks it optional so a fresh clone can still build and
+`docker compose config`, but the server will exit at boot without the
+required values above. When Redis or Iggy runs on the Docker host, use
+`host.docker.internal` in their URLs instead of `127.0.0.1`.
 
 ## Contract
 

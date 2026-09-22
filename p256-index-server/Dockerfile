@@ -11,13 +11,17 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Build context is the repository root (see docker-compose.yaml): the server
-# is a workspace member and needs the sibling p256-registrar crate.
+# Build context is the repository root (see docker-compose.yaml). Cargo loads
+# the manifest of EVERY workspace member before it builds anything, so all
+# three members must be copied even though only the server is built — a
+# missing one fails the build with "failed to load manifest for workspace
+# member". Keep this list in step with `members` in the root Cargo.toml.
 COPY Cargo.toml Cargo.lock ./
 COPY p256-registrar ./p256-registrar
 COPY p256-index-server ./p256-index-server
+COPY p256-replay ./p256-replay
 
-RUN cargo build --release --locked --bin p256-index-server
+RUN cargo build --release --locked -p p256-index-server
 
 
 FROM debian:bookworm-slim AS runtime

@@ -11,11 +11,17 @@ services:
   index:
     image: ${P256_INDEX_IMAGE:-p256-index-server:local}
     build:
-      # Repository root: the server build needs the sibling p256-registrar crate.
+      # Repository root: the server is a workspace member, so its build needs
+      # the sibling crates' manifests too (see p256-index-server/Dockerfile).
       context: .
       dockerfile: p256-index-server/Dockerfile
+    # `.env` is gitignored, so a fresh clone does not have one: marking it
+    # optional keeps `docker compose build`/`config` working there. The server
+    # still needs it to run — see "Docker" in README.md
+    # (cp .env.example p256-index-server/.env, then fill it in).
     env_file:
-      - ./p256-index-server/.env
+      - path: ./p256-index-server/.env
+        required: false
     environment:
       PORT: 11256
     ports:
