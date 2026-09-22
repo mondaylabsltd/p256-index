@@ -2,6 +2,7 @@
 name = "p256-registrar"
 version = "2.1.1"
 edition = "2024"
+license = "MIT"
 
 # The registrar owns the service's business vocabulary and decision rules.
 # It is deliberately I/O-free: no Redis, no Iggy, no HTTP clients, no runtime.
